@@ -51,6 +51,7 @@ export interface YamlConditionDef {
   indicator?: string;
   operator?: string;
   compare_to?: string | number;
+  value?: number;
   output?: string;
   compare_output?: string;
   candlestick?: string;

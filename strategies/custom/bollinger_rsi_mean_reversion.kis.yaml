@@ -1,0 +1,58 @@
+version: "1.0"
+
+metadata:
+  name: "Bollinger + RSI 평균회귀"
+  description: "종가가 볼린저 하단을 이탈하고 RSI가 과매도일 때 진입해 중단선 회복을 청산 신호로 사용하는 전략"
+  author: "codex"
+  tags:
+    - mean_reversion
+    - bollinger
+    - rsi
+    - oversold
+
+strategy:
+  id: bollinger_rsi_mean_reversion
+  category: mean_reversion
+
+  indicators:
+    - id: bollinger
+      alias: bb_20
+      params:
+        period: 20
+        std: 2
+    - id: rsi
+      alias: rsi_14
+      params:
+        period: 14
+
+  entry:
+    logic: AND
+    conditions:
+      - indicator: close
+        operator: cross_below
+        compare_to: bb_20
+        compare_output: lower
+      - indicator: rsi_14
+        operator: less_than
+        value: 35
+
+  exit:
+    logic: OR
+    conditions:
+      - indicator: close
+        operator: cross_above
+        compare_to: bb_20
+        compare_output: middle
+      - indicator: rsi_14
+        operator: greater_than
+        value: 55
+
+risk:
+  stop_loss:
+    enabled: true
+    percent: 4.0
+  take_profit:
+    enabled: true
+    percent: 10.0
+  trailing_stop:
+    enabled: false

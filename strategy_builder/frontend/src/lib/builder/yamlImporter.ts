@@ -271,6 +271,10 @@ function resolveRightOperand(
   cond: YamlConditionDef,
   indicatorAliases: Set<string>
 ): ConditionOperand {
+  if (cond.value !== undefined) {
+    return { type: "value", value: cond.value };
+  }
+
   const compareTo = cond.compare_to;
 
   // No compare_to → default value 0

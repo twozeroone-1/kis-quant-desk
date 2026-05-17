@@ -1,0 +1,47 @@
+version: "1.0"
+
+metadata:
+  name: "SuperTrend 추세 추종"
+  description: "종가가 SuperTrend를 상향 돌파하면 진입하고 하향 이탈하면 청산하는 ATR 기반 추세 전략"
+  author: "codex"
+  tags:
+    - trend
+    - supertrend
+    - atr
+    - trailing
+
+strategy:
+  id: supertrend_follow
+  category: trend
+
+  indicators:
+    - id: supertrend
+      alias: st_10_3
+      params:
+        period: 10
+        multiplier: 3
+
+  entry:
+    logic: AND
+    conditions:
+      - indicator: close
+        operator: cross_above
+        compare_to: st_10_3
+
+  exit:
+    logic: OR
+    conditions:
+      - indicator: close
+        operator: cross_below
+        compare_to: st_10_3
+
+risk:
+  stop_loss:
+    enabled: true
+    percent: 5.0
+  take_profit:
+    enabled: true
+    percent: 12.0
+  trailing_stop:
+    enabled: true
+    percent: 4.0

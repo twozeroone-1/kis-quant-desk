@@ -138,6 +138,7 @@ next-env.d.ts
 # ===== Environment / Secrets =====
 .env
 .env.local
+.env.production
 .env.*.local
 *.pem
 
@@ -163,6 +164,17 @@ KIS/
 # ===== Claude Code =====
 .claude/logs/*.log
 .claude/settings.local.json
+
+# ===== Codex project config =====
+.codex/*
+!.codex/config.toml
+!.codex/rules/
+!.codex/rules/**
+!.codex/scripts/
+!.codex/scripts/**
+!.codex/skills/
+!.codex/skills/**
+.codex/skills/.system/
 
 # ===== p2 output artifacts (regeneratable) =====
 backtester/examples/output/reports/*.html

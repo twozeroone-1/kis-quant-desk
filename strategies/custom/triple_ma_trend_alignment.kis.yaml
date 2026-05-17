@@ -1,0 +1,63 @@
+version: "1.0"
+
+metadata:
+  name: "Triple MA 추세 정렬"
+  description: "20일, 60일, 120일 이동평균이 정배열일 때만 진입하는 추세 필터 강화 전략"
+  author: "codex"
+  tags:
+    - trend
+    - sma
+    - triple_ma
+    - trend_filter
+
+strategy:
+  id: triple_ma_trend_alignment
+  category: trend
+
+  indicators:
+    - id: sma
+      alias: sma_20
+      params:
+        period: 20
+    - id: sma
+      alias: sma_60
+      params:
+        period: 60
+    - id: sma
+      alias: sma_120
+      params:
+        period: 120
+
+  entry:
+    logic: AND
+    conditions:
+      - indicator: sma_20
+        operator: greater_than
+        compare_to: sma_60
+      - indicator: sma_60
+        operator: greater_than
+        compare_to: sma_120
+      - indicator: close
+        operator: greater_than
+        compare_to: sma_20
+
+  exit:
+    logic: OR
+    conditions:
+      - indicator: sma_20
+        operator: cross_below
+        compare_to: sma_60
+      - indicator: close
+        operator: cross_below
+        compare_to: sma_60
+
+risk:
+  stop_loss:
+    enabled: true
+    percent: 6.0
+  take_profit:
+    enabled: true
+    percent: 15.0
+  trailing_stop:
+    enabled: true
+    percent: 5.0

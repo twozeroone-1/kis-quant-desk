@@ -1,0 +1,60 @@
+version: "1.0"
+
+metadata:
+  name: "KRX 과매도 반전"
+  description: "연속 하락과 RSI 과매도를 동시에 만족할 때 평균회귀 반등을 노리는 전략"
+  author: "codex"
+  tags:
+    - mean_reversion
+    - krx
+    - rsi
+    - consecutive
+    - oversold
+
+strategy:
+  id: krx_oversold_reversal
+  category: mean_reversion
+
+  indicators:
+    - id: consecutive
+      alias: down_days
+      params:
+        direction: down
+    - id: rsi
+      alias: rsi_14
+      params:
+        period: 14
+    - id: sma
+      alias: sma_5
+      params:
+        period: 5
+
+  entry:
+    logic: AND
+    conditions:
+      - indicator: down_days
+        operator: greater_than
+        value: 2
+      - indicator: rsi_14
+        operator: less_than
+        value: 30
+
+  exit:
+    logic: OR
+    conditions:
+      - indicator: rsi_14
+        operator: greater_than
+        value: 50
+      - indicator: close
+        operator: cross_above
+        compare_to: sma_5
+
+risk:
+  stop_loss:
+    enabled: true
+    percent: 4.0
+  take_profit:
+    enabled: true
+    percent: 8.0
+  trailing_stop:
+    enabled: false

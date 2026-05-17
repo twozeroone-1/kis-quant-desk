@@ -163,6 +163,7 @@ export interface YamlCondition {
   indicator?: string;
   operator?: string;
   compare_to?: string | number;
+  value?: number;
   output?: string;
   compare_output?: string; // 오른쪽 지표의 출력 필드 (예: macd_1의 signal)
   // 캔들스틱 조건

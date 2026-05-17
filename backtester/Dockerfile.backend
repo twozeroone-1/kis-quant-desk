@@ -1,0 +1,25 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl docker-cli \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir uv
+
+COPY backtester/pyproject.toml backtester/uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY backtester/ ./
+COPY backtester/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /home/kis
+
+EXPOSE 8002
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

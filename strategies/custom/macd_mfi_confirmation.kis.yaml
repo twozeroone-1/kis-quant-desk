@@ -1,0 +1,69 @@
+version: "1.0"
+
+metadata:
+  name: "MACD + MFI 확인"
+  description: "MACD 골든크로스를 RSI와 MFI로 확인해 추세 전환 신호의 품질을 높이는 전략"
+  author: "codex"
+  tags:
+    - composite
+    - macd
+    - rsi
+    - mfi
+    - momentum
+
+strategy:
+  id: macd_mfi_confirmation
+  category: composite
+
+  indicators:
+    - id: macd
+      alias: macd
+      params:
+        fast: 12
+        slow: 26
+        signal: 9
+    - id: rsi
+      alias: rsi_14
+      params:
+        period: 14
+    - id: mfi
+      alias: mfi_14
+      params:
+        period: 14
+
+  entry:
+    logic: AND
+    conditions:
+      - indicator: macd
+        output: value
+        operator: cross_above
+        compare_to: macd
+        compare_output: signal
+      - indicator: rsi_14
+        operator: greater_than
+        value: 50
+      - indicator: mfi_14
+        operator: greater_than
+        value: 50
+
+  exit:
+    logic: OR
+    conditions:
+      - indicator: macd
+        output: value
+        operator: cross_below
+        compare_to: macd
+        compare_output: signal
+      - indicator: rsi_14
+        operator: less_than
+        value: 45
+
+risk:
+  stop_loss:
+    enabled: true
+    percent: 5.0
+  take_profit:
+    enabled: true
+    percent: 12.0
+  trailing_stop:
+    enabled: false

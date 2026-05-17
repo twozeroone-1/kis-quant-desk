@@ -7,8 +7,10 @@ strategy_core 모듈을 사용하여 전략 조회/실행/빌드를 처리합니
 import time
 import logging
 import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -28,6 +30,7 @@ from strategy_core.dsl.converter import builder_state_to_dsl
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+PRICE_FIELDS = {"close", "open", "high", "low"}
 
 
 def _api_sleep():
@@ -36,6 +39,171 @@ def _api_sleep():
     time.sleep(interval)
 
 
+
+
+def _custom_yaml_dirs() -> List[Path]:
+    """Return custom strategy directories for local and Docker layouts."""
+    strategy_builder_root = Path(__file__).resolve().parents[2]
+    project_root = strategy_builder_root.parent
+    candidates = [
+        strategy_builder_root / "strategies" / "custom",
+        project_root / "strategies" / "custom",
+    ]
+
+    seen: set[Path] = set()
+    result: List[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen and resolved.is_dir():
+            seen.add(resolved)
+            result.append(resolved)
+    return result
+
+
+def _operand_from_indicator(name: str, output: str = "value") -> Dict[str, Any]:
+    if name in PRICE_FIELDS:
+        return {"type": "price", "priceField": name}
+    return {"type": "indicator", "indicatorAlias": name, "indicatorOutput": output}
+
+
+def _right_operand(condition: Dict[str, Any], indicator_aliases: set[str]) -> Dict[str, Any]:
+    if "value" in condition:
+        return {"type": "value", "value": condition.get("value")}
+
+    compare_to = condition.get("compare_to")
+    if compare_to is None:
+        return {"type": "value", "value": 0}
+    if isinstance(compare_to, (int, float)):
+        return {"type": "value", "value": compare_to}
+    if isinstance(compare_to, str):
+        if compare_to in PRICE_FIELDS:
+            return {"type": "price", "priceField": compare_to}
+        if compare_to in indicator_aliases:
+            return {
+                "type": "indicator",
+                "indicatorAlias": compare_to,
+                "indicatorOutput": condition.get("compare_output", "value"),
+            }
+        try:
+            return {"type": "value", "value": float(compare_to)}
+        except ValueError:
+            return {
+                "type": "indicator",
+                "indicatorAlias": compare_to,
+                "indicatorOutput": condition.get("compare_output", "value"),
+            }
+
+    return {"type": "value", "value": 0}
+
+
+def _condition_group_from_yaml(
+    group: Dict[str, Any],
+    prefix: str,
+    indicator_aliases: set[str],
+) -> Dict[str, Any]:
+    conditions = []
+    for index, condition in enumerate(group.get("conditions", []), start=1):
+        conditions.append({
+            "id": f"{prefix}_{index}",
+            "left": _operand_from_indicator(
+                condition.get("indicator", ""),
+                condition.get("output", "value"),
+            ),
+            "operator": condition.get("operator", "greater_than"),
+            "right": _right_operand(condition, indicator_aliases),
+        })
+
+    return {
+        "logic": group.get("logic", "AND"),
+        "conditions": conditions,
+    }
+
+
+def _builder_state_from_kis_yaml(data: Dict[str, Any]) -> Dict[str, Any]:
+    strategy = data.get("strategy", {})
+    metadata = data.get("metadata", {})
+    indicators = []
+    indicator_aliases: set[str] = set()
+
+    for index, indicator in enumerate(strategy.get("indicators", []), start=1):
+        indicator_id = indicator.get("id", "")
+        alias = indicator.get("alias") or f"{indicator_id}_{index}"
+        indicator_aliases.add(alias)
+        indicators.append({
+            "id": f"{indicator_id}_{index}",
+            "indicatorId": indicator_id,
+            "alias": alias,
+            "params": indicator.get("params") or {},
+            "output": indicator.get("output", "value"),
+        })
+
+    risk = data.get("risk") or {}
+
+    return {
+        "metadata": {
+            "id": strategy.get("id", ""),
+            "name": metadata.get("name") or strategy.get("id", "custom_strategy"),
+            "description": metadata.get("description", ""),
+            "category": strategy.get("category", "custom"),
+            "tags": metadata.get("tags") or [],
+            "author": metadata.get("author", "user"),
+        },
+        "indicators": indicators,
+        "entry": _condition_group_from_yaml(
+            strategy.get("entry") or {},
+            "entry",
+            indicator_aliases,
+        ),
+        "exit": _condition_group_from_yaml(
+            strategy.get("exit") or {},
+            "exit",
+            indicator_aliases,
+        ),
+        "risk": {
+            "stopLoss": {
+                "enabled": risk.get("stop_loss", {}).get("enabled", False),
+                "percent": risk.get("stop_loss", {}).get("percent", 5),
+            },
+            "takeProfit": {
+                "enabled": risk.get("take_profit", {}).get("enabled", False),
+                "percent": risk.get("take_profit", {}).get("percent", 10),
+            },
+            "trailingStop": {
+                "enabled": risk.get("trailing_stop", {}).get("enabled", False),
+                "percent": risk.get("trailing_stop", {}).get("percent", 3),
+            },
+        },
+    }
+
+
+def _load_custom_yaml_strategies() -> List[Dict[str, Any]]:
+    strategies = []
+    for directory in _custom_yaml_dirs():
+        for path in sorted(directory.glob("*.kis.yaml")):
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+                builder_state = _builder_state_from_kis_yaml(data)
+                strategy_id = builder_state["metadata"]["id"] or path.stem
+                strategies.append({
+                    "id": strategy_id,
+                    "name": builder_state["metadata"]["name"],
+                    "description": builder_state["metadata"]["description"],
+                    "category": builder_state["metadata"]["category"],
+                    "params": [],
+                    "builder_state": builder_state,
+                    "source": "custom_yaml",
+                    "filename": path.name,
+                })
+            except Exception as exc:
+                logger.warning("Failed to load custom strategy YAML %s: %s", path, exc)
+    return strategies
+
+
+def _get_custom_yaml_strategy(strategy_id: str) -> Optional[Dict[str, Any]]:
+    for strategy in _load_custom_yaml_strategies():
+        if strategy["id"] == strategy_id:
+            return strategy
+    return None
 
 
 # ============================================
@@ -105,7 +273,14 @@ class ExecuteResponse(BaseModel):
 @router.get("")
 async def list_strategies():
     """전략 목록 조회 - builder_state 포함 (SSoT)"""
-    return {"strategies": StrategyRegistry.get_list()}
+    strategies = StrategyRegistry.get_list()
+    known_ids = {strategy["id"] for strategy in strategies}
+    strategies.extend(
+        strategy
+        for strategy in _load_custom_yaml_strategies()
+        if strategy["id"] not in known_ids
+    )
+    return {"strategies": strategies}
 
 
 @router.get("/custom")
@@ -266,6 +441,14 @@ async def execute_strategy(request: ExecuteRequest):
 
         # 3) 레지스트리 전략
         schema = StrategyRegistry.get(strategy_id)
+        if not schema:
+            custom_yaml = _get_custom_yaml_strategy(strategy_id)
+            if custom_yaml:
+                schema = {
+                    **custom_yaml,
+                    "strategy_class": None,
+                    "param_map": {},
+                }
         if not schema:
             log("error", f"알 수 없는 전략: {strategy_id}")
             return ExecuteResponse(status='error', logs=logs, message=f'알 수 없는 전략: {strategy_id}')

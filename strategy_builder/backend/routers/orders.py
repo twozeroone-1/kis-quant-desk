@@ -12,13 +12,14 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from core.order_executor import OrderExecutor
 from core.signal import Action, Signal
 from core.data_fetcher import get_deposit, get_holdings, get_pending_orders, cancel_order, clear_balance_cache
 from backend import is_authenticated, get_current_mode
+from backend.services.audit_log import write_order_audit
 
 logging.basicConfig(level=logging.INFO)
 
@@ -132,7 +133,7 @@ class OrderResponse(BaseModel):
 
 
 @router.post("/execute", response_model=OrderResponse)
-async def execute_order(request: OrderRequest):
+async def execute_order(request: OrderRequest, http_request: Request):
     """
     주문 실행
 
@@ -156,42 +157,96 @@ async def execute_order(request: OrderRequest):
             "timestamp": datetime.now().strftime("%H:%M:%S")
         })
 
+    authenticated_user = http_request.headers.get("X-Authenticated-User", "unknown")
+
     try:
         # 1. 인증 확인
         if not is_authenticated():
             add_log("error", "인증이 필요합니다")
-            return OrderResponse(
+            response = OrderResponse(
                 status="error",
                 message="인증이 필요합니다",
                 logs=logs
             )
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": get_current_mode(),
+                "action": "execute",
+                "stock_code": request.stock_code,
+                "quantity": request.quantity,
+                "price": request.price,
+                "order_type": request.order_type,
+                "result": "error",
+                "order_id": None,
+                "error_message": response.message,
+            })
+            return response
 
         add_log("info", f"주문 검증 중: {request.stock_name}")
 
         # 2. 입력 검증
         if request.quantity <= 0:
             add_log("error", "주문 수량이 올바르지 않습니다")
-            return OrderResponse(
+            response = OrderResponse(
                 status="error",
                 message="주문 수량이 올바르지 않습니다",
                 logs=logs
             )
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": get_current_mode(),
+                "action": "execute",
+                "stock_code": request.stock_code,
+                "quantity": request.quantity,
+                "price": request.price,
+                "order_type": request.order_type,
+                "result": "error",
+                "order_id": None,
+                "error_message": response.message,
+            })
+            return response
 
         if request.action not in ["BUY", "SELL"]:
             add_log("error", "주문 구분이 올바르지 않습니다")
-            return OrderResponse(
+            response = OrderResponse(
                 status="error",
                 message="주문 구분이 올바르지 않습니다",
                 logs=logs
             )
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": get_current_mode(),
+                "action": "execute",
+                "stock_code": request.stock_code,
+                "quantity": request.quantity,
+                "price": request.price,
+                "order_type": request.order_type,
+                "result": "error",
+                "order_id": None,
+                "error_message": response.message,
+            })
+            return response
 
         if request.order_type not in ["limit", "market"]:
             add_log("error", "주문 유형이 올바르지 않습니다")
-            return OrderResponse(
+            response = OrderResponse(
                 status="error",
                 message="주문 유형이 올바르지 않습니다",
                 logs=logs
             )
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": get_current_mode(),
+                "action": "execute",
+                "stock_code": request.stock_code,
+                "quantity": request.quantity,
+                "price": request.price,
+                "order_type": request.order_type,
+                "result": "error",
+                "order_id": None,
+                "error_message": response.message,
+            })
+            return response
 
         add_log("success", "주문 검증 완료")
 
@@ -233,11 +288,24 @@ async def execute_order(request: OrderRequest):
 
             add_log("error", error_reason)
 
-            return OrderResponse(
+            response = OrderResponse(
                 status="error",
                 message=error_reason,
                 logs=logs
             )
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": env_dv,
+                "action": "execute",
+                "stock_code": request.stock_code,
+                "quantity": request.quantity,
+                "price": request.price,
+                "order_type": request.order_type,
+                "result": "error",
+                "order_id": None,
+                "error_message": response.message,
+            })
+            return response
 
         # 주문 성공 (POST API 응답은 대문자 필드명: ODNO, ORD_TMD, KRX_FWDG_ORD_ORGNO)
         order_id = result.iloc[0].get("ODNO", "")
@@ -278,22 +346,47 @@ async def execute_order(request: OrderRequest):
         # 계좌 캐시 클리어 (잔고 갱신 위해, 미체결 캐시는 유지)
         _clear_account_cache()
 
-        return OrderResponse(
+        response = OrderResponse(
             status="success",
             message="주문이 접수되었습니다",
             data=order_data,
             logs=logs
         )
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": env_dv,
+            "action": "execute",
+            "stock_code": request.stock_code,
+            "quantity": request.quantity,
+            "price": request.price,
+            "order_type": request.order_type,
+            "result": "success",
+            "order_id": order_id,
+            "error_message": None,
+        })
+        return response
 
     except Exception as e:
         logging.error(f"주문 실행 에러: {e}")
         add_log("error", f"주문 실행 에러: {str(e)}")
-
-        return OrderResponse(
+        response = OrderResponse(
             status="error",
             message=str(e),
             logs=logs
         )
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": get_current_mode(),
+            "action": "execute",
+            "stock_code": request.stock_code,
+            "quantity": request.quantity,
+            "price": request.price,
+            "order_type": request.order_type,
+            "result": "error",
+            "order_id": None,
+            "error_message": response.message,
+        })
+        return response
 
 
 # ============================================
@@ -501,7 +594,7 @@ async def get_pending_orders_api():
 
 
 @router.post("/cancel", response_model=CancelOrderResponse)
-async def cancel_order_api(request: CancelOrderRequest):
+async def cancel_order_api(request: CancelOrderRequest, http_request: Request):
     """주문 취소
     
     미체결 주문을 취소합니다.
@@ -516,7 +609,21 @@ async def cancel_order_api(request: CancelOrderRequest):
         - order_no: 취소된 주문번호
         - message: 결과 메시지
     """
+    authenticated_user = http_request.headers.get("X-Authenticated-User", "unknown")
+
     if not is_authenticated():
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": get_current_mode(),
+            "action": "cancel",
+            "stock_code": request.stock_code,
+            "quantity": request.qty,
+            "price": None,
+            "order_type": None,
+            "result": "error",
+            "order_id": request.order_no,
+            "error_message": "인증이 필요합니다",
+        })
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
     
     env_dv = get_current_mode()
@@ -554,13 +661,38 @@ async def cancel_order_api(request: CancelOrderRequest):
             _pending_cache_time = None
             logging.info(f"취소 실패(체결 완료 추정) - 캐시에서 제거: 주문번호 {request.order_no}")
 
-        return CancelOrderResponse(
+        response = CancelOrderResponse(
             status="success" if result.get("success") else "error",
             success=result.get("success", False),
             order_no=result.get("order_no", request.order_no),
             message=result.get("message") or ""
         )
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": env_dv,
+            "action": "cancel",
+            "stock_code": request.stock_code,
+            "quantity": request.qty,
+            "price": None,
+            "order_type": None,
+            "result": "success" if response.success else "error",
+            "order_id": response.order_no,
+            "error_message": None if response.success else response.message,
+        })
+        return response
         
     except Exception as e:
         logging.error(f"주문 취소 에러: {e}")
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": env_dv,
+            "action": "cancel",
+            "stock_code": request.stock_code,
+            "quantity": request.qty,
+            "price": None,
+            "order_type": None,
+            "result": "error",
+            "order_id": request.order_no,
+            "error_message": str(e),
+        })
         raise HTTPException(status_code=500, detail=str(e))

@@ -1,0 +1,67 @@
+version: "1.0"
+
+metadata:
+  name: "Donchian + ADX 돌파"
+  description: "돈치안 채널 상단 돌파를 ADX 추세 강도로 필터링하는 단기 추세 돌파 전략"
+  author: "codex"
+  tags:
+    - trend
+    - breakout
+    - donchian
+    - adx
+    - atr
+
+strategy:
+  id: donchian_adx_breakout
+  category: trend
+
+  indicators:
+    - id: donchian
+      alias: dc_20
+      params:
+        period: 20
+    - id: donchian
+      alias: dc_10
+      params:
+        period: 10
+    - id: adx
+      alias: adx_14
+      params:
+        period: 14
+    - id: atr
+      alias: atr_14
+      params:
+        period: 14
+
+  entry:
+    logic: AND
+    conditions:
+      - indicator: close
+        operator: cross_above
+        compare_to: dc_20
+        compare_output: upper
+      - indicator: adx_14
+        operator: greater_than
+        value: 25
+
+  exit:
+    logic: OR
+    conditions:
+      - indicator: close
+        operator: cross_below
+        compare_to: dc_10
+        compare_output: lower
+      - indicator: adx_14
+        operator: less_than
+        value: 18
+
+risk:
+  stop_loss:
+    enabled: true
+    percent: 5.0
+  take_profit:
+    enabled: true
+    percent: 14.0
+  trailing_stop:
+    enabled: true
+    percent: 4.0

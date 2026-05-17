@@ -43,15 +43,15 @@ def main():
     pd.set_option('display.max_rows', None)  # 모든 행 표시
 
     # 인증 토큰 발급
-    ka.auth()
+    ka.auth(svr="vps")
 
     trenv = ka.getTREnv()
 
     # case1 조회
     logging.info("=== case1 조회 ===")
     try:
-        result = order_cash(env_dv="real", ord_dv="sell", cano=trenv.my_acct, acnt_prdt_cd=trenv.my_prod, pdno="005930",
-                            ord_dvsn="00", ord_qty="1", ord_unpr="2000", excg_id_dvsn_cd="SOR")
+        result = order_cash(env_dv="demo", ord_dv="sell", cano=trenv.my_acct, acnt_prdt_cd=trenv.my_prod, pdno="005930",
+                            ord_dvsn="00", ord_qty="1", ord_unpr="2000", excg_id_dvsn_cd="KRX")
     except ValueError as e:
         logging.error("에러 발생: %s" % str(e))
         return

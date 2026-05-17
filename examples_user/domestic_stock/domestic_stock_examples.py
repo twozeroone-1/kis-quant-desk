@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # 인증
-ka.auth()
+ka.auth(svr="vps")
 trenv = ka.getTREnv()
 
 ##############################################################################################
@@ -353,7 +353,7 @@ print(result2)
 ##############################################################################################
 
 result1, result2 = inquire_balance(
-    env_dv="real",
+    env_dv="demo",
     cano=trenv.my_acct,
     acnt_prdt_cd=trenv.my_prod,
     afhr_flpr_yn="N",
@@ -946,8 +946,8 @@ print(df)
 # [국내주식] 주문/계좌 > 주식주문(현금)[v1_국내주식-001]
 ##############################################################################################
 
-result = order_cash(env_dv="real", ord_dv="sell", cano=trenv.my_acct, acnt_prdt_cd=trenv.my_prod, pdno="005930",
-                    ord_dvsn="00", ord_qty="1", ord_unpr="2000", excg_id_dvsn_cd="SOR")
+result = order_cash(env_dv="demo", ord_dv="sell", cano=trenv.my_acct, acnt_prdt_cd=trenv.my_prod, pdno="005930",
+                    ord_dvsn="00", ord_qty="1", ord_unpr="2000", excg_id_dvsn_cd="KRX")
 print(result)
 
 ##############################################################################################

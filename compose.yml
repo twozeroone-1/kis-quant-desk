@@ -1,0 +1,100 @@
+name: kis-stack
+
+services:
+  builder-backend:
+    build:
+      context: .
+      dockerfile: strategy_builder/Dockerfile.backend
+    env_file:
+      - .env.production
+    environment:
+      HOME: /home/kis
+      AUDIT_LOG_DIR: ${AUDIT_LOG_DIR:-/var/log/kis/orders}
+      AUDIT_LOG_RETENTION_DAYS: ${AUDIT_LOG_RETENTION_DAYS:-365}
+    volumes:
+      - ${KIS_CONFIG_DIR:-C:/kis-stack/config}:/home/kis/KIS/config
+      - ${KIS_LOG_DIR:-C:/kis-stack/logs}:/var/log/kis
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  builder-frontend:
+    build:
+      context: .
+      dockerfile: strategy_builder/Dockerfile.frontend
+    expose:
+      - "3000"
+    depends_on:
+      builder-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  backtest-backend:
+    build:
+      context: .
+      dockerfile: backtester/Dockerfile.backend
+    env_file:
+      - .env.production
+    environment:
+      HOME: /home/kis
+    volumes:
+      - ${KIS_CONFIG_DIR:-C:/kis-stack/config}:/home/kis/KIS/config
+      - backtester_workspace:/app/.lean-workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    expose:
+      - "8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  backtest-frontend:
+    build:
+      context: .
+      dockerfile: backtester/Dockerfile.frontend
+    expose:
+      - "3001"
+    depends_on:
+      backtest-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10-alpine
+    env_file:
+      - .env.production
+    ports:
+      - "${CADDY_BIND_IP:-127.0.0.1}:8081:8081"
+      - "${CADDY_BIND_IP:-127.0.0.1}:8082:8082"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      builder-frontend:
+        condition: service_healthy
+      backtest-frontend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  backtester_workspace:

@@ -111,6 +111,39 @@ def append_to_symbol_properties(symbols: list[dict]) -> int:
     return len(new_symbols)
 
 
+def dedupe_symbol_properties() -> int:
+    """Lean 키(market, symbol, type) 기준 중복 행 제거."""
+    seen = set()
+    kept_lines = []
+    removed = 0
+
+    with open(SYMBOL_PROPS_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.rstrip("\n")
+            if not stripped or stripped.startswith("#"):
+                kept_lines.append(line)
+                continue
+
+            parts = stripped.split(",")
+            if len(parts) < 3:
+                kept_lines.append(line)
+                continue
+
+            key = tuple(parts[:3])
+            if key in seen:
+                removed += 1
+                continue
+
+            seen.add(key)
+            kept_lines.append(line)
+
+    if removed:
+        with open(SYMBOL_PROPS_FILE, "w", encoding="utf-8") as f:
+            f.writelines(kept_lines)
+
+    return removed
+
+
 def main():
     print("=" * 50)
     print("KIS 마스터파일 다운로드")
@@ -144,6 +177,10 @@ def main():
             
         except Exception as e:
             print(f"  ❌ 오류: {e}")
+
+    removed = dedupe_symbol_properties()
+    if removed:
+        print(f"\n중복 symbol-properties {removed}건 제거됨")
     
     print()
     print("=" * 50)

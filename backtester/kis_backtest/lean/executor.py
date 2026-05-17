@@ -202,8 +202,8 @@ class LeanExecutor:
             "-v", f"{project_path}:/Algorithm:ro",
             "-v", f"{data_path}:/Data:ro",
             "-v", f"{results_path}:/Results",
-            "-v", f"{config_path}:/Lean/Launcher/bin/Debug/config.json:ro",
             LEAN_IMAGE,
+            "--config", "/Algorithm/lean-config.json",
         ]
         
         logger.info(f"[Lean] Docker 실행: {project.run_id}")
