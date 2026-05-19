@@ -50,6 +50,50 @@ function Wait-DockerReady {
     throw "Docker Desktop did not become ready within $TimeoutSeconds seconds."
 }
 
+function Get-DotEnvValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not (Test-Path $Path)) {
+        return $null
+    }
+
+    $pattern = "^\s*{0}\s*=\s*(.*)\s*$" -f [regex]::Escape($Name)
+    foreach ($line in Get-Content -Path $Path) {
+        if ($line -match $pattern) {
+            return $Matches[1].Trim().Trim("'").Trim('"')
+        }
+    }
+
+    return $null
+}
+
+function Wait-IPAddressReady {
+    param(
+        [Parameter(Mandatory = $true)][string]$IPAddress,
+        [int]$TimeoutSeconds = 300
+    )
+
+    if ($IPAddress -in @("0.0.0.0", "127.0.0.1", "localhost", "")) {
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $matchingAddress = Get-NetIPAddress -IPAddress $IPAddress -ErrorAction SilentlyContinue
+        if ($matchingAddress) {
+            return
+        }
+
+        Write-Output "Waiting for IP address $IPAddress to become available..."
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $deadline)
+
+    throw "IP address $IPAddress did not become available within $TimeoutSeconds seconds."
+}
+
 function ConvertTo-BashLiteral {
     param([Parameter(Mandatory = $true)][string]$Value)
 
@@ -110,6 +154,11 @@ $EnvPath = Join-Path $RepoRoot $EnvFile
 
 Invoke-NativeCommand "docker desktop start" { & docker desktop start }
 Wait-DockerReady
+
+$caddyBindIp = Get-DotEnvValue -Path $EnvPath -Name "CADDY_BIND_IP"
+if ($caddyBindIp) {
+    Wait-IPAddressReady -IPAddress $caddyBindIp
+}
 
 Invoke-NativeCommand "docker compose up" { & docker compose --env-file $EnvPath up -d --build }
 
