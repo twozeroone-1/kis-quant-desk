@@ -61,6 +61,10 @@ export {
   clearAccountCache,
   getPendingOrders,
   cancelOrder,
+  getProtectiveOrders,
+  saveProtectiveOrder,
+  saveProtectiveSettings,
+  checkProtectiveOrders,
   type OrderResponse,
   type AccountInfo as OrdersAccountInfo,
   type HoldingItem,
@@ -68,6 +72,13 @@ export {
   type PendingOrdersResponse,
   type CancelOrderRequest,
   type CancelOrderResponse,
+  type ExitOrderType,
+  type ProtectiveOrder,
+  type ProtectiveOrdersResponse,
+  type ProtectiveSettings,
+  type ProtectiveRealtimeStatus,
+  type ProtectiveRealtimeTick,
+  type ProtectiveOrderUpsertRequest,
 } from "./orders";
 
 // Market

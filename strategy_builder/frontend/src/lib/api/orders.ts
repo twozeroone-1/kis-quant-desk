@@ -84,6 +84,84 @@ export interface CancelOrderResponse {
   message: string;
 }
 
+export type ExitOrderType = "market" | "limit";
+
+export interface ProtectiveOrder {
+  id?: string;
+  status: string;
+  source?: string;
+  market?: "domestic" | "us";
+  exchange?: string | null;
+  currency?: string;
+  stock_code: string;
+  stock_name: string;
+  quantity: number;
+  entry_price: number;
+  take_profit_enabled?: boolean;
+  take_profit_trigger_price?: number;
+  take_profit_limit_price?: number;
+  take_profit_order_type?: ExitOrderType;
+  stop_loss_enabled?: boolean;
+  stop_loss_price?: number;
+  stop_loss_limit_price?: number;
+  stop_loss_order_type?: ExitOrderType;
+  last_price?: number;
+  last_checked_at?: string;
+  exit_reason?: string;
+  exit_order_type?: ExitOrderType;
+  last_error?: string;
+}
+
+export interface ProtectiveOrdersResponse {
+  status: string;
+  orders: ProtectiveOrder[];
+  total_count: number;
+  settings?: ProtectiveSettings;
+  realtime?: ProtectiveRealtimeStatus;
+}
+
+export interface ProtectiveSettings {
+  monitor_interval_seconds: number;
+  price_source?: "websocket" | "rest";
+}
+
+export interface ProtectiveRealtimeTick {
+  market: "domestic" | "us";
+  stock_code: string;
+  exchange?: string | null;
+  price: number;
+  volume?: number;
+  tick_time?: string;
+  received_at?: string;
+}
+
+export interface ProtectiveRealtimeStatus {
+  connected: boolean;
+  subscription_count: number;
+  last_connected_at?: string | null;
+  last_error?: string | null;
+  latest_ticks?: ProtectiveRealtimeTick[];
+}
+
+export interface ProtectiveOrderUpsertRequest {
+  stock_code: string;
+  stock_name: string;
+  quantity: number;
+  entry_price: number;
+  enabled: boolean;
+  take_profit_enabled: boolean;
+  take_profit_trigger_price?: number | null;
+  take_profit_order_type: ExitOrderType;
+  take_profit_limit_price?: number | null;
+  stop_loss_enabled: boolean;
+  stop_loss_trigger_price?: number | null;
+  stop_loss_order_type: ExitOrderType;
+  stop_loss_limit_price?: number | null;
+  market?: "domestic" | "us";
+  exchange?: string | null;
+  currency?: string;
+}
+
 /**
  * 주문 실행
  */
@@ -137,4 +215,22 @@ export async function getPendingOrders(): Promise<PendingOrdersResponse> {
  */
 export async function cancelOrder(request: CancelOrderRequest): Promise<CancelOrderResponse> {
   return apiPost<CancelOrderResponse>("/api/orders/cancel", request);
+}
+
+export async function getProtectiveOrders(): Promise<ProtectiveOrdersResponse> {
+  return apiGet<ProtectiveOrdersResponse>("/api/orders/protective");
+}
+
+export async function saveProtectiveOrder(request: ProtectiveOrderUpsertRequest): Promise<{ status: string; order: ProtectiveOrder }> {
+  return apiPost<{ status: string; order: ProtectiveOrder }>("/api/orders/protective", request);
+}
+
+export async function saveProtectiveSettings(
+  request: ProtectiveSettings
+): Promise<{ status: string; settings: ProtectiveSettings }> {
+  return apiPost<{ status: string; settings: ProtectiveSettings }>("/api/orders/protective/settings", request);
+}
+
+export async function checkProtectiveOrders(): Promise<ProtectiveOrdersResponse> {
+  return apiPost<ProtectiveOrdersResponse>("/api/orders/protective/check");
 }

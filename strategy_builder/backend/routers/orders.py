@@ -12,7 +12,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from core import data_fetcher, overseas_data_fetcher
@@ -21,7 +21,14 @@ from core.signal import Action, Signal
 from core.data_fetcher import get_deposit, get_holdings, get_pending_orders, cancel_order, clear_balance_cache
 from backend import is_authenticated, get_current_mode
 from backend.services.audit_log import write_order_audit
-from backend.services.protective_orders import list_protective_orders, register_after_buy, run_monitor_cycle
+from backend.services.protective_orders import (
+    list_protective_orders,
+    register_after_buy,
+    run_monitor_cycle,
+    update_monitor_settings,
+    upsert_existing_position_protection,
+)
+from backend.services.realtime_price_stream import get_realtime_price_stream
 
 logging.basicConfig(level=logging.INFO)
 
@@ -113,6 +120,31 @@ class ProtectiveOrderRequest(BaseModel):
     enabled: bool = False
     take_profit_percent: float | None = None
     stop_loss_percent: float | None = None
+
+
+class ProtectiveReviewRequest(BaseModel):
+    """이미 보유 중인 종목에 붙이는 전략 검토 감시 설정"""
+    stock_code: str
+    stock_name: str
+    quantity: int
+    entry_price: float
+    enabled: bool = True
+    take_profit_enabled: bool = True
+    take_profit_trigger_price: float | None = None
+    take_profit_order_type: str = "limit"
+    take_profit_limit_price: float | None = None
+    stop_loss_enabled: bool = True
+    stop_loss_trigger_price: float | None = None
+    stop_loss_order_type: str = "market"
+    stop_loss_limit_price: float | None = None
+    market: str = "domestic"
+    exchange: str | None = None
+    currency: str = "KRW"
+
+
+class ProtectiveSettingsRequest(BaseModel):
+    """전략 검토 감시 서비스 설정"""
+    monitor_interval_seconds: int
 
 
 class OrderRequest(BaseModel):
@@ -654,6 +686,67 @@ async def get_protective_orders_api():
         "status": "success",
         "orders": state.get("orders", []),
         "total_count": len(state.get("orders", [])),
+        "settings": state.get("settings", {}),
+        "realtime": get_realtime_price_stream().status(),
+    }
+
+
+@router.post("/protective/settings")
+async def update_protective_settings_api(request: ProtectiveSettingsRequest):
+    """보호주문 감시 서비스 설정 저장"""
+    if not is_authenticated():
+        raise HTTPException(status_code=401, detail="인증이 필요합니다")
+    settings = await update_monitor_settings(
+        monitor_interval_seconds=request.monitor_interval_seconds,
+    )
+    return {
+        "status": "success",
+        "settings": settings,
+    }
+
+
+@router.post("/protective")
+async def upsert_protective_order_api(request: ProtectiveReviewRequest):
+    """보유 종목의 손익절 감시 설정을 저장합니다."""
+    if not is_authenticated():
+        raise HTTPException(status_code=401, detail="인증이 필요합니다")
+    if request.quantity <= 0:
+        raise HTTPException(status_code=400, detail="감시 수량이 올바르지 않습니다")
+    if request.entry_price <= 0:
+        raise HTTPException(status_code=400, detail="기준 단가가 올바르지 않습니다")
+    if request.take_profit_order_type not in {"market", "limit"}:
+        raise HTTPException(status_code=400, detail="익절 주문 방식이 올바르지 않습니다")
+    if request.stop_loss_order_type not in {"market", "limit"}:
+        raise HTTPException(status_code=400, detail="손절 주문 방식이 올바르지 않습니다")
+    if request.market not in {"domestic", "us"}:
+        raise HTTPException(status_code=400, detail="시장 구분이 올바르지 않습니다")
+
+    try:
+        protection = await upsert_existing_position_protection(
+            env_dv=get_current_mode(),
+            stock_code=request.stock_code.strip(),
+            stock_name=request.stock_name.strip(),
+            quantity=request.quantity,
+            entry_price=request.entry_price,
+            enabled=request.enabled,
+            take_profit_enabled=request.take_profit_enabled,
+            take_profit_trigger_price=request.take_profit_trigger_price,
+            take_profit_order_type=request.take_profit_order_type,
+            take_profit_limit_price=request.take_profit_limit_price,
+            stop_loss_enabled=request.stop_loss_enabled,
+            stop_loss_trigger_price=request.stop_loss_trigger_price,
+            stop_loss_order_type=request.stop_loss_order_type,
+            stop_loss_limit_price=request.stop_loss_limit_price,
+            market=request.market,
+            exchange=request.exchange,
+            currency=request.currency,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "success",
+        "order": protection,
     }
 
 
@@ -668,7 +761,35 @@ async def check_protective_orders_api():
         "status": "success",
         "orders": state.get("orders", []),
         "total_count": len(state.get("orders", [])),
+        "settings": state.get("settings", {}),
+        "realtime": get_realtime_price_stream().status(),
     }
+
+
+@router.websocket("/protective/prices/ws")
+async def protective_prices_ws(websocket: WebSocket):
+    """전략 검토 화면용 실시간 체결가 스트림."""
+    await websocket.accept()
+    if not is_authenticated():
+        await websocket.send_json({"type": "error", "message": "인증이 필요합니다"})
+        await websocket.close(code=1008)
+        return
+
+    stream = get_realtime_price_stream()
+    await stream.start()
+    try:
+        while True:
+            raw = await websocket.receive_json()
+            if raw.get("type") == "subscribe":
+                await stream.add_client(websocket, raw.get("symbols") or [])
+                await websocket.send_json({
+                    "type": "status",
+                    "realtime": stream.status(),
+                })
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await stream.remove_client(websocket)
 
 
 @router.get("/account", response_model=AccountResponse)

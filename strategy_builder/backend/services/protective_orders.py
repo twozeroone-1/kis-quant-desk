@@ -31,7 +31,10 @@ from core.signal import Action, Signal
 logger = logging.getLogger(__name__)
 
 STATE_FILE = Path(__file__).resolve().parents[2] / ".runtime" / "protective_orders.json"
-MONITOR_INTERVAL_SECONDS = 15
+DEFAULT_MONITOR_INTERVAL_SECONDS = 15
+MIN_MONITOR_INTERVAL_SECONDS = 5
+MAX_MONITOR_INTERVAL_SECONDS = 300
+REALTIME_FRESH_SECONDS = 30
 
 _monitor_task: Optional[asyncio.Task] = None
 _state_lock = asyncio.Lock()
@@ -79,14 +82,33 @@ def _round_price(market: str, price: float, direction: str) -> float:
 
 def _load_state_sync() -> dict[str, Any]:
     if not STATE_FILE.exists():
-        return {"orders": []}
+        return {
+            "orders": [],
+            "settings": {
+                "monitor_interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS,
+                "price_source": "websocket",
+            },
+        }
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict) and isinstance(data.get("orders"), list):
+            settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
+            interval = settings.get("monitor_interval_seconds", DEFAULT_MONITOR_INTERVAL_SECONDS)
+            data["settings"] = {
+                **settings,
+                "monitor_interval_seconds": _normalize_monitor_interval(interval),
+                "price_source": settings.get("price_source") or "websocket",
+            }
             return data
     except Exception as exc:
         logger.warning("protective order state load failed: %s", exc)
-    return {"orders": []}
+    return {
+        "orders": [],
+        "settings": {
+            "monitor_interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS,
+            "price_source": "websocket",
+        },
+    }
 
 
 def _save_state_sync(state: dict[str, Any]) -> None:
@@ -102,6 +124,50 @@ async def _load_state() -> dict[str, Any]:
 async def _save_state(state: dict[str, Any]) -> None:
     async with _state_lock:
         await asyncio.to_thread(_save_state_sync, state)
+
+
+def _normalize_monitor_interval(value: Any) -> int:
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        interval = DEFAULT_MONITOR_INTERVAL_SECONDS
+    return max(MIN_MONITOR_INTERVAL_SECONDS, min(MAX_MONITOR_INTERVAL_SECONDS, interval))
+
+
+async def _get_monitor_interval_seconds() -> int:
+    state = await _load_state()
+    settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
+    return _normalize_monitor_interval(settings.get("monitor_interval_seconds"))
+
+
+def _is_recent_realtime(order: dict[str, Any]) -> bool:
+    value = order.get("last_realtime_at")
+    if not value:
+        return False
+    try:
+        checked_at = datetime.fromisoformat(str(value))
+    except ValueError:
+        return False
+    return (datetime.now() - checked_at).total_seconds() <= REALTIME_FRESH_SECONDS
+
+
+async def _sync_realtime_subscriptions(state: dict[str, Any] | None = None) -> None:
+    try:
+        from backend.services.realtime_price_stream import get_realtime_price_stream
+
+        state = state or await _load_state()
+        orders = [
+            {
+                "market": order.get("market", "domestic"),
+                "stock_code": order.get("stock_code"),
+                "exchange": order.get("exchange"),
+            }
+            for order in state.get("orders", [])
+            if order.get("status") == "active"
+        ]
+        await get_realtime_price_stream().set_protective_subscriptions(orders)
+    except Exception:
+        logger.exception("realtime subscription sync failed")
 
 
 def _get_holding_map(env_dv: str, market: str = "domestic") -> dict[str, dict[str, Any]]:
@@ -217,6 +283,8 @@ def _cancel_take_profit(order: dict[str, Any], env_dv: str) -> None:
 def _ensure_take_profit(order: dict[str, Any], env_dv: str, pending: dict[str, dict[str, Any]]) -> None:
     if not order.get("take_profit_enabled"):
         return
+    if order.get("take_profit_submit_mode") == "on_trigger":
+        return
     if _is_order_pending(order.get("take_profit_order_no"), pending):
         return
 
@@ -246,6 +314,52 @@ def _ensure_take_profit(order: dict[str, Any], env_dv: str, pending: dict[str, d
         })
     else:
         order["take_profit_status"] = "submit_failed"
+
+
+def _submit_triggered_exit(
+    order: dict[str, Any],
+    env_dv: str,
+    *,
+    reason: str,
+    exit_reason: str,
+    order_type: str,
+    price: Optional[float],
+    current_price: float,
+) -> dict[str, Any]:
+    order_type = "market" if order_type not in {"market", "limit"} else order_type
+    market = str(order.get("market") or "domestic")
+    if market == "us" and order_type == "market":
+        order_type = "limit"
+        price = current_price
+
+    order_no, org_no, ok = _submit_exit_order(
+        env_dv=env_dv,
+        stock_code=str(order["stock_code"]),
+        stock_name=str(order["stock_name"]),
+        quantity=int(order["quantity"]),
+        order_type=order_type,
+        price=price if order_type == "limit" else None,
+        market=market,
+        exchange=order.get("exchange"),
+        reason=reason,
+    )
+    if ok:
+        order["status"] = "exit_submitted"
+        order["exit_order_no"] = order_no
+        order["exit_org_no"] = org_no
+        order["exit_reason"] = exit_reason
+        order["exit_order_type"] = order_type
+        order["closed_at"] = _now()
+        order.setdefault("events", []).append({
+            "type": f"{exit_reason}_submitted",
+            "at": _now(),
+            "order_no": order_no,
+            "order_type": order_type,
+            "current_price": current_price,
+        })
+    else:
+        order["last_error"] = f"{exit_reason} sell submit failed"
+    return order
 
 
 def _check_order_sync(order: dict[str, Any], env_dv: str) -> dict[str, Any]:
@@ -282,37 +396,91 @@ def _check_order_sync(order: dict[str, Any], env_dv: str) -> dict[str, Any]:
     order["last_price"] = current_price
     order["last_checked_at"] = _now()
 
+    take_profit_trigger = float(order.get("take_profit_trigger_price") or order.get("take_profit_price") or 0)
+    if (
+        order.get("take_profit_enabled")
+        and order.get("take_profit_submit_mode") == "on_trigger"
+        and take_profit_trigger > 0
+        and current_price >= take_profit_trigger
+    ):
+        _cancel_take_profit(order, env_dv)
+        return _submit_triggered_exit(
+            order,
+            env_dv,
+            reason=(
+                f"보호주문 익절 {order.get('take_profit_order_type', 'limit')} "
+                f"{order.get('take_profit_pct')}%: 현재가 {current_price} >= {take_profit_trigger}"
+            ),
+            exit_reason="take_profit",
+            order_type=str(order.get("take_profit_order_type") or "limit"),
+            price=float(order.get("take_profit_limit_price") or order.get("take_profit_price") or take_profit_trigger),
+            current_price=current_price,
+        )
+
     stop_loss_price = float(order["stop_loss_price"])
     if order.get("stop_loss_enabled") and current_price <= stop_loss_price:
         _cancel_take_profit(order, env_dv)
-        order_no, org_no, ok = _submit_exit_order(
-            env_dv=env_dv,
-            stock_code=str(order["stock_code"]),
-            stock_name=str(order["stock_name"]),
-            quantity=int(order["quantity"]),
-            order_type="market" if market != "us" else "limit",
-            price=current_price if market == "us" else None,
-            market=market,
-            exchange=order.get("exchange"),
+        return _submit_triggered_exit(
+            order,
+            env_dv,
             reason=(
-                ("보호주문 손절 지정가 " if market == "us" else "보호주문 손절 시장가 ") +
+                f"보호주문 손절 {order.get('stop_loss_order_type', 'market')} "
                 f"{order['stop_loss_pct']}%: 현재가 {current_price} <= {stop_loss_price}"
             ),
+            exit_reason="stop_loss",
+            order_type=str(order.get("stop_loss_order_type") or "market"),
+            price=float(order.get("stop_loss_limit_price") or stop_loss_price),
+            current_price=current_price,
         )
-        if ok:
-            order["status"] = "exit_submitted"
-            order["exit_order_no"] = order_no
-            order["exit_org_no"] = org_no
-            order["exit_reason"] = "stop_loss"
-            order["closed_at"] = _now()
-            order.setdefault("events", []).append({
-                "type": "stop_loss_submitted",
-                "at": _now(),
-                "order_no": order_no,
-                "current_price": current_price,
-            })
-        else:
-            order["last_error"] = "stop-loss sell submit failed"
+
+    return order
+
+
+def _check_realtime_trigger_sync(order: dict[str, Any], env_dv: str, current_price: float) -> dict[str, Any]:
+    if order.get("status") != "active" or current_price <= 0:
+        return order
+
+    order["last_price"] = current_price
+    order["last_checked_at"] = _now()
+    order["last_realtime_at"] = _now()
+    order.pop("last_error", None)
+
+    take_profit_trigger = float(order.get("take_profit_trigger_price") or order.get("take_profit_price") or 0)
+    if (
+        order.get("take_profit_enabled")
+        and order.get("take_profit_submit_mode") == "on_trigger"
+        and take_profit_trigger > 0
+        and current_price >= take_profit_trigger
+    ):
+        _cancel_take_profit(order, env_dv)
+        return _submit_triggered_exit(
+            order,
+            env_dv,
+            reason=(
+                f"실시간 보호주문 익절 {order.get('take_profit_order_type', 'limit')} "
+                f"{order.get('take_profit_pct')}%: 현재가 {current_price} >= {take_profit_trigger}"
+            ),
+            exit_reason="take_profit",
+            order_type=str(order.get("take_profit_order_type") or "limit"),
+            price=float(order.get("take_profit_limit_price") or order.get("take_profit_price") or take_profit_trigger),
+            current_price=current_price,
+        )
+
+    stop_loss_price = float(order.get("stop_loss_price") or 0)
+    if order.get("stop_loss_enabled") and stop_loss_price > 0 and current_price <= stop_loss_price:
+        _cancel_take_profit(order, env_dv)
+        return _submit_triggered_exit(
+            order,
+            env_dv,
+            reason=(
+                f"실시간 보호주문 손절 {order.get('stop_loss_order_type', 'market')} "
+                f"{order.get('stop_loss_pct')}%: 현재가 {current_price} <= {stop_loss_price}"
+            ),
+            exit_reason="stop_loss",
+            order_type=str(order.get("stop_loss_order_type") or "market"),
+            price=float(order.get("stop_loss_limit_price") or stop_loss_price),
+            current_price=current_price,
+        )
 
     return order
 
@@ -352,15 +520,22 @@ async def register_after_buy(
         "quantity": quantity,
         "entry_price": entry_price,
         "source_order_no": source_order_no,
+        "source": "after_buy",
         "take_profit_enabled": take_profit_enabled,
         "take_profit_pct": take_profit_pct,
         "take_profit_price": _round_price(market, entry_price * (1 + (take_profit_pct or 0) / 100), "up"),
+        "take_profit_trigger_price": _round_price(market, entry_price * (1 + (take_profit_pct or 0) / 100), "up"),
+        "take_profit_limit_price": _round_price(market, entry_price * (1 + (take_profit_pct or 0) / 100), "up"),
+        "take_profit_order_type": "limit",
+        "take_profit_submit_mode": "resting_limit",
         "take_profit_status": "not_submitted",
         "take_profit_order_no": None,
         "take_profit_org_no": None,
         "stop_loss_enabled": stop_loss_enabled,
         "stop_loss_pct": stop_loss_pct,
         "stop_loss_price": _round_price(market, entry_price * (1 - (stop_loss_pct or 0) / 100), "down"),
+        "stop_loss_limit_price": _round_price(market, entry_price * (1 - (stop_loss_pct or 0) / 100), "down"),
+        "stop_loss_order_type": "market",
         "created_at": _now(),
         "last_checked_at": None,
         "events": [{"type": "created", "at": _now()}],
@@ -377,6 +552,7 @@ async def register_after_buy(
     ]
     state["orders"].append(protection)
     await _save_state(state)
+    await _sync_realtime_subscriptions(state)
 
     updated = await asyncio.to_thread(_check_order_sync, protection, env_dv)
     state = await _load_state()
@@ -385,11 +561,123 @@ async def register_after_buy(
             state["orders"][index] = updated
             break
     await _save_state(state)
+    await _sync_realtime_subscriptions(state)
     return updated
+
+
+async def upsert_existing_position_protection(
+    *,
+    env_dv: str,
+    stock_code: str,
+    stock_name: str,
+    quantity: int,
+    entry_price: float,
+    enabled: bool,
+    take_profit_enabled: bool,
+    take_profit_trigger_price: Optional[float],
+    take_profit_order_type: str = "limit",
+    take_profit_limit_price: Optional[float] = None,
+    stop_loss_enabled: bool = True,
+    stop_loss_trigger_price: Optional[float] = None,
+    stop_loss_order_type: str = "market",
+    stop_loss_limit_price: Optional[float] = None,
+    market: str = "domestic",
+    exchange: Optional[str] = None,
+    currency: str = "KRW",
+) -> dict[str, Any]:
+    """Create or replace a trigger-based protection group for an existing holding."""
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+    if entry_price <= 0:
+        raise ValueError("entry_price must be positive")
+
+    state = await _load_state()
+    existing_orders = state.get("orders", [])
+    if not enabled:
+        changed = False
+        for order in existing_orders:
+            if (
+                order.get("status") == "active"
+                and order.get("stock_code") == stock_code
+                and order.get("env_dv") == env_dv
+                and order.get("market", "domestic") == market
+            ):
+                order["status"] = "disabled"
+                order["closed_at"] = _now()
+                order.setdefault("events", []).append({"type": "disabled", "at": _now()})
+                changed = True
+        if changed:
+            await _save_state(state)
+            await _sync_realtime_subscriptions(state)
+        return {"status": "disabled", "stock_code": stock_code}
+
+    if not take_profit_enabled and not stop_loss_enabled:
+        raise ValueError("take_profit or stop_loss must be enabled")
+
+    tp_trigger = float(take_profit_trigger_price or 0)
+    sl_trigger = float(stop_loss_trigger_price or 0)
+    if take_profit_enabled and tp_trigger <= 0:
+        raise ValueError("take_profit_trigger_price must be positive")
+    if stop_loss_enabled and sl_trigger <= 0:
+        raise ValueError("stop_loss_trigger_price must be positive")
+
+    take_profit_order_type = take_profit_order_type if take_profit_order_type in {"market", "limit"} else "limit"
+    stop_loss_order_type = stop_loss_order_type if stop_loss_order_type in {"market", "limit"} else "market"
+    tp_pct = ((tp_trigger / entry_price) - 1) * 100 if take_profit_enabled else None
+    sl_pct = (1 - (sl_trigger / entry_price)) * 100 if stop_loss_enabled else None
+
+    protection = {
+        "id": uuid4().hex,
+        "status": "active",
+        "env_dv": env_dv,
+        "market": market,
+        "exchange": exchange,
+        "currency": currency,
+        "stock_code": stock_code,
+        "stock_name": stock_name,
+        "quantity": quantity,
+        "entry_price": entry_price,
+        "source": "review",
+        "source_order_no": None,
+        "take_profit_enabled": take_profit_enabled,
+        "take_profit_pct": round(tp_pct, 2) if tp_pct is not None else None,
+        "take_profit_price": _round_price(market, tp_trigger or entry_price, "up"),
+        "take_profit_trigger_price": _round_price(market, tp_trigger or entry_price, "up"),
+        "take_profit_limit_price": _round_price(market, take_profit_limit_price or tp_trigger or entry_price, "down"),
+        "take_profit_order_type": take_profit_order_type,
+        "take_profit_submit_mode": "on_trigger",
+        "take_profit_status": "waiting_trigger",
+        "take_profit_order_no": None,
+        "take_profit_org_no": None,
+        "stop_loss_enabled": stop_loss_enabled,
+        "stop_loss_pct": round(sl_pct, 2) if sl_pct is not None else None,
+        "stop_loss_price": _round_price(market, sl_trigger or entry_price, "down"),
+        "stop_loss_limit_price": _round_price(market, stop_loss_limit_price or sl_trigger or entry_price, "down"),
+        "stop_loss_order_type": stop_loss_order_type,
+        "created_at": _now(),
+        "last_checked_at": None,
+        "events": [{"type": "created_from_review", "at": _now()}],
+    }
+
+    state["orders"] = [
+        order for order in existing_orders
+        if not (
+            order.get("status") == "active"
+            and order.get("stock_code") == stock_code
+            and order.get("env_dv") == env_dv
+            and order.get("market", "domestic") == market
+        )
+    ]
+    state["orders"].append(protection)
+    await _save_state(state)
+    await _sync_realtime_subscriptions(state)
+    return protection
 
 
 async def run_monitor_cycle() -> None:
     state = await _load_state()
+    settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
+    price_source = settings.get("price_source") or "websocket"
     changed = False
     updated_orders = []
 
@@ -398,10 +686,20 @@ async def run_monitor_cycle() -> None:
             updated_orders.append(order)
             continue
 
+        if (
+            price_source == "websocket"
+            and order.get("source") == "review"
+            and order.get("take_profit_submit_mode") == "on_trigger"
+            and _is_recent_realtime(order)
+        ):
+            updated_orders.append(order)
+            continue
+
         try:
+            before = json.dumps(order, sort_keys=True, default=str)
             updated = await asyncio.to_thread(_check_order_sync, order, str(order.get("env_dv") or "vps"))
             updated_orders.append(updated)
-            changed = changed or updated != order
+            changed = changed or json.dumps(updated, sort_keys=True, default=str) != before
         except Exception as exc:
             order["last_error"] = str(exc)
             order["last_checked_at"] = _now()
@@ -412,6 +710,53 @@ async def run_monitor_cycle() -> None:
     if changed:
         state["orders"] = updated_orders
         await _save_state(state)
+        await _sync_realtime_subscriptions(state)
+
+
+async def handle_realtime_tick(tick: dict[str, Any]) -> None:
+    state = await _load_state()
+    changed = False
+    updated_orders = []
+    tick_market = str(tick.get("market") or "domestic")
+    tick_code = str(tick.get("stock_code") or "")
+    tick_exchange = tick.get("exchange")
+    current_price = float(tick.get("price") or 0)
+
+    for order in state.get("orders", []):
+        if order.get("status") != "active":
+            updated_orders.append(order)
+            continue
+        if str(order.get("market") or "domestic") != tick_market:
+            updated_orders.append(order)
+            continue
+        if str(order.get("stock_code") or "") != tick_code:
+            updated_orders.append(order)
+            continue
+        if tick_market == "us" and (order.get("exchange") or None) != (tick_exchange or None):
+            updated_orders.append(order)
+            continue
+
+        try:
+            before = json.dumps(order, sort_keys=True, default=str)
+            updated = await asyncio.to_thread(
+                _check_realtime_trigger_sync,
+                order,
+                str(order.get("env_dv") or "vps"),
+                current_price,
+            )
+            updated_orders.append(updated)
+            changed = changed or json.dumps(updated, sort_keys=True, default=str) != before
+        except Exception as exc:
+            order["last_error"] = str(exc)
+            order["last_checked_at"] = _now()
+            updated_orders.append(order)
+            changed = True
+            logger.exception("realtime protective order check failed")
+
+    if changed:
+        state["orders"] = updated_orders
+        await _save_state(state)
+        await _sync_realtime_subscriptions(state)
 
 
 async def _monitor_loop() -> None:
@@ -422,11 +767,21 @@ async def _monitor_loop() -> None:
             raise
         except Exception:
             logger.exception("protective order monitor cycle failed")
-        await asyncio.sleep(MONITOR_INTERVAL_SECONDS)
+        await asyncio.sleep(await _get_monitor_interval_seconds())
 
 
 async def start_monitor() -> None:
     global _monitor_task
+    try:
+        from backend.services.realtime_price_stream import get_realtime_price_stream
+
+        stream = get_realtime_price_stream()
+        stream.set_tick_handler(handle_realtime_tick)
+        await stream.start()
+        await _sync_realtime_subscriptions()
+    except Exception:
+        logger.exception("realtime price stream startup failed")
+
     if _monitor_task is None or _monitor_task.done():
         _monitor_task = asyncio.create_task(_monitor_loop())
         logger.info("protective order monitor started")
@@ -442,7 +797,23 @@ async def stop_monitor() -> None:
     except asyncio.CancelledError:
         pass
     _monitor_task = None
+    try:
+        from backend.services.realtime_price_stream import get_realtime_price_stream
+
+        await get_realtime_price_stream().stop()
+    except Exception:
+        logger.exception("realtime price stream shutdown failed")
 
 
 async def list_protective_orders() -> dict[str, Any]:
     return await _load_state()
+
+
+async def update_monitor_settings(*, monitor_interval_seconds: int) -> dict[str, Any]:
+    state = await _load_state()
+    settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
+    settings["monitor_interval_seconds"] = _normalize_monitor_interval(monitor_interval_seconds)
+    state["settings"] = settings
+    await _save_state(state)
+    await _sync_realtime_subscriptions(state)
+    return settings

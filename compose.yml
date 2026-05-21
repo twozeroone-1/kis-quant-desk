@@ -85,15 +85,10 @@ services:
     env_file:
       - .env.production
     ports:
-      - "${CADDY_BIND_IP:-127.0.0.1}:8081:8081"
-      - "${CADDY_BIND_IP:-127.0.0.1}:8082:8082"
+      - "${CADDY_BIND_IP:-0.0.0.0}:8081:8081"
+      - "${CADDY_BIND_IP:-0.0.0.0}:8082:8082"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-    depends_on:
-      builder-frontend:
-        condition: service_healthy
-      backtest-frontend:
-        condition: service_healthy
     restart: unless-stopped
 
 volumes:
