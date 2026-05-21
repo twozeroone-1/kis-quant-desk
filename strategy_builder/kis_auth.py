@@ -274,6 +274,35 @@ def getTREnv():
     return _TRENV
 
 
+def _clear_saved_token():
+    try:
+        if os.path.exists(token_tmp):
+            os.remove(token_tmp)
+    except OSError as exc:
+        logging.warning("토큰 파일 삭제 실패: %s", exc)
+
+
+def _is_expired_token_response(resp) -> bool:
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    msg_cd = str(body.get("msg_cd") or "")
+    msg1 = str(body.get("msg1") or "")
+    return msg_cd == "EGW00123" or "기간이 만료된 token" in msg1 or "EGW00123" in getattr(resp, "text", "")
+
+
+def _reauth_current_env():
+    try:
+        trenv = getTREnv()
+        product = trenv.my_prod
+    except Exception:
+        product = _cfg["my_prod"]
+    svr = "vps" if isPaperTrading() else "prod"
+    _clear_saved_token()
+    auth(svr=svr, product=product)
+
+
 # 주문 API에서 사용할 hash key값을 받아 header에 설정해 주는 함수
 # 현재는 hash key 필수 사항아님, 생략가능, API 호출과정에서 변조 우려를 하는 경우 사용
 # Input: HTTP Header, HTTP post param
@@ -459,11 +488,25 @@ def _url_fetch(
         print(f"<header>\n{headers}")
         print(f"<body>\n{params}")
 
-    if postFlag:
-        # if (hashFlag): set_order_hash_key(headers, params)
-        res = requests.post(url, headers=headers, data=json.dumps(params))
-    else:
-        res = requests.get(url, headers=headers, params=params)
+    def send_request():
+        if postFlag:
+            # if (hashFlag): set_order_hash_key(headers, params)
+            return requests.post(url, headers=headers, data=json.dumps(params))
+        return requests.get(url, headers=headers, params=params)
+
+    res = send_request()
+    if _is_expired_token_response(res):
+        logging.warning("KIS token expired; refreshing token and retrying request once.")
+        _reauth_current_env()
+        headers = _getBaseHeader()
+        headers["tr_id"] = tr_id
+        headers["custtype"] = "P"
+        headers["tr_cont"] = tr_cont
+        if appendHeaders is not None:
+            if len(appendHeaders) > 0:
+                for x in appendHeaders.keys():
+                    headers[x] = appendHeaders.get(x)
+        res = send_request()
 
     if res.status_code == 200:
         ar = APIResp(res)

@@ -18,7 +18,11 @@ interface UseStrategyExecutorResult {
   loadStrategies: () => Promise<void>;
   selectStrategy: (strategy: StrategyInfo | null) => void;
   setParam: (name: string, value: number) => void;
-  execute: (stocks: string[]) => Promise<SignalResult[]>;
+  execute: (
+    stocks: string[],
+    market?: "domestic" | "us",
+    symbolMeta?: Record<string, { exchange?: "NASD" | "NYSE" | "AMEX" }>
+  ) => Promise<SignalResult[]>;
   clearSignals: () => void;
 }
 
@@ -87,7 +91,11 @@ export function useStrategyExecutor(): UseStrategyExecutorResult {
     }));
   }, []);
 
-  const execute = useCallback(async (stocks: string[]): Promise<SignalResult[]> => {
+  const execute = useCallback(async (
+    stocks: string[],
+    market: "domestic" | "us" = "domestic",
+    symbolMeta: Record<string, { exchange?: "NASD" | "NYSE" | "AMEX" }> = {}
+  ): Promise<SignalResult[]> => {
     if (!selectedStrategy) {
       setError("전략을 선택해주세요");
       return [];
@@ -109,7 +117,9 @@ export function useStrategyExecutor(): UseStrategyExecutorResult {
         selectedStrategy.id,
         stocks,
         params,
-        selectedStrategy.isLocal ? selectedStrategy.builder_state : undefined
+        selectedStrategy.isLocal ? selectedStrategy.builder_state : undefined,
+        market,
+        symbolMeta
       );
 
       if (response.status === "success") {

@@ -10,6 +10,7 @@
 
 import { apiGet, apiPost, type LogEntry } from "./client";
 import type { OrderRequest } from "@/types/order";
+import { executeOverseasOrder } from "./overseas";
 
 export interface OrderResponse {
   status: "success" | "error";
@@ -18,6 +19,8 @@ export interface OrderResponse {
     order_id: string;
     status: string;
     message: string;
+    protective_order?: Record<string, unknown>;
+    protective_order_error?: string;
   };
   logs: LogEntry[];
 }
@@ -85,6 +88,10 @@ export interface CancelOrderResponse {
  * 주문 실행
  */
 export async function executeOrder(request: OrderRequest): Promise<OrderResponse> {
+  if (request.market === "us") {
+    return executeOverseasOrder(request);
+  }
+
   return apiPost<OrderResponse>("/api/orders/execute", {
     stock_code: request.stock_code,
     stock_name: request.stock_name,
@@ -93,6 +100,10 @@ export async function executeOrder(request: OrderRequest): Promise<OrderResponse
     price: request.price || 0,
     quantity: request.quantity,
     signal_reason: request.signal_reason || "수동 주문",
+    protective_order: request.protective_order,
+    market: request.market || "domestic",
+    exchange: request.exchange,
+    confirm_prod: request.confirm_prod,
   });
 }
 

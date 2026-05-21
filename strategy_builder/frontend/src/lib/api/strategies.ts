@@ -22,13 +22,17 @@ export async function executeStrategy(
   strategyId: string,
   stocks: string[],
   params: Record<string, number> = {},
-  builderState?: BuilderState
+  builderState?: BuilderState,
+  market: "domestic" | "us" = "domestic",
+  symbolMeta: Record<string, { exchange?: "NASD" | "NYSE" | "AMEX" }> = {}
 ): Promise<ExecuteResponse> {
   const request: ExecuteRequest = {
     strategy_id: strategyId,
     stocks,
     params,
     builder_state: builderState,
+    market,
+    symbol_meta: symbolMeta,
   };
   return apiPost<ExecuteResponse>("/api/strategies/execute", request);
 }

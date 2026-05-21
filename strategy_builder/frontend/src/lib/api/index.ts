@@ -79,3 +79,17 @@ export {
   type PriceData,
   type PriceResponse,
 } from "./market";
+
+// Overseas
+export {
+  searchOverseasSymbol,
+  getOverseasPrice,
+  getOverseasHoldings,
+  getOverseasBalance,
+  getOverseasBuyableAmount,
+  getOverseasPendingOrders,
+  executeOverseasOrder,
+  cancelOverseasOrder,
+  type OverseasExchange,
+  type OverseasSymbolInfo,
+} from "./overseas";

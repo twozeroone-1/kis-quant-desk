@@ -88,8 +88,14 @@ export function SignalList({ signals, onSelect, selectedCode }: SignalListProps)
               <div className="flex items-center gap-2">
                 <span className="font-medium">{signal.name}</span>
                 <span className="text-xs text-slate-400 font-mono">{signal.code}</span>
+                {signal.exchange && (
+                  <span className="text-xs text-slate-400">{signal.exchange}</span>
+                )}
               </div>
               <p className="text-sm text-slate-500 line-clamp-1">{signal.reason}</p>
+              {signal.warning && (
+                <p className="text-xs text-amber-600 dark:text-amber-400 line-clamp-1">{signal.warning}</p>
+              )}
             </div>
 
             {/* Strength - 임시 비활성화 */}

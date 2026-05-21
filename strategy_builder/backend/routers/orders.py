@@ -15,11 +15,13 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+from core import data_fetcher, overseas_data_fetcher
 from core.order_executor import OrderExecutor
 from core.signal import Action, Signal
 from core.data_fetcher import get_deposit, get_holdings, get_pending_orders, cancel_order, clear_balance_cache
 from backend import is_authenticated, get_current_mode
 from backend.services.audit_log import write_order_audit
+from backend.services.protective_orders import list_protective_orders, register_after_buy, run_monitor_cycle
 
 logging.basicConfig(level=logging.INFO)
 
@@ -106,15 +108,26 @@ def _clear_account_cache():
     clear_balance_cache()
 
 
+class ProtectiveOrderRequest(BaseModel):
+    """매수 후 생성할 앱 레벨 OCO 보호주문"""
+    enabled: bool = False
+    take_profit_percent: float | None = None
+    stop_loss_percent: float | None = None
+
+
 class OrderRequest(BaseModel):
     """주문 요청"""
     stock_code: str
     stock_name: str
     action: str  # "BUY" or "SELL"
     order_type: str  # "limit" or "market"
-    price: int
+    price: float
     quantity: int
     signal_reason: str
+    protective_order: ProtectiveOrderRequest | None = None
+    market: str = "domestic"
+    exchange: str | None = None
+    confirm_prod: bool = False
 
 
 class LogEntry(BaseModel):
@@ -250,6 +263,166 @@ async def execute_order(request: OrderRequest, http_request: Request):
 
         add_log("success", "주문 검증 완료")
 
+        env_dv = get_current_mode()
+
+        if request.market == "us":
+            if request.order_type != "limit":
+                add_log("error", "미국 주식 주문은 지정가만 지원합니다")
+                response = OrderResponse(
+                    status="error",
+                    message="미국 주식 주문은 지정가만 지원합니다",
+                    logs=logs,
+                )
+                write_order_audit({
+                    "authenticated_user": authenticated_user,
+                    "mode": env_dv,
+                    "action": "execute",
+                    "stock_code": request.stock_code,
+                    "quantity": request.quantity,
+                    "price": request.price,
+                    "order_type": request.order_type,
+                    "result": "error",
+                    "order_id": None,
+                    "error_message": response.message,
+                })
+                return response
+
+            if request.price <= 0:
+                add_log("error", "미국 주식 지정가가 올바르지 않습니다")
+                response = OrderResponse(
+                    status="error",
+                    message="미국 주식 지정가가 올바르지 않습니다",
+                    logs=logs,
+                )
+                write_order_audit({
+                    "authenticated_user": authenticated_user,
+                    "mode": env_dv,
+                    "action": "execute",
+                    "stock_code": request.stock_code,
+                    "quantity": request.quantity,
+                    "price": request.price,
+                    "order_type": request.order_type,
+                    "result": "error",
+                    "order_id": None,
+                    "error_message": response.message,
+                })
+                return response
+
+            if env_dv in ("prod", "real") and not request.confirm_prod:
+                add_log("error", "실전 해외주식 주문은 confirm_prod=true 확인이 필요합니다")
+                write_order_audit({
+                    "authenticated_user": authenticated_user,
+                    "mode": env_dv,
+                    "action": "execute",
+                    "stock_code": request.stock_code,
+                    "quantity": request.quantity,
+                    "price": request.price,
+                    "order_type": request.order_type,
+                    "result": "error",
+                    "order_id": None,
+                    "error_message": "confirm_prod required",
+                })
+                raise HTTPException(
+                    status_code=400,
+                    detail="실전 해외주식 주문은 confirm_prod=true 확인이 필요합니다",
+                )
+
+            symbol = request.stock_code.strip().upper()
+            resolution = overseas_data_fetcher.resolve_exchange(symbol, request.exchange)
+            add_log("info", f"해외주식 지정가 주문 실행 중: {request.action} {symbol} {request.quantity}주 @ ${request.price:g}")
+
+            if request.action == "SELL":
+                holdings_df = overseas_data_fetcher.get_holdings(env_dv)
+                if holdings_df.empty or symbol not in set(holdings_df["stock_code"].astype(str)):
+                    add_log("error", f"미보유 종목입니다. {request.stock_name}을(를) 보유하고 있지 않습니다.")
+                    return OrderResponse(
+                        status="error",
+                        message=f"미보유 종목입니다. {request.stock_name}을(를) 보유하고 있지 않습니다.",
+                        logs=logs,
+                    )
+
+            result = overseas_data_fetcher.execute_order(
+                symbol=symbol,
+                action=request.action,
+                quantity=request.quantity,
+                price=request.price,
+                env_dv=env_dv,
+                exchange=resolution.exchange,
+            )
+
+            if result.empty:
+                add_log("error", "해외주식 주문 실행 실패")
+                response = OrderResponse(
+                    status="error",
+                    message="해외주식 주문 실행 실패",
+                    logs=logs,
+                )
+                write_order_audit({
+                    "authenticated_user": authenticated_user,
+                    "mode": env_dv,
+                    "action": "execute",
+                    "stock_code": symbol,
+                    "quantity": request.quantity,
+                    "price": request.price,
+                    "order_type": request.order_type,
+                    "result": "error",
+                    "order_id": None,
+                    "error_message": response.message,
+                })
+                return response
+
+            order_id = str(result.iloc[0].get("ODNO", result.iloc[0].get("odno", "")))
+            order_data = {
+                "order_id": order_id,
+                "status": "submitted",
+                "message": "해외주식 주문이 접수되었습니다",
+                "exchange": resolution.exchange,
+                "currency": "USD",
+            }
+
+            if request.action == "BUY" and request.protective_order and request.protective_order.enabled:
+                try:
+                    protective = await register_after_buy(
+                        env_dv=env_dv,
+                        stock_code=symbol,
+                        stock_name=request.stock_name,
+                        quantity=request.quantity,
+                        entry_price=request.price,
+                        take_profit_pct=request.protective_order.take_profit_percent,
+                        stop_loss_pct=request.protective_order.stop_loss_percent,
+                        source_order_no=order_id,
+                        market="us",
+                        exchange=resolution.exchange,
+                        currency="USD",
+                    )
+                    order_data["protective_order"] = protective
+                    add_log("success", "해외주식 보호주문 생성 완료")
+                except Exception as protective_error:
+                    order_data["protective_order_error"] = str(protective_error)
+                    add_log("warning", f"보호주문 생성 실패: {protective_error}")
+
+            overseas_data_fetcher.clear_balance_cache()
+            add_log("success", f"해외주식 주문 실행 성공 (주문번호: {order_id})")
+            response = OrderResponse(
+                status="success",
+                message="해외주식 주문이 접수되었습니다",
+                data=order_data,
+                logs=logs,
+            )
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": env_dv,
+                "action": "execute",
+                "stock_code": symbol,
+                "quantity": request.quantity,
+                "price": request.price,
+                "order_type": request.order_type,
+                "result": "success",
+                "order_id": order_id,
+                "error_message": None,
+            })
+            return response
+
         # 3. Signal 객체 생성
         # 지정가 주문: strength < 0.8 → order_executor가 target_price 사용
         # 시장가 주문: strength >= 0.8 → order_executor가 시장가 사용
@@ -271,7 +444,6 @@ async def execute_order(request: OrderRequest, http_request: Request):
         logging.info(f"[주문] order_type={request.order_type}, price={request.price}, strength={signal.strength}, target_price={signal.target_price}")
 
         # 4. OrderExecutor 호출 (현재 트레이딩 모드 사용)
-        env_dv = get_current_mode()
         executor = OrderExecutor(env_dv=env_dv)
         result = executor.execute_signal(signal)
 
@@ -319,6 +491,36 @@ async def execute_order(request: OrderRequest, http_request: Request):
         }
 
         add_log("success", f"주문 실행 성공 (주문번호: {order_id})")
+
+        if request.action == "BUY" and request.protective_order and request.protective_order.enabled:
+            entry_price = request.price
+            if request.order_type == "market" or entry_price <= 0:
+                try:
+                    price_data = data_fetcher.get_current_price(request.stock_code, env_dv)
+                    entry_price = int(price_data.get("price") or 0)
+                except Exception:
+                    entry_price = 0
+
+            if entry_price > 0:
+                try:
+                    protective = await register_after_buy(
+                        env_dv=env_dv,
+                        stock_code=request.stock_code,
+                        stock_name=request.stock_name,
+                        quantity=request.quantity,
+                        entry_price=entry_price,
+                        take_profit_pct=request.protective_order.take_profit_percent,
+                        stop_loss_pct=request.protective_order.stop_loss_percent,
+                        source_order_no=order_id,
+                    )
+                    order_data["protective_order"] = protective
+                    add_log("success", "보호주문 생성 완료")
+                except Exception as protective_error:
+                    order_data["protective_order_error"] = str(protective_error)
+                    add_log("warning", f"보호주문 생성 실패: {protective_error}")
+            else:
+                order_data["protective_order_error"] = "진입 가격을 확인할 수 없습니다"
+                add_log("warning", "보호주문 생성 실패: 진입 가격 확인 불가")
 
         # 미체결 캐시에 직접 추가 (Optimistic Update)
         global _pending_cache, _pending_cache_time, _optimistic_order_nos, _optimistic_added_at
@@ -440,6 +642,33 @@ class CancelOrderResponse(BaseModel):
     success: bool
     order_no: str
     message: str
+
+
+@router.get("/protective")
+async def get_protective_orders_api():
+    """앱 레벨 OCO 보호주문 상태 조회"""
+    if not is_authenticated():
+        raise HTTPException(status_code=401, detail="인증이 필요합니다")
+    state = await list_protective_orders()
+    return {
+        "status": "success",
+        "orders": state.get("orders", []),
+        "total_count": len(state.get("orders", [])),
+    }
+
+
+@router.post("/protective/check")
+async def check_protective_orders_api():
+    """보호주문 감시 루프를 즉시 1회 실행"""
+    if not is_authenticated():
+        raise HTTPException(status_code=401, detail="인증이 필요합니다")
+    await run_monitor_cycle()
+    state = await list_protective_orders()
+    return {
+        "status": "success",
+        "orders": state.get("orders", []),
+        "total_count": len(state.get("orders", [])),
+    }
 
 
 @router.get("/account", response_model=AccountResponse)

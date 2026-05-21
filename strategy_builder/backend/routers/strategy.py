@@ -27,6 +27,7 @@ import kis_auth as ka
 from strategy_core.dsl.codegen import StrategyCodeGenerator, generate_strategy_file
 from strategy_core.dsl.parser import parse_strategy, StrategyDSLParser
 from strategy_core.dsl.converter import builder_state_to_dsl
+from core import data_fetcher, overseas_data_fetcher
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -216,6 +217,12 @@ def get_stock_name(code: str) -> str:
     symbols 모듈의 마스터파일 캐시를 사용하여 종목명을 반환합니다.
     캐시에 없는 경우 종목코드를 그대로 반환합니다.
     """
+    context = data_fetcher.get_market_context()
+    if context.get("market") == "us":
+        meta = (context.get("symbol_meta") or {}).get(code) or (context.get("symbol_meta") or {}).get(code.upper()) or {}
+        exchange = meta.get("exchange") if isinstance(meta, dict) else None
+        return overseas_data_fetcher.resolve_exchange(code, exchange).name
+
     from backend.routers.symbols import _get_all_symbols, FALLBACK_STOCKS
 
     all_symbols = _get_all_symbols() or FALLBACK_STOCKS
@@ -236,6 +243,8 @@ class ExecuteRequest(BaseModel):
     stocks: List[str]
     params: Dict[str, Any] = {}
     builder_state: Optional[Dict[str, Any]] = None
+    market: str = "domestic"
+    symbol_meta: Dict[str, Dict[str, Any]] = {}
 
 
 class BuildRequest(BaseModel):
@@ -250,7 +259,9 @@ class SignalResult(BaseModel):
     action: str
     strength: float
     reason: str
-    target_price: Optional[int] = None
+    target_price: Optional[float] = None
+    exchange: Optional[str] = None
+    warning: Optional[str] = None
 
 
 class LogEntry(BaseModel):
@@ -264,6 +275,28 @@ class ExecuteResponse(BaseModel):
     results: List[SignalResult] = []
     logs: List[LogEntry] = []
     message: Optional[str] = None
+
+
+def _decorate_results_for_market(
+    results: list[dict[str, Any]],
+    market: str,
+    symbol_meta: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if market != "us":
+        return results
+    decorated = []
+    for result in results:
+        code = str(result.get("code") or "").upper()
+        meta = symbol_meta.get(code) or {}
+        resolution = overseas_data_fetcher.resolve_exchange(code, meta.get("exchange"))
+        decorated.append({
+            **result,
+            "code": code,
+            "name": resolution.name or result.get("name") or code,
+            "exchange": resolution.exchange,
+            **({"warning": resolution.warning} if resolution.warning else {}),
+        })
+    return decorated
 
 
 # ============================================
@@ -375,7 +408,12 @@ async def list_indicators():
 async def execute_strategy(request: ExecuteRequest):
     """전략 실행"""
     strategy_id = request.strategy_id
-    stocks = request.stocks
+    market = "us" if request.market == "us" else "domestic"
+    stocks = [
+        stock.strip().upper() if market == "us" else stock.strip()
+        for stock in request.stocks
+        if stock and stock.strip()
+    ]
     params = request.params
     logs = []
 
@@ -393,7 +431,10 @@ async def execute_strategy(request: ExecuteRequest):
 
     current_mode = get_current_mode()
     mode_display = "모의투자" if current_mode == "vps" else "실전투자"
-    log("info", f"KIS API 인증 확인 ({mode_display})")
+    market_display = "미국" if market == "us" else "한국"
+    log("info", f"KIS API 인증 확인 ({mode_display}, {market_display})")
+
+    token = data_fetcher.set_market_context(market, request.symbol_meta)
 
     try:
         # 1) 로컬 전략 (프론트엔드에서 builder_state 직접 전달)
@@ -410,6 +451,7 @@ async def execute_strategy(request: ExecuteRequest):
                 request.builder_state, strategy_name, stocks,
                 log, get_stock_name, _api_sleep,
             )
+            results = _decorate_results_for_market(results, market, request.symbol_meta)
             log("success", "로컬 전략 실행 완료")
             return ExecuteResponse(
                 status='success',
@@ -432,6 +474,7 @@ async def execute_strategy(request: ExecuteRequest):
                 custom_name, strategy_dir, stocks,
                 log, get_stock_name, _api_sleep,
             )
+            results = _decorate_results_for_market(results, market, request.symbol_meta)
             log("success", "전략 실행 완료")
             return ExecuteResponse(
                 status='success',
@@ -468,6 +511,7 @@ async def execute_strategy(request: ExecuteRequest):
                 builder_state, strategy_name, stocks,
                 log, get_stock_name, _api_sleep,
             )
+            results = _decorate_results_for_market(results, market, request.symbol_meta)
             log("success", "빌더 전략 실행 완료")
             return ExecuteResponse(
                 status='success',
@@ -480,6 +524,7 @@ async def execute_strategy(request: ExecuteRequest):
             schema['strategy_class'], schema['param_map'], params, stocks,
             strategy_id, log, get_stock_name, _api_sleep,
         )
+        results = _decorate_results_for_market(results, market, request.symbol_meta)
         log("success", "전략 실행 완료")
         return ExecuteResponse(
             status='success',
@@ -490,6 +535,8 @@ async def execute_strategy(request: ExecuteRequest):
     except Exception as e:
         log("error", f"전략 실행 오류: {str(e)}")
         return ExecuteResponse(status='error', logs=logs, message=str(e))
+    finally:
+        data_fetcher.reset_market_context(token)
 
 
 @router.post("/build")

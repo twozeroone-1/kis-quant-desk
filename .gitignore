@@ -150,6 +150,10 @@ yarn-error.log*
 .pnpm-debug.log*
 *_logs/
 
+# ===== Runtime state =====
+.runtime/
+**/.runtime/
+
 # ===== Lock files =====
 *.lock
 

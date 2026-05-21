@@ -1,7 +1,13 @@
 "use client";
 
 import { useState, useCallback, useRef } from "react";
-import { getAccountInfo, getHoldings, getBalance } from "@/lib/api";
+import {
+  getAccountInfo,
+  getHoldings,
+  getBalance,
+  getOverseasHoldings,
+  getOverseasBalance,
+} from "@/lib/api";
 import type { AccountInfo, Holding, Balance } from "@/types/account";
 
 // Minimum interval between API calls (in milliseconds)
@@ -20,7 +26,7 @@ interface UseAccountResult {
   resetThrottle: () => void;
 }
 
-export function useAccount(): UseAccountResult {
+export function useAccount(market: "domestic" | "us" = "domestic"): UseAccountResult {
   const [info, setInfo] = useState<AccountInfo | null>(null);
   const [holdings, setHoldings] = useState<Holding[]>([]);
   const [balance, setBalance] = useState<Balance | null>(null);
@@ -71,7 +77,7 @@ export function useAccount(): UseAccountResult {
     setIsLoading(true);
 
     try {
-      const response = await getHoldings();
+      const response = market === "us" ? await getOverseasHoldings() : await getHoldings();
       if (response.status === "success") {
         setHoldings(response.data || []);
         setError(null);
@@ -86,7 +92,7 @@ export function useAccount(): UseAccountResult {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [market]);
 
   const fetchBalance = useCallback(async () => {
     const now = Date.now();
@@ -97,7 +103,7 @@ export function useAccount(): UseAccountResult {
     setIsLoading(true);
 
     try {
-      const response = await getBalance();
+      const response = market === "us" ? await getOverseasBalance() : await getBalance();
       if (response.status === "success" && response.data) {
         setBalance(response.data);
         setError(null);
@@ -112,7 +118,7 @@ export function useAccount(): UseAccountResult {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [market]);
 
   const resetThrottle = useCallback(() => {
     lastFetchTimes.current = { info: 0, holdings: 0, balance: 0 };

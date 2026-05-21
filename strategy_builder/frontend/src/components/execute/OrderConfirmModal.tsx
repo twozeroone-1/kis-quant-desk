@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import {
   X,
   AlertTriangle,
@@ -27,6 +27,9 @@ interface OrderConfirmModalProps {
   onConfirm: (request: OrderRequest) => Promise<void>;
   onCancel: () => void;
   isLoading?: boolean;
+  market?: "domestic" | "us";
+  exchange?: "NASD" | "NYSE" | "AMEX";
+  confirmProd?: boolean;
 }
 
 export function OrderConfirmModal({
@@ -37,6 +40,9 @@ export function OrderConfirmModal({
   onConfirm,
   onCancel,
   isLoading,
+  market = "domestic",
+  exchange,
+  confirmProd = false,
 }: OrderConfirmModalProps) {
   const currentPrice = priceData?.price || 0;
   const change = priceData?.change || 0;
@@ -45,14 +51,9 @@ export function OrderConfirmModal({
   const [quantity, setQuantity] = useState(1);
   const [orderType, setOrderType] = useState<OrderType>("limit");
   const [limitPrice, setLimitPrice] = useState(signal.target_price || currentPrice);
-  const [showOrderbook, setShowOrderbook] = useState(true);
-
-  // Update limit price when current price loads (if no target_price)
-  useEffect(() => {
-    if (!signal.target_price && currentPrice > 0) {
-      setLimitPrice(currentPrice);
-    }
-  }, [currentPrice, signal.target_price]);
+  const [showOrderbook, setShowOrderbook] = useState(market === "domestic");
+  const currencyLabel = market === "us" ? "USD" : "원";
+  const amountPrefix = market === "us" ? "$" : "";
 
   const action: OrderAction = signal.action === "BUY" ? "BUY" : "SELL";
   const price = orderType === "market" ? currentPrice : limitPrice;
@@ -80,10 +81,13 @@ export function OrderConfirmModal({
       stock_code: signal.code,
       stock_name: signal.name,
       action,
-      order_type: orderType,
-      price: orderType === "limit" ? limitPrice : undefined,
+      order_type: market === "us" ? "limit" : orderType,
+      price: market === "us" || orderType === "limit" ? limitPrice : undefined,
       quantity,
       signal_reason: signal.reason,
+      market,
+      exchange,
+      confirm_prod: confirmProd,
     };
     await onConfirm(request);
   };
@@ -105,13 +109,15 @@ export function OrderConfirmModal({
             {isBuy ? "매수" : "매도"} 주문 확인
           </h2>
           <div className="flex items-center gap-2">
-            <button
-              onClick={() => setShowOrderbook(!showOrderbook)}
-              className="p-1 rounded-full hover:bg-white/20 transition-colors"
-              title={showOrderbook ? "호가창 숨기기" : "호가창 표시"}
-            >
-              <Maximize2 className="w-5 h-5 text-white" />
-            </button>
+            {market === "domestic" && (
+              <button
+                onClick={() => setShowOrderbook(!showOrderbook)}
+                className="p-1 rounded-full hover:bg-white/20 transition-colors"
+                title={showOrderbook ? "호가창 숨기기" : "호가창 표시"}
+              >
+                <Maximize2 className="w-5 h-5 text-white" />
+              </button>
+            )}
             <button
               onClick={onCancel}
               className="p-1 rounded-full hover:bg-white/20 transition-colors"
@@ -124,7 +130,7 @@ export function OrderConfirmModal({
         {/* Content - Two Column Layout */}
         <div className={cn("flex", showOrderbook ? "flex-row" : "flex-col")}>
           {/* Left Column - Orderbook */}
-          {showOrderbook && (
+          {showOrderbook && market === "domestic" && (
             <div className="w-64 border-r border-slate-200 dark:border-slate-700 p-4 bg-slate-50 dark:bg-slate-800/50 max-h-[600px] overflow-auto">
               <OrderbookPanel
                 stockCode={signal.code}
@@ -176,7 +182,7 @@ export function OrderConfirmModal({
                 >
                   {currentPrice.toLocaleString()}
                 </span>
-                <span className="text-sm text-slate-500">원</span>
+                <span className="text-sm text-slate-500">{currencyLabel}</span>
               </div>
 
               {/* Change Info */}
@@ -214,7 +220,7 @@ export function OrderConfirmModal({
                   </span>
                 </div>
                 <span className="font-mono font-medium text-green-700 dark:text-green-400">
-                  {buyable.amount.toLocaleString()}원
+                  {amountPrefix}{buyable.amount.toLocaleString()}
                 </span>
               </div>
             )}
@@ -253,6 +259,7 @@ export function OrderConfirmModal({
                 </button>
                 <button
                   onClick={() => setOrderType("market")}
+                  disabled={market === "us"}
                   className={cn(
                     "px-4 py-2 rounded-lg border-2 transition-all",
                     orderType === "market"
@@ -260,9 +267,14 @@ export function OrderConfirmModal({
                       : "border-slate-200 dark:border-slate-700"
                   )}
                 >
-                  시장가
+                  {market === "us" ? "시장가 불가" : "시장가"}
                 </button>
               </div>
+              {market === "us" && (
+                <p className="text-xs text-slate-400 mt-1">
+                  미국 주식은 v1에서 지정가 주문만 지원합니다
+                </p>
+              )}
             </div>
 
             {/* Limit Price */}
@@ -279,7 +291,7 @@ export function OrderConfirmModal({
                     className="w-full px-4 py-3 pr-12 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900 focus:ring-2 focus:ring-primary focus:border-transparent"
                   />
                   <span className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500">
-                    원
+                    {currencyLabel}
                   </span>
                 </div>
                 {showOrderbook && (
@@ -335,7 +347,7 @@ export function OrderConfirmModal({
                   예상 금액
                 </span>
                 <span className="text-xl font-bold">
-                  {estimatedAmount.toLocaleString()}원
+                  {amountPrefix}{estimatedAmount.toLocaleString()}
                 </span>
               </div>
               {isBuy && buyable && estimatedAmount > buyable.amount && (

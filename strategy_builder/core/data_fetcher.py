@@ -9,13 +9,48 @@ Applied Skills: skills/investment-strategy-framework.md
 import logging
 import threading
 import time
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 
 import pandas as pd
 
 import kis_auth as ka
+from core import overseas_data_fetcher
 
 logging.basicConfig(level=logging.INFO)
+
+_market_context: ContextVar[dict] = ContextVar(
+    "market_context",
+    default={"market": "domestic", "symbol_meta": {}},
+)
+
+
+def set_market_context(market: str = "domestic", symbol_meta: dict | None = None):
+    """Set request-local market context for strategy code using this module."""
+    return _market_context.set({
+        "market": market,
+        "symbol_meta": symbol_meta or {},
+    })
+
+
+def reset_market_context(token) -> None:
+    _market_context.reset(token)
+
+
+def get_market_context() -> dict:
+    return _market_context.get()
+
+
+def _is_us_context() -> bool:
+    return get_market_context().get("market") == "us"
+
+
+def _symbol_exchange(symbol: str) -> str | None:
+    meta = get_market_context().get("symbol_meta") or {}
+    item = meta.get(symbol) or meta.get(symbol.upper())
+    if isinstance(item, dict):
+        return item.get("exchange")
+    return None
 
 
 def _assert_trenv_ready(context: str = "") -> bool:
@@ -139,6 +174,14 @@ def get_daily_prices(
     Note:
         skill: API 실패 시 빈 DataFrame 반환
     """
+    if _is_us_context():
+        return overseas_data_fetcher.get_daily_prices(
+            stock_code,
+            days=days,
+            env_dv=env_dv,
+            exchange=_symbol_exchange(stock_code),
+        )
+
     if not _assert_trenv_ready(f"일봉 조회 {stock_code}"):
         return pd.DataFrame()
 
@@ -230,6 +273,13 @@ def get_current_price(
     Note:
         skill: API 실패 시 빈 dict 반환
     """
+    if _is_us_context():
+        return overseas_data_fetcher.get_current_price(
+            stock_code,
+            env_dv=env_dv,
+            exchange=_symbol_exchange(stock_code),
+        )
+
     if not _assert_trenv_ready(f"현재가 조회 {stock_code}"):
         return {}
 
@@ -715,4 +765,3 @@ def cancel_order(
             "order_no": order_no,
             "message": str(e)
         }
-

@@ -12,7 +12,8 @@ sys.path.insert(0, project_root)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.routers import strategy, auth, market, orders, account, files, symbols
+from backend.routers import strategy, auth, market, orders, account, files, symbols, overseas
+from backend.services.protective_orders import start_monitor, stop_monitor
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -36,6 +37,7 @@ app.include_router(strategy.router, prefix="/api/strategies", tags=["전략"])
 app.include_router(market.router, prefix="/api/market", tags=["시장정보"])
 app.include_router(orders.router, prefix="/api/orders", tags=["주문"])
 app.include_router(account.router, prefix="/api/account", tags=["계좌"])
+app.include_router(overseas.router, prefix="/api/overseas", tags=["해외주식"])
 app.include_router(files.router, prefix="/api/files", tags=["파일"])
 app.include_router(symbols.router, prefix="/api/symbols", tags=["종목"])
 
@@ -50,6 +52,18 @@ async def health_check():
 async def root():
     """API 루트"""
     return {"message": "KIS Strategy Builder API", "docs": "/docs"}
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Start app-level protective order monitoring."""
+    await start_monitor()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop background tasks cleanly."""
+    await stop_monitor()
 
 
 # 서버 실행

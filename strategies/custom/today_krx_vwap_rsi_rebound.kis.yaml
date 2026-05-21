@@ -1,0 +1,57 @@
+version: "1.0"
+
+metadata:
+  name: "오늘 한국장 VWAP + RSI 반등"
+  description: "약세 출발 이후 종가가 VWAP을 회복하고 RSI가 중립권으로 돌아설 때만 진입하는 한국장 당일 대응형 반등 전략"
+  author: "codex"
+  tags:
+    - krx
+    - vwap
+    - rsi
+    - rebound
+    - intraday
+
+strategy:
+  id: today_krx_vwap_rsi_rebound
+  category: momentum
+
+  indicators:
+    - id: vwap
+      alias: vwap_14
+      params:
+        period: 14
+    - id: rsi
+      alias: rsi_14
+      params:
+        period: 14
+
+  entry:
+    logic: AND
+    conditions:
+      - indicator: close
+        operator: cross_above
+        compare_to: vwap_14
+      - indicator: rsi_14
+        operator: greater_than
+        value: 45
+
+  exit:
+    logic: OR
+    conditions:
+      - indicator: close
+        operator: cross_below
+        compare_to: vwap_14
+      - indicator: rsi_14
+        operator: greater_than
+        value: 65
+
+risk:
+  stop_loss:
+    enabled: true
+    percent: 2.0
+  take_profit:
+    enabled: true
+    percent: 4.0
+  trailing_stop:
+    enabled: true
+    percent: 1.5

@@ -13,6 +13,14 @@ export interface OrderRequest {
   price?: number;
   quantity: number;
   signal_reason?: string;
+  market?: "domestic" | "us";
+  exchange?: "NASD" | "NYSE" | "AMEX";
+  confirm_prod?: boolean;
+  protective_order?: {
+    enabled: boolean;
+    take_profit_percent?: number | null;
+    stop_loss_percent?: number | null;
+  };
 }
 
 export interface OrderResult {

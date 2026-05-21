@@ -20,9 +20,12 @@ export function useLocalStrategies() {
 
   // Load strategies on mount
   useEffect(() => {
-    setStorageAvailable(isStorageAvailable());
-    setStrategies(loadAllStrategies());
-    setIsLoading(false);
+    const timer = window.setTimeout(() => {
+      setStorageAvailable(isStorageAvailable());
+      setStrategies(loadAllStrategies());
+      setIsLoading(false);
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   // Refresh strategies

@@ -20,6 +20,8 @@ export interface Holding {
   eval_amount: number;
   profit_loss: number;
   profit_rate: number;
+  exchange?: string;
+  currency?: string;
 }
 
 export interface Balance {
@@ -28,6 +30,7 @@ export interface Balance {
   purchase_amount: number;
   eval_amount: number;
   profit_loss: number;
+  currency?: string;
   deposit_formatted?: string;
   total_eval_formatted?: string;
   profit_loss_formatted?: string;

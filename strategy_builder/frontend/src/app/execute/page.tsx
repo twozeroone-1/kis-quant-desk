@@ -18,17 +18,60 @@ import {
   getPendingOrders,
   cancelOrder,
   clearAccountCache,
+  getOverseasPrice,
+  getOverseasBuyableAmount,
+  getOverseasPendingOrders,
+  cancelOverseasOrder,
   type PriceData,
   type PendingOrder,
   type CancelOrderRequest,
+  type OverseasExchange,
 } from "@/lib/api";
 import type { SignalResult } from "@/types/signal";
 import type { OrderRequest, OrderResult } from "@/types/order";
 import type { BuyableInfo } from "@/types/account";
 
+type ExecuteMarket = "domestic" | "us";
+
 export default function ExecutePage() {
+  const [market, setMarket] = useState<ExecuteMarket>("domestic");
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 py-6">
+      <div className="mb-6">
+        <h1 className="text-display text-slate-900 dark:text-slate-100 flex items-center gap-3">
+          <Zap className="w-7 h-7 text-primary" />
+          전략 실행
+        </h1>
+        <p className="text-body text-slate-500 dark:text-slate-400 mt-1 ml-10">
+          전략을 선택하고 종목에 적용하여 매매 시그널을 생성합니다
+        </p>
+      </div>
+
+      <div className="mb-6 inline-flex rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-1">
+        {(["domestic", "us"] as ExecuteMarket[]).map((item) => (
+          <button
+            key={item}
+            onClick={() => setMarket(item)}
+            className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+              market === item
+                ? "bg-primary text-white"
+                : "text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+            }`}
+          >
+            {item === "domestic" ? "한국" : "미국"}
+          </button>
+        ))}
+      </div>
+
+      <ExecutePanel key={market} market={market} />
+    </div>
+  );
+}
+
+function ExecutePanel({ market }: { market: ExecuteMarket }) {
   const { status: authStatus } = useAuth();
-  const { holdings, balance, fetchHoldings, fetchBalance, resetThrottle, isLoading: accountLoading } = useAccount();
+  const { holdings, balance, fetchHoldings, fetchBalance, resetThrottle, isLoading: accountLoading } = useAccount(market);
   const {
     strategies,
     selectedStrategy,
@@ -44,6 +87,7 @@ export default function ExecutePage() {
   const { execute: executeOrder, isLoading: orderLoading } = useOrder();
 
   const [stocks, setStocks] = useState<string[]>([]);
+  const [symbolMeta, setSymbolMeta] = useState<Record<string, { exchange?: OverseasExchange }>>({});
   const [selectedSignal, setSelectedSignal] = useState<SignalResult | null>(null);
   const [priceData, setPriceData] = useState<PriceData | null>(null);
   const [buyableInfo, setBuyableInfo] = useState<BuyableInfo | null>(null);
@@ -80,14 +124,14 @@ export default function ExecutePage() {
 
   const fetchPendingOrders = useCallback(async () => {
     try {
-      const response = await getPendingOrders();
+      const response = market === "us" ? await getOverseasPendingOrders() : await getPendingOrders();
       if (response.status === "success") {
         setPendingOrders(response.orders || []);
       }
     } catch (error) {
       console.error("Failed to fetch pending orders:", error);
     }
-  }, []);
+  }, [market]);
 
   const handleRefresh = useCallback(async () => {
     resetThrottle();
@@ -98,7 +142,7 @@ export default function ExecutePage() {
 
   const handleCancelOrder = useCallback(async (request: CancelOrderRequest) => {
     try {
-      const response = await cancelOrder(request);
+      const response = market === "us" ? await cancelOverseasOrder(request) : await cancelOrder(request);
       if (response.success) {
         // 순차 호출: 취소 후 데이터 갱신
         await fetchPendingOrders();
@@ -109,14 +153,14 @@ export default function ExecutePage() {
     } catch {
       alert("주문 취소 중 오류가 발생했습니다");
     }
-  }, [fetchPendingOrders, fetchBalance]);
+  }, [market, fetchPendingOrders, fetchBalance]);
 
   const handleExecute = async () => {
     if (stocks.length === 0) {
       alert("종목을 입력해주세요");
       return;
     }
-    await execute(stocks);
+    await execute(stocks, market, symbolMeta);
   };
 
   const handleSignalSelect = async (signal: SignalResult) => {
@@ -126,7 +170,10 @@ export default function ExecutePage() {
     if (signal.action === "BUY" || signal.action === "SELL") {
       // Fetch current price
       try {
-        const priceResponse = await getCurrentPrice(signal.code, authStatus.mode);
+        const exchange = symbolMeta[signal.code]?.exchange || signal.exchange;
+        const priceResponse = market === "us"
+          ? await getOverseasPrice(signal.code, exchange, authStatus.mode)
+          : await getCurrentPrice(signal.code, authStatus.mode);
         if (priceResponse.status === "success" && priceResponse.data) {
           setPriceData(priceResponse.data);
         } else {
@@ -135,10 +182,9 @@ export default function ExecutePage() {
 
         // Fetch buyable amount for BUY signals; find holding quantity for SELL
         if (signal.action === "BUY") {
-          const buyableResponse = await getBuyableAmount(
-            signal.code,
-            priceResponse.data?.price || 0
-          );
+          const buyableResponse = market === "us"
+            ? await getOverseasBuyableAmount(signal.code, priceResponse.data?.price || 0, exchange)
+            : await getBuyableAmount(signal.code, priceResponse.data?.price || 0);
           if (buyableResponse.status === "success" && buyableResponse.data) {
             setBuyableInfo(buyableResponse.data);
           } else {
@@ -162,15 +208,32 @@ export default function ExecutePage() {
   };
 
   const handleOrderConfirm = async (request: OrderRequest) => {
-    const result = await executeOrder(request);
+    const risk = selectedStrategy?.builder_state?.risk;
+    const protectedRequest: OrderRequest = request.action === "BUY" && risk
+      ? {
+          ...request,
+          protective_order: {
+            enabled: Boolean(risk.takeProfit.enabled || risk.stopLoss.enabled),
+            take_profit_percent: risk.takeProfit.enabled ? risk.takeProfit.percent : null,
+            stop_loss_percent: risk.stopLoss.enabled ? risk.stopLoss.percent : null,
+          },
+        }
+      : request;
+
+    const result = await executeOrder({
+      ...protectedRequest,
+      market,
+      exchange: symbolMeta[protectedRequest.stock_code]?.exchange || protectedRequest.exchange,
+      confirm_prod: market === "us" && authStatus.mode === "prod",
+    });
 
     // Store order info for result modal
     setOrderInfo({
-      stock_name: request.stock_name,
-      stock_code: request.stock_code,
-      action: request.action,
-      quantity: request.quantity,
-      price: request.price || priceData?.price || 0,
+      stock_name: protectedRequest.stock_name,
+      stock_code: protectedRequest.stock_code,
+      action: protectedRequest.action,
+      quantity: protectedRequest.quantity,
+      price: protectedRequest.price || priceData?.price || 0,
     });
     setOrderResult(result);
 
@@ -180,7 +243,9 @@ export default function ExecutePage() {
     setShowResultModal(true);
 
     // 백엔드 캐시 클리어 후 KIS API 반영 대기, 그 다음 프론트 갱신
-    await clearAccountCache();
+    if (market === "domestic") {
+      await clearAccountCache();
+    }
     await new Promise((r) => setTimeout(r, 1500));
     await handleRefresh();
   };
@@ -199,18 +264,6 @@ export default function ExecutePage() {
 
   return (
     <>
-    <div className="max-w-7xl mx-auto px-4 py-6">
-        {/* Header */}
-        <div className="mb-6">
-          <h1 className="text-display text-slate-900 dark:text-slate-100 flex items-center gap-3">
-            <Zap className="w-7 h-7 text-primary" />
-            전략 실행
-          </h1>
-          <p className="text-body text-slate-500 dark:text-slate-400 mt-1 ml-10">
-            전략을 선택하고 종목에 적용하여 매매 시그널을 생성합니다
-          </p>
-        </div>
-
         {/* Auth Warning */}
         {!authStatus.authenticated && (
           <div className="card mb-6 border-yellow-200 dark:border-yellow-800 bg-yellow-50 dark:bg-yellow-900/20" role="alert">
@@ -236,7 +289,12 @@ export default function ExecutePage() {
 
             {/* Stock Input */}
             <div className="card p-6">
-              <StockInput stocks={stocks} onChange={setStocks} />
+              <StockInput
+                stocks={stocks}
+                onChange={setStocks}
+                market={market}
+                onMetaChange={setSymbolMeta}
+              />
             </div>
 
             {/* Execute Button */}
@@ -290,10 +348,10 @@ export default function ExecutePage() {
               onRefresh={handleRefresh}
               onCancelOrder={handleCancelOrder}
               isLoading={accountLoading}
+              market={market}
             />
           </div>
         </div>
-      </div>
 
       {/* Order Confirmation Modal */}
       {showOrderModal && selectedSignal && (
@@ -305,6 +363,9 @@ export default function ExecutePage() {
           onConfirm={handleOrderConfirm}
           onCancel={handleOrderCancel}
           isLoading={orderLoading}
+          market={market}
+          exchange={symbolMeta[selectedSignal.code]?.exchange || selectedSignal.exchange}
+          confirmProd={market === "us" && authStatus.mode === "prod"}
         />
       )}
 

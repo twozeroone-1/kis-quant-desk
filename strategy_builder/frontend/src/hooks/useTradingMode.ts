@@ -30,7 +30,10 @@ export function useTradingMode(): UseTradingModeReturn {
   // Cooldown timer countdown
   useEffect(() => {
     if (status.cooldown_remaining && status.cooldown_remaining > 0) {
-      setCooldownTimer(status.cooldown_remaining);
+      const timer = window.setTimeout(() => {
+        setCooldownTimer(status.cooldown_remaining || 0);
+      }, 0);
+      return () => window.clearTimeout(timer);
     }
   }, [status.cooldown_remaining]);
 

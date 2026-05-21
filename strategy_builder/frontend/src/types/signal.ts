@@ -21,6 +21,8 @@ export interface SignalResult {
   strength: number;
   reason: string;
   target_price?: number;
+  exchange?: "NASD" | "NYSE" | "AMEX";
+  warning?: string;
 }
 
 import type { BuilderState } from "./builder";
@@ -49,6 +51,8 @@ export interface ExecuteRequest {
   stocks: string[];
   params: Record<string, number>;
   builder_state?: BuilderState;  // Local strategy builder state
+  market?: "domestic" | "us";
+  symbol_meta?: Record<string, { exchange?: "NASD" | "NYSE" | "AMEX" }>;
 }
 
 export interface ExecuteResponse {

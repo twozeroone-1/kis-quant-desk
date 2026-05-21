@@ -3,36 +3,58 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { X, Search, Loader2 } from "lucide-react";
 import { searchSymbols, getSymbolByCode } from "@/lib/api/symbols";
+import { searchOverseasSymbol, type OverseasExchange } from "@/lib/api";
 import type { Symbol } from "@/types/symbols";
 
-const STORAGE_KEY = "kis_selected_stocks";
+const STORAGE_KEYS = {
+  domestic: "kis_selected_stocks",
+  us: "kis_selected_us_stocks",
+};
 
 interface StockWithName {
   code: string;
   name: string;
+  exchange?: OverseasExchange;
 }
 
 interface StockInputProps {
   stocks: string[];
   onChange: (stocks: string[]) => void;
+  market?: "domestic" | "us";
+  onMetaChange?: (meta: Record<string, { exchange?: OverseasExchange }>) => void;
 }
 
 // 빠른 선택용 코드 목록 (이름은 마스터파일에서 조회)
 const POPULAR_CODES = ["005930", "000660", "035720", "005380", "051910", "035420"];
+const POPULAR_US: StockWithName[] = [
+  { code: "NVDA", name: "NVIDIA" },
+  { code: "AAPL", name: "Apple" },
+  { code: "TSLA", name: "Tesla" },
+  { code: "MSFT", name: "Microsoft" },
+  { code: "QQQ", name: "Invesco QQQ" },
+  { code: "SPY", name: "SPDR S&P 500" },
+];
 
-export function StockInput({ stocks, onChange }: StockInputProps) {
+export function StockInput({
+  stocks,
+  onChange,
+  market = "domestic",
+  onMetaChange,
+}: StockInputProps) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Symbol[]>([]);
   const [isOpen, setIsOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [highlightIndex, setHighlightIndex] = useState(-1);
   const [stockNames, setStockNames] = useState<Record<string, string>>({});
+  const [stockMeta, setStockMeta] = useState<Record<string, { exchange?: OverseasExchange }>>({});
   const [popularStocks, setPopularStocks] = useState<StockWithName[]>([]);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<NodeJS.Timeout | null>(null);
   const isInitialLoadRef = useRef(true);
+  const storageKey = STORAGE_KEYS[market];
 
   // 마스터파일에서 종목명 조회 (코드 → 이름)
   const resolveStockName = useCallback(async (code: string): Promise<string | null> => {
@@ -59,6 +81,11 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
 
   // 빠른 선택 종목 로드 (마스터파일에서 개별 조회)
   useEffect(() => {
+    if (market === "us") {
+      setPopularStocks(POPULAR_US);
+      return;
+    }
+
     let cancelled = false;
     async function loadPopular() {
       try {
@@ -75,12 +102,12 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
     }
     loadPopular();
     return () => { cancelled = true; };
-  }, [resolveStockName]);
+  }, [market, resolveStockName]);
 
   // Load saved stocks and names from localStorage on mount
   useEffect(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
+      const saved = localStorage.getItem(storageKey);
       if (saved) {
         const parsed = JSON.parse(saved) as StockWithName[];
         if (Array.isArray(parsed) && parsed.length > 0) {
@@ -94,9 +121,18 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
           }, {} as Record<string, string>);
           onChange(codes);
           setStockNames(names);
+          if (market === "us") {
+            const restoredMeta = parsed.reduce((acc, item) => {
+              const exchange = (item as StockWithName & { exchange?: OverseasExchange }).exchange;
+              if (exchange) acc[item.code] = { exchange };
+              return acc;
+            }, {} as Record<string, { exchange?: OverseasExchange }>);
+            setStockMeta(restoredMeta);
+            onMetaChange?.(restoredMeta);
+          }
 
           // 이름이 누락된 종목은 마스터파일에서 조회
-          const missingNameCodes = codes.filter((c) => !names[c]);
+          const missingNameCodes = market === "domestic" ? codes.filter((c) => !names[c]) : [];
           if (missingNameCodes.length > 0) {
             resolveMultipleNames(missingNameCodes).then((resolved) => {
               if (Object.keys(resolved).length > 0) {
@@ -113,7 +149,7 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
     requestAnimationFrame(() => {
       isInitialLoadRef.current = false;
     });
-  }, []);
+  }, [market, onChange, onMetaChange, resolveMultipleNames, storageKey]);
 
   // Save to localStorage when stocks change (초기 로드 시 skip)
   useEffect(() => {
@@ -122,16 +158,17 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
       const stocksToSave: StockWithName[] = stocks.map((code) => ({
         code,
         name: stockNames[code] || "",
+        ...(stockMeta[code]?.exchange ? { exchange: stockMeta[code].exchange } : {}),
       }));
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(stocksToSave));
+      localStorage.setItem(storageKey, JSON.stringify(stocksToSave));
     } else {
-      localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(storageKey);
     }
-  }, [stocks, stockNames]);
+  }, [stocks, stockNames, stockMeta, storageKey]);
 
   // Debounced search
   const doSearch = useCallback(async (searchQuery: string) => {
-    if (!searchQuery.trim()) {
+    if (!searchQuery.trim() || market === "us") {
       setResults([]);
       setIsOpen(false);
       return;
@@ -148,7 +185,7 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [market]);
 
   useEffect(() => {
     if (debounceRef.current) {
@@ -201,10 +238,35 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
 
   const addStockByCode = useCallback(
     async (code: string, name?: string) => {
-      const trimmed = code.trim();
-      if (trimmed.length === 6 && /^\d+$/.test(trimmed) && !stocks.includes(trimmed)) {
+      const trimmed = market === "us" ? code.trim().toUpperCase() : code.trim();
+      const isValid = market === "us"
+        ? /^[A-Z][A-Z0-9.]{0,9}$/.test(trimmed)
+        : trimmed.length === 6 && /^\d+$/.test(trimmed);
+      if (isValid && !stocks.includes(trimmed)) {
         onChange([...stocks, trimmed]);
-        if (name) {
+        if (market === "us") {
+          try {
+            const response = await searchOverseasSymbol(trimmed);
+            if (response.status === "success" && response.data) {
+              const exchange = response.data.exchange;
+              setStockNames((prev) => ({
+                ...prev,
+                [trimmed]: response.data?.name || name || trimmed,
+              }));
+              setStockMeta((prev) => {
+                const updated = { ...prev, [trimmed]: { exchange } };
+                onMetaChange?.(updated);
+                return updated;
+              });
+            } else if (name) {
+              setStockNames((prev) => ({ ...prev, [trimmed]: name }));
+            }
+          } catch {
+            if (name) {
+              setStockNames((prev) => ({ ...prev, [trimmed]: name }));
+            }
+          }
+        } else if (name) {
           setStockNames((prev) => ({
             ...prev,
             [trimmed]: name,
@@ -222,7 +284,7 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
         setQuery("");
       }
     },
-    [stocks, onChange, resolveStockName]
+    [market, stocks, onChange, onMetaChange, resolveStockName]
   );
 
   const removeStock = useCallback(
@@ -233,8 +295,14 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
         delete updated[code];
         return updated;
       });
+      setStockMeta((prev) => {
+        const updated = { ...prev };
+        delete updated[code];
+        onMetaChange?.(updated);
+        return updated;
+      });
     },
-    [stocks, onChange]
+    [stocks, onChange, onMetaChange]
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -252,7 +320,10 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
           e.preventDefault();
           if (highlightIndex >= 0 && highlightIndex < results.length) {
             handleSelect(results[highlightIndex]);
-          } else if (query.length === 6 && /^\d+$/.test(query)) {
+          } else if (
+            (market === "domestic" && query.length === 6 && /^\d+$/.test(query)) ||
+            (market === "us" && /^[A-Za-z][A-Za-z0-9.]{0,9}$/.test(query.trim()))
+          ) {
             addStockByCode(query);
           }
           break;
@@ -260,7 +331,13 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
           setIsOpen(false);
           break;
       }
-    } else if (e.key === "Enter" && query.length === 6 && /^\d+$/.test(query)) {
+    } else if (
+      e.key === "Enter" &&
+      (
+        (market === "domestic" && query.length === 6 && /^\d+$/.test(query)) ||
+        (market === "us" && /^[A-Za-z][A-Za-z0-9.]{0,9}$/.test(query.trim()))
+      )
+    ) {
       e.preventDefault();
       addStockByCode(query);
     }
@@ -272,22 +349,37 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
       const pastedText = e.clipboardData.getData("text");
       const codes = pastedText
         .split(/[,\s]+/)
-        .filter((c) => c.trim().length === 6 && /^\d+$/.test(c.trim()))
-        .map((c) => c.trim());
+        .map((c) => market === "us" ? c.trim().toUpperCase() : c.trim())
+        .filter((c) => market === "us"
+          ? /^[A-Z][A-Z0-9.]{0,9}$/.test(c)
+          : c.length === 6 && /^\d+$/.test(c));
       const newCodes = codes.filter((c) => !stocks.includes(c));
       if (newCodes.length === 0) return;
 
       const uniqueCodes = [...new Set([...stocks, ...newCodes])];
       onChange(uniqueCodes);
 
-      // 붙여넣기한 종목 이름 조회
-      resolveMultipleNames(newCodes).then((resolved) => {
-        if (Object.keys(resolved).length > 0) {
-          setStockNames((prev) => ({ ...prev, ...resolved }));
+      if (market === "domestic") {
+        resolveMultipleNames(newCodes).then((resolved) => {
+          if (Object.keys(resolved).length > 0) {
+            setStockNames((prev) => ({ ...prev, ...resolved }));
+          }
+        });
+      } else {
+        for (const symbol of newCodes) {
+          searchOverseasSymbol(symbol).then((response) => {
+            if (response.status !== "success" || !response.data) return;
+            setStockNames((prev) => ({ ...prev, [symbol]: response.data?.name || symbol }));
+            setStockMeta((prev) => {
+              const updated = { ...prev, [symbol]: { exchange: response.data?.exchange } };
+              onMetaChange?.(updated);
+              return updated;
+            });
+          }).catch(() => undefined);
         }
-      });
+      }
     },
-    [stocks, onChange, resolveMultipleNames]
+    [market, stocks, onChange, onMetaChange, resolveMultipleNames]
   );
 
   const getStockName = (code: string): string => {
@@ -297,7 +389,7 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
   return (
     <div className="space-y-3">
       <label className="block text-sm font-medium text-slate-700 dark:text-slate-300">
-        종목 검색
+        {market === "us" ? "미국 심볼" : "종목 검색"}
       </label>
 
       {/* Search Input with Autocomplete */}
@@ -312,7 +404,7 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
             onFocus={() => query && results.length > 0 && setIsOpen(true)}
-            placeholder="종목명 또는 코드 검색 (예: 삼성전자, 005930)"
+            placeholder={market === "us" ? "심볼 입력 (예: NVDA, AAPL)" : "종목명 또는 코드 검색 (예: 삼성전자, 005930)"}
             className="w-full pl-10 pr-10 py-3 border border-slate-200 dark:border-slate-700 rounded-lg bg-white dark:bg-slate-900 focus:ring-2 focus:ring-primary focus:border-transparent"
           />
           {query && !isLoading && (
@@ -384,6 +476,9 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
               >
                 <span className="font-mono font-medium">{code}</span>
                 {name && <span className="text-primary/70">{name}</span>}
+                {stockMeta[code]?.exchange && (
+                  <span className="text-primary/60">{stockMeta[code].exchange}</span>
+                )}
                 <button
                   onClick={() => removeStock(code)}
                   className="ml-0.5 p-0.5 hover:bg-primary/20 rounded-full transition-colors"
@@ -397,7 +492,7 @@ export function StockInput({ stocks, onChange }: StockInputProps) {
         </div>
       )}
 
-      {/* Quick Select (마스터파일 기반) */}
+      {/* Quick Select */}
       {popularStocks.length > 0 && (
         <div className="pt-2">
           <p className="text-xs text-slate-500 mb-2">빠른 선택</p>
