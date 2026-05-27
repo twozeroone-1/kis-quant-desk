@@ -34,10 +34,22 @@ class OrderExecutor:
                 - True: 이미 보유 중인 종목도 추가 매수 가능
                 - False: 이미 보유 중인 종목 매수 불가 (기존 동작)
         """
-        self.env_dv = env_dv
+        self.env_dv = self._normalize_env(env_dv)
         self.allow_duplicate_buy = allow_duplicate_buy
-        self.position_manager = PositionManager(env_dv)
+        self.position_manager = PositionManager(self.env_dv)
         self.risk_manager = RiskManager()
+
+    @staticmethod
+    def _normalize_env(env_dv: str) -> str:
+        """KIS 환경명을 주문 TR 기준 real/demo로 정규화."""
+        return "real" if env_dv in ("real", "prod") else "demo"
+
+    @staticmethod
+    def _mask_account(account: object) -> str:
+        text = str(account)
+        if len(text) <= 4:
+            return "****"
+        return f"{text[:4]}****"
 
     def execute_signal(self, signal: Signal) -> pd.DataFrame:
         """
@@ -218,7 +230,14 @@ class OrderExecutor:
                 f"{signal.action.value.upper()} "
                 f"{ord_qty}주 @ {ord_unpr}원 ({ord_type_name}, ord_dvsn={ord_dvsn})"
             )
-            logging.info(f"[DEBUG] tr_id={tr_id}, CANO={trenv.my_acct}, ACNT_PRDT_CD={trenv.my_prod}, PDNO={signal.stock_code}, env_dv={self.env_dv}")
+            logging.info(
+                "[DEBUG] tr_id=%s, CANO=%s, ACNT_PRDT_CD=%s, PDNO=%s, env_dv=%s",
+                tr_id,
+                self._mask_account(trenv.my_acct),
+                trenv.my_prod,
+                signal.stock_code,
+                self.env_dv,
+            )
 
             res = ka._url_fetch(
                 "/uapi/domestic-stock/v1/trading/order-cash",
@@ -241,4 +260,3 @@ class OrderExecutor:
         except Exception as e:
             logging.error(f"주문 실행 에러: {e}")
             return pd.DataFrame()
-

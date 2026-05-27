@@ -58,21 +58,23 @@ const holdingKey = (market: ReviewMarket, holding: Pick<Holding, "stock_code" | 
 const orderKey = (order: ProtectiveOrder) =>
   `${order.market || "domestic"}:${order.stock_code}:${order.exchange || ""}`;
 
-function defaultDraft(holding: Holding, protection?: ProtectiveOrder): ReviewDraft {
-  const avgPrice = Number(holding.avg_price || protection?.entry_price || 0);
-  const takeProfitTrigger = protection?.take_profit_trigger_price ?? Math.round(avgPrice * 1.04 * 100) / 100;
-  const stopLossTrigger = protection?.stop_loss_price ?? Math.round(avgPrice * 0.98 * 100) / 100;
+function defaultDraft(holding: Holding, protection: ProtectiveOrder | undefined, market: ReviewMarket): ReviewDraft {
+  const hasSavedProtection = Boolean(protection);
+  const takeProfitTrigger = hasSavedProtection ? protection?.take_profit_trigger_price : null;
+  const stopLossTrigger = hasSavedProtection ? protection?.stop_loss_price : null;
+  const takeProfitOrderType = market === "us" ? "limit" : protection?.take_profit_order_type || "limit";
+  const stopLossOrderType = market === "us" ? "limit" : protection?.stop_loss_order_type || "market";
 
   return {
     enabled: protection?.status === "active",
     quantity: String(protection?.quantity || holding.quantity || 1),
-    takeProfitEnabled: protection?.take_profit_enabled !== false,
+    takeProfitEnabled: hasSavedProtection ? protection?.take_profit_enabled !== false : false,
     takeProfitTriggerPrice: String(takeProfitTrigger || ""),
-    takeProfitOrderType: protection?.take_profit_order_type || "limit",
+    takeProfitOrderType,
     takeProfitLimitPrice: String(protection?.take_profit_limit_price || takeProfitTrigger || ""),
-    stopLossEnabled: protection?.stop_loss_enabled !== false,
+    stopLossEnabled: hasSavedProtection ? protection?.stop_loss_enabled !== false : false,
     stopLossTriggerPrice: String(stopLossTrigger || ""),
-    stopLossOrderType: protection?.stop_loss_order_type || "market",
+    stopLossOrderType,
     stopLossLimitPrice: String(protection?.stop_loss_limit_price || stopLossTrigger || ""),
   };
 }
@@ -96,6 +98,16 @@ export default function ReviewPage() {
     const map = new Map<string, ProtectiveOrder>();
     for (const order of protectiveOrders) {
       if (order.status === "active" && (order.market || "domestic") === market) {
+        map.set(orderKey(order), order);
+      }
+    }
+    return map;
+  }, [market, protectiveOrders]);
+
+  const savedProtectionByKey = useMemo(() => {
+    const map = new Map<string, ProtectiveOrder>();
+    for (const order of protectiveOrders) {
+      if ((order.status === "active" || order.status === "disabled") && (order.market || "domestic") === market) {
         map.set(orderKey(order), order);
       }
     }
@@ -134,13 +146,16 @@ export default function ReviewPage() {
       const next = { ...current };
       for (const holding of holdings) {
         const key = holdingKey(market, holding);
-        if (!next[key]) {
-          next[key] = defaultDraft(holding, activeProtectionByKey.get(key));
+        const savedProtection = savedProtectionByKey.get(key);
+        if (savedProtection) {
+          next[key] = defaultDraft(holding, savedProtection, market);
+        } else if (!next[key]) {
+          next[key] = defaultDraft(holding, undefined, market);
         }
       }
       return next;
     });
-  }, [activeProtectionByKey, holdings, market]);
+  }, [holdings, market, savedProtectionByKey]);
 
   useEffect(() => {
     if (!authStatus.authenticated || holdings.length === 0) {
@@ -220,8 +235,10 @@ export default function ReviewPage() {
 
   const saveHolding = async (holding: Holding) => {
     const key = holdingKey(market, holding);
-    const protection = activeProtectionByKey.get(key);
-    const draft = drafts[key] || defaultDraft(holding, protection);
+    const protection = savedProtectionByKey.get(key);
+    const draft = drafts[key] || defaultDraft(holding, protection, market);
+    const takeProfitOrderType = market === "us" ? "limit" : draft.takeProfitOrderType;
+    const stopLossOrderType = market === "us" ? "limit" : draft.stopLossOrderType;
     const quantity = parseNumber(draft.quantity);
     const takeProfitTrigger = parseNumber(draft.takeProfitTriggerPrice);
     const takeProfitLimit = parseNumber(draft.takeProfitLimitPrice);
@@ -236,7 +253,7 @@ export default function ReviewPage() {
     setSavingSymbol(key);
     setMessage("");
     try {
-      await saveProtectiveOrder({
+      const response = await saveProtectiveOrder({
         stock_code: holding.stock_code,
         stock_name: holding.stock_name,
         quantity,
@@ -244,16 +261,20 @@ export default function ReviewPage() {
         enabled: draft.enabled,
         take_profit_enabled: draft.takeProfitEnabled,
         take_profit_trigger_price: takeProfitTrigger,
-        take_profit_order_type: draft.takeProfitOrderType,
-        take_profit_limit_price: draft.takeProfitOrderType === "limit" ? takeProfitLimit : null,
+        take_profit_order_type: takeProfitOrderType,
+        take_profit_limit_price: takeProfitOrderType === "limit" ? takeProfitLimit : null,
         stop_loss_enabled: draft.stopLossEnabled,
         stop_loss_trigger_price: stopLossTrigger,
-        stop_loss_order_type: draft.stopLossOrderType,
-        stop_loss_limit_price: draft.stopLossOrderType === "limit" ? stopLossLimit : null,
+        stop_loss_order_type: stopLossOrderType,
+        stop_loss_limit_price: stopLossOrderType === "limit" ? stopLossLimit : null,
         market,
         exchange: holding.exchange || null,
         currency: market === "us" ? "USD" : "KRW",
       });
+      setDrafts((current) => ({
+        ...current,
+        [key]: defaultDraft(holding, response.order, market),
+      }));
       await refresh();
       setMessage(`${holding.stock_name} 감시 설정을 저장했습니다.`);
     } catch (error) {
@@ -410,8 +431,9 @@ export default function ReviewPage() {
         ) : (
           holdings.map((holding) => {
             const key = holdingKey(market, holding);
-            const protection = activeProtectionByKey.get(key);
-            const draft = drafts[key] || defaultDraft(holding, protection);
+            const savedProtection = savedProtectionByKey.get(key);
+            const activeProtection = activeProtectionByKey.get(key);
+            const draft = drafts[key] || defaultDraft(holding, savedProtection, market);
             const livePrice = livePrices[key]?.price;
             const displayPrice = livePrice || holding.current_price;
             const profitPositive = Number(holding.profit_rate) >= 0;
@@ -430,7 +452,7 @@ export default function ReviewPage() {
                           {holding.exchange}
                         </span>
                       )}
-                      {protection && (
+                      {activeProtection && (
                         <span className="px-2 py-1 rounded bg-primary/10 text-primary text-xs font-bold">
                           감시 중
                         </span>
@@ -496,21 +518,27 @@ export default function ReviewPage() {
                       </label>
                       <label>
                         <span className="text-caption text-slate-500">주문</span>
-                        <select
-                          value={draft.stopLossOrderType}
-                          onChange={(event) => updateDraft(key, { stopLossOrderType: event.target.value as ExitOrderType })}
-                          className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
-                        >
-                          <option value="market">시장가</option>
-                          <option value="limit">지정가</option>
-                        </select>
+                        {market === "us" ? (
+                          <div className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200">
+                            지정가
+                          </div>
+                        ) : (
+                          <select
+                            value={draft.stopLossOrderType}
+                            onChange={(event) => updateDraft(key, { stopLossOrderType: event.target.value as ExitOrderType })}
+                            className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                          >
+                            <option value="market">시장가</option>
+                            <option value="limit">지정가</option>
+                          </select>
+                        )}
                       </label>
                       <label>
                         <span className="text-caption text-slate-500">지정가</span>
                         <input
                           value={draft.stopLossLimitPrice}
                           onChange={(event) => updateDraft(key, { stopLossLimitPrice: event.target.value })}
-                          disabled={draft.stopLossOrderType === "market"}
+                          disabled={market !== "us" && draft.stopLossOrderType === "market"}
                           inputMode="decimal"
                           className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 disabled:opacity-50"
                         />
@@ -539,21 +567,27 @@ export default function ReviewPage() {
                       </label>
                       <label>
                         <span className="text-caption text-slate-500">주문</span>
-                        <select
-                          value={draft.takeProfitOrderType}
-                          onChange={(event) => updateDraft(key, { takeProfitOrderType: event.target.value as ExitOrderType })}
-                          className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
-                        >
-                          <option value="limit">지정가</option>
-                          <option value="market">시장가</option>
-                        </select>
+                        {market === "us" ? (
+                          <div className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200">
+                            지정가
+                          </div>
+                        ) : (
+                          <select
+                            value={draft.takeProfitOrderType}
+                            onChange={(event) => updateDraft(key, { takeProfitOrderType: event.target.value as ExitOrderType })}
+                            className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                          >
+                            <option value="limit">지정가</option>
+                            <option value="market">시장가</option>
+                          </select>
+                        )}
                       </label>
                       <label>
                         <span className="text-caption text-slate-500">지정가</span>
                         <input
                           value={draft.takeProfitLimitPrice}
                           onChange={(event) => updateDraft(key, { takeProfitLimitPrice: event.target.value })}
-                          disabled={draft.takeProfitOrderType === "market"}
+                          disabled={market !== "us" && draft.takeProfitOrderType === "market"}
                           inputMode="decimal"
                           className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 disabled:opacity-50"
                         />
@@ -571,12 +605,12 @@ export default function ReviewPage() {
                   </button>
                 </div>
 
-                {protection && (
+                {activeProtection && (
                   <div className="mt-4 text-xs text-slate-500 flex flex-wrap gap-x-4 gap-y-1">
-                    <span>익절 주문: {orderTypeLabel(protection.take_profit_order_type)}</span>
-                    <span>손절 주문: {orderTypeLabel(protection.stop_loss_order_type)}</span>
-                    <span>마지막 점검: {protection.last_checked_at || "-"}</span>
-                    {protection.last_error && <span className="text-red-600">오류: {protection.last_error}</span>}
+                    <span>익절 주문: {orderTypeLabel(activeProtection.take_profit_order_type)}</span>
+                    <span>손절 주문: {orderTypeLabel(activeProtection.stop_loss_order_type)}</span>
+                    <span>마지막 점검: {activeProtection.last_checked_at || "-"}</span>
+                    {activeProtection.last_error && <span className="text-red-600">오류: {activeProtection.last_error}</span>}
                   </div>
                 )}
               </article>

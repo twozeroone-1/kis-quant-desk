@@ -3,27 +3,28 @@
 }
 
 :8081 {
-	basic_auth {
-		{$CADDY_AUTH_USER} {$CADDY_AUTH_HASH}
-	}
-
 	@builder_api path /api/*
-	reverse_proxy @builder_api builder-backend:8000 {
-		header_up X-Authenticated-User {http.auth.user.id}
+	reverse_proxy @builder_api builder-backend-vps:8000 {
+		header_up X-Authenticated-User local-test
 	}
 
 	reverse_proxy builder-frontend:3000
 }
 
 :8082 {
-	basic_auth {
-		{$CADDY_AUTH_USER} {$CADDY_AUTH_HASH}
-	}
-
 	@backtest_api path /api/*
 	reverse_proxy @backtest_api backtest-backend:8002 {
-		header_up X-Authenticated-User {http.auth.user.id}
+		header_up X-Authenticated-User local-test
 	}
 
 	reverse_proxy backtest-frontend:3001
+}
+
+:8083 {
+	@builder_api path /api/*
+	reverse_proxy @builder_api builder-backend-prod:8000 {
+		header_up X-Authenticated-User local-test
+	}
+
+	reverse_proxy builder-frontend:3000
 }

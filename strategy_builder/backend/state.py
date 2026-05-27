@@ -33,7 +33,7 @@ class TradingState:
 
     def __init__(self):
         self._authenticated = False
-        self._current_mode = self._load_mode_file()  # 파일에서 복원 (기본값 "vps")
+        self._current_mode = self._get_locked_mode() or self._load_mode_file()  # 파일에서 복원 (기본값 "vps")
         self._last_mode_switch: Optional[datetime] = None
 
         # 재시작 시 유효 토큰이 있으면 자동 복원
@@ -44,8 +44,23 @@ class TradingState:
     # ------------------------------------------------------------------
 
     def _get_mode_file_path(self) -> str:
-        """KIS_MODE 파일 경로 (~KIS/config/KIS_MODE)"""
-        return os.path.join(os.path.expanduser("~"), "KIS", "config", "KIS_MODE")
+        """KIS_MODE 파일 경로."""
+        explicit = os.environ.get("KIS_MODE_FILE")
+        if explicit:
+            return explicit
+        root = os.environ.get(
+            "KIS_TOKEN_ROOT",
+            os.environ.get(
+                "KIS_CONFIG_ROOT",
+                os.path.join(os.path.expanduser("~"), "KIS", "config"),
+            ),
+        )
+        return os.path.join(root, "KIS_MODE")
+
+    def _get_locked_mode(self) -> Optional[str]:
+        """Return a deployment-pinned mode, if configured."""
+        locked = os.environ.get("KIS_LOCK_MODE", "").strip()
+        return locked if locked in ("vps", "prod") else None
 
     def _load_mode_file(self) -> str:
         """저장된 모드 파일 읽기. 없거나 잘못된 경우 기본값 'vps' 반환."""
@@ -58,7 +73,8 @@ class TradingState:
                     return mode
         except OSError:
             pass
-        return "vps"
+        default_mode = os.environ.get("KIS_DEFAULT_MODE", "vps")
+        return default_mode if default_mode in ("vps", "prod") else "vps"
 
     def _save_mode_file(self, mode: str) -> None:
         """인증 성공 후 현재 모드를 파일에 저장."""
@@ -135,9 +151,19 @@ class TradingState:
 
     def _get_token_file_path(self) -> str:
         """오늘 날짜의 토큰 파일 경로"""
-        return os.path.join(
-            os.path.expanduser("~"), "KIS", "config",
-            f"KIS{datetime.today().strftime('%Y%m%d')}"
+        return getattr(
+            ka,
+            "token_tmp",
+            os.path.join(
+                os.environ.get(
+                    "KIS_TOKEN_ROOT",
+                    os.environ.get(
+                        "KIS_CONFIG_ROOT",
+                        os.path.join(os.path.expanduser("~"), "KIS", "config"),
+                    ),
+                ),
+                f"KIS{datetime.today().strftime('%Y%m%d')}",
+            ),
         )
 
     def _clear_token_file(self):
@@ -157,9 +183,11 @@ class TradingState:
         yaml을 수정한 뒤 인증 시도 시 이 메서드로 재로드해야 반영된다.
         """
         import yaml as _yaml
-        config_path = os.path.join(
-            os.path.expanduser("~"), "KIS", "config", "kis_devlp.yaml"
+        config_root = os.environ.get(
+            "KIS_CONFIG_ROOT",
+            os.path.join(os.path.expanduser("~"), "KIS", "config"),
         )
+        config_path = os.path.join(config_root, "kis_devlp.yaml")
         try:
             with open(config_path, encoding="UTF-8") as f:
                 new_cfg = _yaml.load(f, Loader=_yaml.FullLoader)
@@ -180,6 +208,10 @@ class TradingState:
         Raises:
             Exception: 쿨다운 중 모드 전환 시도 시
         """
+        locked_mode = self._get_locked_mode()
+        if locked_mode and mode != locked_mode:
+            raise Exception(f"이 서버는 {locked_mode} 모드 전용입니다.")
+
         switching_mode = self._authenticated and self._current_mode != mode
 
         # 모드 변경 시 쿨다운 체크
@@ -212,6 +244,8 @@ class TradingState:
         Returns:
             (전환 가능 여부, 남은 쿨다운 시간 초)
         """
+        if self._get_locked_mode():
+            return False, 0
         if self._last_mode_switch is None:
             return True, 0
         elapsed = (datetime.now() - self._last_mode_switch).total_seconds()
@@ -255,8 +289,12 @@ class TradingState:
         다른 프로세스(backtester 등)에서 KIS_MODE 파일이 변경된 경우
         자동으로 감지하여 인증 상태를 초기화한다 (재인증 필요).
         """
-        file_mode = self._load_mode_file()
-        if file_mode != self._current_mode:
+        locked_mode = self._get_locked_mode()
+        file_mode = locked_mode or self._load_mode_file()
+        if locked_mode and self._current_mode != locked_mode:
+            self._current_mode = locked_mode
+            self._authenticated = False
+        elif file_mode != self._current_mode:
             self._current_mode = file_mode
             self._authenticated = False  # 다른 프로세스가 모드 변경 → 재인증 필요
 

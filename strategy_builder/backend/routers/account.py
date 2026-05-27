@@ -90,7 +90,7 @@ async def get_account_info():
         trenv = ka.getTREnv()
         
         # 계좌번호 마스킹 (앞 4자리만 표시)
-        account_no = trenv.my_acct
+        account_no = str(trenv.my_acct)
         masked_account = f"{account_no[:4]}****"
         
         # 계좌유형 판별

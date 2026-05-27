@@ -34,17 +34,23 @@ def clearConsole():
     return os.system("cls" if os.name in ("nt", "dos") else "clear")
 
 key_bytes = 32
-config_root = os.path.join(os.path.expanduser("~"), "KIS", "config")
+config_root = os.environ.get(
+    "KIS_CONFIG_ROOT",
+    os.path.join(os.path.expanduser("~"), "KIS", "config"),
+)
+token_root = os.environ.get("KIS_TOKEN_ROOT", config_root)
 # config_root = "$HOME/KIS/config/"  # 토큰 파일이 저장될 폴더, 제3자가 찾기 어렵도록 경로 설정하시기 바랍니다.
 # token_tmp = config_root + 'KIS000000'  # 토큰 로컬저장시 파일 이름 지정, 파일이름을 토큰값이 유추가능한 파일명은 삼가바랍니다.
 # token_tmp = config_root + 'KIS' + datetime.today().strftime("%Y%m%d%H%M%S")  # 토큰 로컬저장시 파일명 년월일시분초
 token_tmp = os.path.join(
-    config_root, f"KIS{datetime.today().strftime('%Y%m%d')}"
+    token_root, f"KIS{datetime.today().strftime('%Y%m%d')}"
 )  # 토큰 로컬저장시 파일명 년월일
 
 # 접근토큰 관리하는 파일 존재여부 체크, 없으면 생성
+os.makedirs(token_root, exist_ok=True)
 if not os.path.exists(token_tmp):
-    f = open(token_tmp, "w+")
+    with open(token_tmp, "w+", encoding="utf-8"):
+        pass
 
 # 앱키, 앱시크리트, 토큰, 계좌번호 등 저장관리, 자신만의 경로와 파일명으로 설정하시기 바랍니다.
 # pip install PyYAML (패키지설치)

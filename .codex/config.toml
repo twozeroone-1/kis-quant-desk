@@ -1,5 +1,6 @@
+openai_base_url = "http://127.0.0.1:18317/v1"
 model = "gpt-5.5"
-model_reasoning_effort = "high"
+model_reasoning_effort = "xhigh"
 
 # Approval prefix rules are read from $CODEX_HOME/rules/default.rules.
 # Run Codex with CODEX_HOME set to this project's .codex directory to keep
@@ -8,6 +9,7 @@ model_reasoning_effort = "high"
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 project_doc_fallback_filenames = ["AGENTS.md"]
+plan_mode_reasoning_effort = "xhigh"
 
 # MCP 서버 — url만으로 HTTP 자동 인식 (type 불필요)
 [mcp_servers.kis-backtest]
@@ -24,6 +26,26 @@ approval_mode = "approve"
 
 [mcp_servers.kis-backtest.tools.list_indicators_tool]
 approval_mode = "approve"
+
+[mcp_servers.kis-backtest.tools.validate_yaml_tool]
+approval_mode = "approve"
+
+[mcp_servers.kis-backtest.tools.list_presets_tool]
+approval_mode = "approve"
+
+[mcp_servers.kis-backtest.tools.get_report_tool]
+approval_mode = "approve"
+
+[mcp_servers.agentmemory]
+command = "/home/from0to01/.codex/agentmemory-mcp.sh"
+args = []
+startup_timeout_sec = 120
+
+[mcp_servers.agentmemory.env]
+AGENTMEMORY_URL = "http://127.0.0.1:3117"
+AGENTMEMORY_TOOLS = "all"
+AGENTMEMORY_FORCE_PROXY = "1"
+AGENTMEMORY_PROBE_TIMEOUT_MS = "5000"
 
 # Skills 경로 명시 (Codex는 .agents/skills/ 자동 탐색 불가, 명시 필요)
 [[skills.config]]
@@ -74,7 +96,7 @@ shell_tool = true
 notifications = true
 
 [tui.model_availability_nux]
-"gpt-5.5" = 1
+"gpt-5.5" = 4
 
 [history]
 persistence = "save-all"

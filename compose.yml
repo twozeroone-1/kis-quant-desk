@@ -1,7 +1,7 @@
 name: kis-stack
 
 services:
-  builder-backend:
+  builder-backend-vps:
     build:
       context: .
       dockerfile: strategy_builder/Dockerfile.backend
@@ -9,11 +9,50 @@ services:
       - .env.production
     environment:
       HOME: /home/kis
+      KIS_CONFIG_ROOT: /home/kis/KIS/config
+      KIS_TOKEN_ROOT: /home/kis/KIS/token-vps
+      KIS_MODE_FILE: /home/kis/KIS/token-vps/KIS_MODE
+      KIS_RUNTIME_DIR: /app/.runtime-vps
+      KIS_DEFAULT_MODE: vps
+      KIS_LOCK_MODE: vps
       AUDIT_LOG_DIR: ${AUDIT_LOG_DIR:-/var/log/kis/orders}
       AUDIT_LOG_RETENTION_DAYS: ${AUDIT_LOG_RETENTION_DAYS:-365}
     volumes:
-      - ${KIS_CONFIG_DIR:-C:/kis-stack/config}:/home/kis/KIS/config
-      - ${KIS_LOG_DIR:-C:/kis-stack/logs}:/var/log/kis
+      - ${KIS_CONFIG_BIND_DIR:-/home/from0to01/KIS/config}:/home/kis/KIS/config
+      - ${KIS_LOG_BIND_DIR:-/home/from0to01/.local/state/kis-stack/logs}:/var/log/kis
+      - ${KIS_TOKEN_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/token-vps}:/home/kis/KIS/token-vps
+      - ${KIS_RUNTIME_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/runtime-vps}:/app/.runtime-vps
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  builder-backend-prod:
+    build:
+      context: .
+      dockerfile: strategy_builder/Dockerfile.backend
+    env_file:
+      - .env.production
+    environment:
+      HOME: /home/kis
+      KIS_CONFIG_ROOT: /home/kis/KIS/config
+      KIS_TOKEN_ROOT: /home/kis/KIS/token-prod
+      KIS_MODE_FILE: /home/kis/KIS/token-prod/KIS_MODE
+      KIS_RUNTIME_DIR: /app/.runtime-prod
+      KIS_DEFAULT_MODE: prod
+      KIS_LOCK_MODE: prod
+      AUDIT_LOG_DIR: ${AUDIT_LOG_DIR:-/var/log/kis/orders}
+      AUDIT_LOG_RETENTION_DAYS: ${AUDIT_LOG_RETENTION_DAYS:-365}
+    volumes:
+      - ${KIS_CONFIG_BIND_DIR:-/home/from0to01/KIS/config}:/home/kis/KIS/config
+      - ${KIS_LOG_BIND_DIR:-/home/from0to01/.local/state/kis-stack/logs}:/var/log/kis
+      - ${KIS_TOKEN_PROD_BIND_DIR:-/home/from0to01/.local/state/kis-stack/token-prod}:/home/kis/KIS/token-prod
+      - ${KIS_RUNTIME_PROD_BIND_DIR:-/home/from0to01/.local/state/kis-stack/runtime-prod}:/app/.runtime-prod
     expose:
       - "8000"
     healthcheck:
@@ -31,7 +70,9 @@ services:
     expose:
       - "3000"
     depends_on:
-      builder-backend:
+      builder-backend-vps:
+        condition: service_healthy
+      builder-backend-prod:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -50,7 +91,7 @@ services:
     environment:
       HOME: /home/kis
     volumes:
-      - ${KIS_CONFIG_DIR:-C:/kis-stack/config}:/home/kis/KIS/config
+      - ${KIS_CONFIG_BIND_DIR:-/home/from0to01/KIS/config}:/home/kis/KIS/config
       - backtester_workspace:/app/.lean-workspace
       - /var/run/docker.sock:/var/run/docker.sock
     expose:
@@ -87,6 +128,7 @@ services:
     ports:
       - "${CADDY_BIND_IP:-0.0.0.0}:8081:8081"
       - "${CADDY_BIND_IP:-0.0.0.0}:8082:8082"
+      - "${CADDY_BIND_IP:-0.0.0.0}:8083:8083"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
     restart: unless-stopped

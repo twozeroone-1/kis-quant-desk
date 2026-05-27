@@ -1,0 +1,63 @@
+version: "1.0"
+metadata:
+  name: Today US News Trend Filter
+  description: News-aware US large-cap trend filter using EMA, ROC, and RSI.
+  category: momentum
+  author: codex
+
+strategy:
+  id: today_us_news_trend_filter
+  indicators:
+    - id: ema
+      alias: ema_fast
+      params:
+        period: 20
+    - id: ema
+      alias: ema_slow
+      params:
+        period: 50
+    - id: roc
+      alias: roc_20
+      params:
+        period: 20
+    - id: rsi
+      alias: rsi
+      params:
+        period: 14
+
+  entry:
+    logic: AND
+    conditions:
+      - indicator: ema_fast
+        operator: greater_than
+        compare_to: ema_slow
+      - indicator: roc_20
+        operator: greater_than
+        value: 4
+      - indicator: rsi
+        operator: greater_than
+        value: 50
+      - indicator: rsi
+        operator: less_than
+        value: 72
+
+  exit:
+    logic: OR
+    conditions:
+      - indicator: ema_fast
+        operator: less_than
+        compare_to: ema_slow
+      - indicator: roc_20
+        operator: less_than
+        value: -3
+      - indicator: rsi
+        operator: greater_than
+        value: 78
+
+risk:
+  stop_loss:
+    enabled: true
+    percent: 3.0
+  take_profit:
+    enabled: true
+    percent: 6.0

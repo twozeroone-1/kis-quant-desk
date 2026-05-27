@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -30,7 +31,13 @@ from core.signal import Action, Signal
 
 logger = logging.getLogger(__name__)
 
-STATE_FILE = Path(__file__).resolve().parents[2] / ".runtime" / "protective_orders.json"
+RUNTIME_DIR = Path(
+    os.environ.get(
+        "KIS_RUNTIME_DIR",
+        str(Path(__file__).resolve().parents[2] / ".runtime"),
+    )
+)
+STATE_FILE = RUNTIME_DIR / "protective_orders.json"
 DEFAULT_MONITOR_INTERVAL_SECONDS = 15
 MIN_MONITOR_INTERVAL_SECONDS = 5
 MAX_MONITOR_INTERVAL_SECONDS = 300
@@ -593,42 +600,40 @@ async def upsert_existing_position_protection(
 
     state = await _load_state()
     existing_orders = state.get("orders", [])
-    if not enabled:
-        changed = False
-        for order in existing_orders:
-            if (
-                order.get("status") == "active"
-                and order.get("stock_code") == stock_code
-                and order.get("env_dv") == env_dv
-                and order.get("market", "domestic") == market
-            ):
-                order["status"] = "disabled"
-                order["closed_at"] = _now()
-                order.setdefault("events", []).append({"type": "disabled", "at": _now()})
-                changed = True
-        if changed:
-            await _save_state(state)
-            await _sync_realtime_subscriptions(state)
-        return {"status": "disabled", "stock_code": stock_code}
 
-    if not take_profit_enabled and not stop_loss_enabled:
+    if enabled and not take_profit_enabled and not stop_loss_enabled:
         raise ValueError("take_profit or stop_loss must be enabled")
 
     tp_trigger = float(take_profit_trigger_price or 0)
     sl_trigger = float(stop_loss_trigger_price or 0)
-    if take_profit_enabled and tp_trigger <= 0:
+    if enabled and take_profit_enabled and tp_trigger <= 0:
         raise ValueError("take_profit_trigger_price must be positive")
-    if stop_loss_enabled and sl_trigger <= 0:
+    if enabled and stop_loss_enabled and sl_trigger <= 0:
         raise ValueError("stop_loss_trigger_price must be positive")
 
     take_profit_order_type = take_profit_order_type if take_profit_order_type in {"market", "limit"} else "limit"
     stop_loss_order_type = stop_loss_order_type if stop_loss_order_type in {"market", "limit"} else "market"
+    if market == "us":
+        take_profit_order_type = "limit"
+        stop_loss_order_type = "limit"
     tp_pct = ((tp_trigger / entry_price) - 1) * 100 if take_profit_enabled else None
     sl_pct = (1 - (sl_trigger / entry_price)) * 100 if stop_loss_enabled else None
+    tp_price = _round_price(market, tp_trigger, "up") if take_profit_enabled and tp_trigger > 0 else None
+    tp_limit = (
+        _round_price(market, take_profit_limit_price or tp_trigger, "down")
+        if take_profit_enabled and (take_profit_limit_price or tp_trigger) else None
+    )
+    sl_price = _round_price(market, sl_trigger, "down") if stop_loss_enabled and sl_trigger > 0 else None
+    sl_limit = (
+        _round_price(market, stop_loss_limit_price or sl_trigger, "down")
+        if stop_loss_enabled and (stop_loss_limit_price or sl_trigger) else None
+    )
+    status = "active" if enabled else "disabled"
+    now = _now()
 
     protection = {
         "id": uuid4().hex,
-        "status": "active",
+        "status": status,
         "env_dv": env_dv,
         "market": market,
         "exchange": exchange,
@@ -641,9 +646,9 @@ async def upsert_existing_position_protection(
         "source_order_no": None,
         "take_profit_enabled": take_profit_enabled,
         "take_profit_pct": round(tp_pct, 2) if tp_pct is not None else None,
-        "take_profit_price": _round_price(market, tp_trigger or entry_price, "up"),
-        "take_profit_trigger_price": _round_price(market, tp_trigger or entry_price, "up"),
-        "take_profit_limit_price": _round_price(market, take_profit_limit_price or tp_trigger or entry_price, "down"),
+        "take_profit_price": tp_price,
+        "take_profit_trigger_price": tp_price,
+        "take_profit_limit_price": tp_limit,
         "take_profit_order_type": take_profit_order_type,
         "take_profit_submit_mode": "on_trigger",
         "take_profit_status": "waiting_trigger",
@@ -651,21 +656,24 @@ async def upsert_existing_position_protection(
         "take_profit_org_no": None,
         "stop_loss_enabled": stop_loss_enabled,
         "stop_loss_pct": round(sl_pct, 2) if sl_pct is not None else None,
-        "stop_loss_price": _round_price(market, sl_trigger or entry_price, "down"),
-        "stop_loss_limit_price": _round_price(market, stop_loss_limit_price or sl_trigger or entry_price, "down"),
+        "stop_loss_price": sl_price,
+        "stop_loss_limit_price": sl_limit,
         "stop_loss_order_type": stop_loss_order_type,
-        "created_at": _now(),
+        "created_at": now,
         "last_checked_at": None,
-        "events": [{"type": "created_from_review", "at": _now()}],
+        "events": [{"type": "created_from_review" if enabled else "saved_disabled_from_review", "at": now}],
     }
+    if not enabled:
+        protection["closed_at"] = now
 
     state["orders"] = [
         order for order in existing_orders
         if not (
-            order.get("status") == "active"
+            order.get("status") in {"active", "disabled"}
             and order.get("stock_code") == stock_code
             and order.get("env_dv") == env_dv
             and order.get("market", "domestic") == market
+            and (order.get("exchange") or None) == (exchange or None)
         )
     ]
     state["orders"].append(protection)
