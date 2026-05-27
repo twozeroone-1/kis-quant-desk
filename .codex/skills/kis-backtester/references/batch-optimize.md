@@ -10,7 +10,7 @@
 {
   "items": [
     {"strategy_id": "sma_crossover", "symbols": ["005930"]},
-    {"strategy_id": "golden_cross",  "symbols": ["005930"], "param_overrides": {"fast_period": 50}},
+    {"strategy_id": "trend_filter_signal", "symbols": ["005930"], "param_overrides": {"trend_period": 60}},
     {"yaml_content": "<커스텀 YAML>", "symbols": ["000660"]}
   ],
   "start_date": "2025-01-01",

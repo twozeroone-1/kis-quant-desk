@@ -153,6 +153,7 @@ yarn-error.log*
 # ===== Runtime state =====
 .runtime/
 **/.runtime/
+**/.runtime-*/
 
 # ===== Lock files =====
 *.lock
@@ -176,6 +177,7 @@ KIS/
 !.codex/rules/**
 !.codex/scripts/
 !.codex/scripts/**
+.codex/scripts/__pycache__/
 !.codex/skills/
 !.codex/skills/**
 .codex/skills/.system/

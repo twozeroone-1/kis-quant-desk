@@ -6,7 +6,6 @@ description: "KIS 전략을 과거 데이터로 검증하거나 성과를 확인
   backtester MCP 서버를 통해 10개 프리셋(sma_crossover, momentum 등) 또는 .kis.yaml 전략 실행,
   BacktestResult(총수익률·CAGR·최대낙폭·샤프) 해석, Grid/Random 파라미터 최적화,
   배치 전략 비교, 포트폴리오 분석, HTML 리포트 생성을 수행한다."
-model: sonnet
 ---
 
 # [Step 2] KIS 백테스팅
@@ -34,14 +33,14 @@ docker pull quantconnect/lean:latest
 
 ```bash
 # MCP 서버 (port 3846) — IDE에서 백테스트 도구 직접 호출
-cd $CLAUDE_PROJECT_DIR/backtester && bash scripts/start_mcp.sh
+cd <프로젝트루트>/backtester && bash scripts/start_mcp.sh
 # → http://127.0.0.1:3846/mcp
 
 # (선택) Backend REST API (port 8002)
-cd $CLAUDE_PROJECT_DIR/backtester && uv run uvicorn backend.main:app --reload --port 8002
+cd <프로젝트루트>/backtester && uv run uvicorn backend.main:app --reload --port 8002
 
 # (선택) Frontend
-cd $CLAUDE_PROJECT_DIR/backtester/frontend && pnpm dev
+cd <프로젝트루트>/backtester/frontend && pnpm dev
 # → http://localhost:3001
 ```
 
@@ -69,15 +68,17 @@ cd $CLAUDE_PROJECT_DIR/backtester/frontend && pnpm dev
 ```
 
 **YAML 사전 검증**:
+- 빠른 로컬 점검: `python3 .codex/scripts/validate_kis_yaml.py <파일.kis.yaml>`
 - `validate_yaml_tool`로 문법 검증
-- 조건의 `value` 필드에 `$param_name` 변수가 있으면 → 해당 파라미터의 default 값으로 치환 후 실행
+- 조건의 `value` 필드나 지표 params에 `$param_name` 변수가 있으면 → 해당 파라미터의 default 값으로 치환 후 실행
 - `value`가 숫자가 아니면 사용자에게 알리고 수정
+- `valid: true` 확인 전에는 `run_backtest_tool`을 호출하지 않는다.
 
 사용자가 확인하면 실행 단계로 진행한다.
 
 ### 1. 전략 선택
 
-- **프리셋 ID**: `"sma_crossover"`, `"momentum"` 등 10개
+- **프리셋 ID**: `list_presets_tool` 결과가 source of truth
   ```
   Tool: list_presets_tool          # 전체 목록 + param 스키마 확인
   Tool: get_preset_yaml_tool       # { "strategy_id": "sma_crossover" }
@@ -90,7 +91,7 @@ cd $CLAUDE_PROJECT_DIR/backtester/frontend && pnpm dev
   ```
 - **지표 목록 확인**:
   ```
-  Tool: list_indicators_tool       # 80개 지표 + 57개 캔들스틱 파라미터 정의
+  Tool: list_indicators_tool       # 현재 지원 지표 + 다중 출력 정의
   ```
 
 ## YAML 자동 생성
@@ -104,17 +105,18 @@ cd $CLAUDE_PROJECT_DIR/backtester/frontend && pnpm dev
 4. `conditions`: `value`(숫자) 또는 `compare_to`(alias) 중 하나만 — 동시 사용 금지
 5. `risk`: `{enabled: true, percent: X.0}` 형식
 6. `version`: `"1.0"` 고정
+7. 생성 후 `python3 .codex/scripts/validate_kis_yaml.py <파일>` 및 `validate_yaml_tool`을 순서대로 통과시킨다.
 
 ### References 파일 요약
 
 | 파일 | 내용 |
 |------|------|
-| `references/yaml-templates.md` | 10개 YAML 기반 전략 템플릿 (golden_cross 등) — 커스텀 YAML 빠른 시작용 |
-| `references/indicator-params.md` | 21개 지표 id·params·다중출력 레퍼런스 (sma, ema, rsi, macd, bollinger 등) |
+| `references/yaml-templates.md` | 커스텀 YAML 템플릿 (원본 placeholder는 실행 전 숫자 리터럴로 치환) |
+| `references/indicator-params.md` | 자주 쓰는 지표 id·params·다중출력 레퍼런스 |
 | `references/batch-optimize.md` | run_batch_backtest_tool / optimize_strategy_tool 상세 입출력 명세 |
 
 ### 프리셋 → YAML 변환
-`references/yaml-templates.md` 에서 해당 전략 복사 → alias/params 조정 → 파일 저장
+MCP 프리셋은 `get_preset_yaml_tool`을 우선 사용한다. `references/yaml-templates.md`는 커스텀 전략 시작점으로만 사용하고, raw placeholder를 그대로 실행하지 않는다.
 
 ### 커스텀 전략 → YAML 생성
 `references/indicator-params.md` 에서 지표 id/params 확인 → 조건 조합 → 체크리스트 검증 후 저장
@@ -177,6 +179,8 @@ Tool: get_backtest_result_tool { "job_id": "<job_id>", "wait": false }
 | `profit_factor` | 총이익/총손실 비율 |
 | `total_trades` | 총 거래 횟수 |
 
+결과를 주문 실행으로 넘길 때는 전략/종목/기간/파라미터와 핵심 지표를 함께 보존한다. 주문 단계에서 전략이나 파라미터가 바뀌면 백테스트 결과를 그대로 인용하지 않는다.
+
 ### 4b. 백테스트 재시도 (실패 시)
 
 EGW00201(초당 한도 초과) 등 일시적 오류로 실패한 경우 재시도:
@@ -221,7 +225,7 @@ Tool: get_backtest_result_tool { "job_id": "<job_id>", "wait": false }
 Tool: run_batch_backtest_tool {
   "items": [
     {"strategy_id": "sma_crossover", "symbols": ["005930"]},
-    {"strategy_id": "golden_cross",  "symbols": ["005930"], "param_overrides": {"fast_period": 50}},
+    {"strategy_id": "trend_filter_signal", "symbols": ["005930"], "param_overrides": {"trend_period": 60}},
     {"yaml_content": "<커스텀 YAML>", "symbols": ["000660"]}
   ]
 }
@@ -251,18 +255,20 @@ Tool: get_report_tool { "job_id": "<job_id>", "format": "json" }
 
 ## 10개 프리셋 ID 목록
 
+아래 목록은 참고용이다. 실행 직전에는 `list_presets_tool` 결과를 다시 확인한다.
+
 | ID | 이름 | 카테고리 | 주요 파라미터 |
 |----|------|----------|--------------|
 | `sma_crossover` | SMA 골든/데드 크로스 | trend | fast_period, slow_period |
 | `momentum` | 모멘텀 | momentum | lookback, threshold |
-| `trend_filter_signal` | 추세 필터 + 시그널 | composite | trend_period |
 | `week52_high` | 52주 신고가 돌파 | trend | lookback, stop_loss_pct |
+| `consecutive_moves` | 연속 상승·하락 | momentum | up_days, down_days |
 | `ma_divergence` | 이동평균 이격도 | mean_reversion | period, buy_ratio, sell_ratio |
 | `false_breakout` | 추세 돌파 후 이탈 | trend | lookback |
-| `short_term_reversal` | 단기 반전 | mean_reversion | period, threshold_pct |
-| `strong_close` | 강한 종가 | momentum | close_ratio, stop_loss_pct |
+| `strong_close` | 강한 종가 | momentum | min_close_ratio, stop_loss_pct |
 | `volatility_breakout` | 변동성 축소 후 확장 | volatility | atr_period, lookback |
-| `consecutive_moves` | 연속 상승·하락 | momentum | up_days, down_days |
+| `short_term_reversal` | 단기 반전 | mean_reversion | period, threshold_pct |
+| `trend_filter_signal` | 추세 필터 + 시그널 | composite | trend_period |
 
 ## 결과 해석 기준
 

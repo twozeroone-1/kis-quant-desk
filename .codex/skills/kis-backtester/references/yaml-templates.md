@@ -1,6 +1,8 @@
-# 10개 프리셋 YAML 템플릿
+# 커스텀 YAML 템플릿
 
-`.kis.yaml`로 저장 후 `POST /api/backtest/run-custom`에 사용한다.
+이 파일의 예시는 MCP 프리셋 ID 목록이 아니라 커스텀 `.kis.yaml` 시작점이다.
+raw 템플릿에는 `$period`, `$threshold` 같은 placeholder가 있을 수 있으므로 실행 전에 숫자 리터럴로 치환한다.
+저장 후 `python3 .codex/scripts/validate_kis_yaml.py <파일>`과 `validate_yaml_tool`을 통과시킨 뒤 백테스트한다.
 
 ### golden_cross
 ```yaml

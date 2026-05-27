@@ -14,7 +14,7 @@ description: "KIS 플러그인 사용법을 안내할 때 사용. '사용법', '
 
 | 트리거 문구 | 스킬 | 단계 | 주요 기능 |
 |------------|------|------|----------|
-| "전략 만들어줘", "YAML 전략" | **kis-strategy-builder** | Step 1 | 10개 프리셋 또는 커스텀 `.kis.yaml` 생성 |
+| "전략 만들어줘", "YAML 전략" | **kis-strategy-builder** | Step 1 | 프리셋 확인 또는 커스텀 `.kis.yaml` 생성 |
 | "백테스트 해줘", "수익률 확인" | **kis-backtester** | Step 2 | 과거 성과 검증, 파라미터 최적화, HTML 리포트 |
 | "신호 확인", "매수 신호 있어?" | **kis-order-executor** | Step 3 | BUY/SELL/HOLD 신호 → 모의/실전 주문 |
 | "다 해줘", "전략부터 주문까지" | **kis-team** | 1→2→3 | 3단계 전체 오케스트레이션 |
@@ -39,6 +39,13 @@ $auth vps            → auth 스킬
 # 한 번에 다
 "전략부터 주문까지 다 해줘" → kis-team
 ```
+
+## 운영 기준
+
+- 실행 가능한 프리셋은 각 실행면의 API가 source of truth다. 백테스터는 `list_presets_tool`, 실시간 실행은 `/api/strategies`를 확인한다.
+- 커스텀 YAML은 실행 전 `python3 .codex/scripts/validate_kis_yaml.py <파일>`과 백테스터 `validate_yaml_tool`로 검증한다.
+- "지금 사도 돼?" 같은 요청은 직접 추천이 아니라 전략 기반 신호 확인 또는 백테스트 검증으로 안내한다.
+- 실전 주문은 Codex 훅으로 차단할 수 없으므로 종목·수량·예상금액·리스크 주문을 표시하고 사용자 확인을 받아야 한다.
 
 ---
 

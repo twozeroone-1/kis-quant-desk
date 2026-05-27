@@ -10,7 +10,7 @@
 
 | 스킬 | 트리거 | 설명 |
 |------|--------|------|
-| `kis-strategy-builder` | "전략 만들어줘", "지표1 + 지표2 조합" | 10개 프리셋 + 80개 지표로 `.kis.yaml` 전략 설계 |
+| `kis-strategy-builder` | "전략 만들어줘", "지표1 + 지표2 조합" | 프리셋 확인 또는 지표 조합으로 `.kis.yaml` 전략 설계 |
 | `kis-backtester` | "백테스트 해줘", "전략 검증" | Lean 엔진 백테스팅, 파라미터 최적화, HTML 리포트 |
 | `kis-order-executor` | "신호 확인", "모의투자 실행" | BUY/SELL/HOLD 신호 확인 후 모의/실전 주문 |
 | `kis-team` | "다 해줘", "전략부터 주문까지" | Step 1→2→3 풀파이프라인 (단계별 사용자 확인) |
@@ -27,6 +27,8 @@
 - 실전(`prod`) 주문 전에 종목·수량·예상금액을 표시하고 반드시 사용자 확인을 받는다.
 - 신호 강도 `0.5` 미만이면 주문을 건너뛴다.
 - 계좌번호는 마스킹해서 표시한다.
+- 실행 가능한 프리셋은 각 실행 도구의 API 결과를 기준으로 한다. 백테스터는 `list_presets_tool`, 실시간 실행은 `/api/strategies`가 source of truth다.
+- 커스텀 `.kis.yaml`은 실행 전 `.codex/scripts/validate_kis_yaml.py`와 백테스터 `validate_yaml_tool`을 통과시킨다.
 
 ## Order Execution Guardrails
 

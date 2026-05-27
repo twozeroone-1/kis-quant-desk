@@ -3,10 +3,9 @@ name: kis-strategy-builder
 description: "KIS 트레이딩 전략을 설계하거나 .kis.yaml 파일을 만들 때 반드시 사용. '전략 만들어줘',
   '전략 설계', 'YAML 전략', '지표 조합', '매매 조건 짜줘', '전략 파일', 'RSI 전략 만들어줘',
   'MACD+볼린저 전략', '골든크로스 전략', 'strategy builder'라고 할 때 자동 실행된다.
-  strategy_builder 비주얼 빌더 안내, 10개 프리셋 전략 소개, 기술적 지표(RSI/MACD/BB/EMA 등) 기반
+  strategy_builder 비주얼 빌더 안내, 실행 가능 프리셋 확인, 기술적 지표(RSI/MACD/BB/EMA 등) 기반
   진입·청산 조건 설계, .kis.yaml 포맷 생성, DSL 조건식 작성을 수행한다.
   완성된 YAML은 백테스팅(Step 2)이나 주문 실행(Step 3)에 바로 사용 가능하다."
-model: sonnet
 ---
 
 # [Step 1] KIS 전략 설계
@@ -20,10 +19,10 @@ strategy_builder 비주얼 빌더를 활용해 기술적 지표 기반 트레이
 
 ```bash
 # Backend
-cd $CLAUDE_PROJECT_DIR/strategy_builder && uv run uvicorn backend.main:app --reload --port 8000
+cd <프로젝트루트>/strategy_builder && uv run uvicorn backend.main:app --reload --port 8000
 
 # Frontend
-cd $CLAUDE_PROJECT_DIR/strategy_builder/frontend && pnpm dev
+cd <프로젝트루트>/strategy_builder/frontend && pnpm dev
 # → http://localhost:3000/builder
 ```
 
@@ -31,8 +30,10 @@ cd $CLAUDE_PROJECT_DIR/strategy_builder/frontend && pnpm dev
 
 ### 1. 전략 유형 파악
 
-- 10개 프리셋 중 선택 vs. 커스텀 설계
+- 실행 가능한 백테스터 프리셋 vs. 커스텀 `.kis.yaml` 설계
 - 카테고리: `trend` / `momentum` / `mean_reversion` / `volatility` / `oscillator`
+- 프리셋 ID·파라미터는 하드코딩하지 말고 가능하면 `list_presets_tool` 결과를 기준으로 한다.
+- `kis-backtester/references/yaml-templates.md`는 커스텀 YAML 예시이며, MCP `run_preset_backtest_tool`의 `strategy_id` 목록과 동일하다고 가정하지 않는다.
 
 ### 2. 지표 선택
 
@@ -161,6 +162,25 @@ risk:
     percent: 8.0
 ```
 
+### 6b. 산출물 핸드오프
+
+전략을 만든 뒤 다음 단계로 넘길 때는 YAML만 던지지 말고 아래 상태를 함께 요약한다.
+
+```json
+{
+  "strategy_id": "rsi_oversold",
+  "yaml_path": "strategies/custom/rsi_oversold.kis.yaml",
+  "symbols": ["005930"],
+  "market": "domestic",
+  "timeframe": "daily",
+  "entry": "RSI < 30",
+  "exit": "RSI > 70",
+  "risk": {"stop_loss_pct": 3.0, "take_profit_pct": 8.0}
+}
+```
+
+백테스트나 주문 실행 단계는 이 `builder_state` 또는 같은 내용의 `.kis.yaml`을 기준으로 조건을 재확인한다.
+
 ### 7. 다중 출력 지표 (MACD 골든크로스)
 
 MACD는 `value`(MACD 라인), `signal`(시그널 라인), `histogram` 세 가지 출력을 가진다.
@@ -223,27 +243,23 @@ Body: { "yaml": "<yaml 내용>" }
 # → 생성된 Python 클래스 코드 확인
 ```
 
-## 10개 프리셋 전략 목록
+## 프리셋 기준
 
-| ID | 이름 | 카테고리 | 주요 지표 |
-|----|------|----------|----------|
-| `golden_cross` | 골든크로스 | trend | SMA(50), SMA(200) |
-| `adx_trend` | ADX 강한 추세 | trend | ADX(14) |
-| `obv_divergence` | OBV 다이버전스 | volume | OBV |
-| `mfi_oversold` | MFI 과매도 | oscillator | MFI(14) |
-| `vwap_bounce` | VWAP 반등 | trend | VWAP |
-| `cci_reversal` | CCI 반전 | oscillator | CCI(20) |
-| `williams_reversal` | Williams %R 반전 | oscillator | Williams%R(14) |
-| `atr_breakout` | ATR 변동성 돌파 | volatility | ATR(14) |
-| `disparity_mean_revert` | 이격도 평균회귀 | mean_reversion | Disparity(20) |
-| `consecutive_candle` | 연속 캔들 패턴 | momentum | Consecutive(3) |
+실행 가능한 프리셋은 백테스터 MCP의 `list_presets_tool` 결과가 source of truth다.
+현재 대표 ID는 `sma_crossover`, `momentum`, `week52_high`, `consecutive_moves`,
+`ma_divergence`, `false_breakout`, `strong_close`, `volatility_breakout`,
+`short_term_reversal`, `trend_filter_signal`이다.
+
+`golden_cross`, `adx_trend`, `mfi_oversold` 같은 이름은 커스텀 YAML 템플릿으로 사용할 수 있지만,
+`run_preset_backtest_tool.strategy_id`로 바로 실행한다고 가정하지 않는다.
 
 
 ## Troubleshooting
 
 - 지표가 NaN → 데이터 부족. `min_period` 이상의 과거 데이터 필요 (SMA20 → 20일 이상)
-- YAML 파싱 오류 → 들여쓰기(2스페이스) 확인, `$param_name` 변수 `$` 누락 확인
+- YAML 파싱 오류 → 들여쓰기(2스페이스) 확인, `$param_name` 변수가 남아 있으면 숫자 리터럴로 치환
 - preview 오류 → 지표 ID와 조건의 `indicator` 필드명 일치 여부 확인
+- 실행 전 빠른 점검 → `python3 .codex/scripts/validate_kis_yaml.py <파일.kis.yaml>`
 
 ## 다음 단계
 
