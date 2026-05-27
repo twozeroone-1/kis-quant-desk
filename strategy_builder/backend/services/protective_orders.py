@@ -42,6 +42,7 @@ DEFAULT_MONITOR_INTERVAL_SECONDS = 15
 MIN_MONITOR_INTERVAL_SECONDS = 5
 MAX_MONITOR_INTERVAL_SECONDS = 300
 REALTIME_FRESH_SECONDS = 30
+POSITION_MISSING_CONFIRMATIONS = 3
 
 _monitor_task: Optional[asyncio.Task] = None
 _state_lock = asyncio.Lock()
@@ -131,6 +132,27 @@ async def _load_state() -> dict[str, Any]:
 async def _save_state(state: dict[str, Any]) -> None:
     async with _state_lock:
         await asyncio.to_thread(_save_state_sync, state)
+
+
+async def _merge_updated_orders(updated_orders: list[dict[str, Any]]) -> dict[str, Any]:
+    """Save monitor updates without dropping orders added by concurrent UI/API saves."""
+    async with _state_lock:
+        latest = await asyncio.to_thread(_load_state_sync)
+        latest_orders = latest.get("orders", [])
+        updated_by_id = {
+            order.get("id"): order
+            for order in updated_orders
+            if order.get("id")
+        }
+
+        merged_orders = []
+        for order in latest_orders:
+            order_id = order.get("id")
+            merged_orders.append(updated_by_id.get(order_id, order))
+
+        latest["orders"] = merged_orders
+        await asyncio.to_thread(_save_state_sync, latest)
+        return latest
 
 
 def _normalize_monitor_interval(value: Any) -> int:
@@ -376,13 +398,33 @@ def _check_order_sync(order: dict[str, Any], env_dv: str) -> dict[str, Any]:
     market = str(order.get("market") or "domestic")
     holdings = _get_holding_map(env_dv, market)
     pending = _get_pending_order_map(env_dv, market, order.get("exchange"))
+
+    if not holdings:
+        order["last_checked_at"] = _now()
+        order["last_error"] = "holdings unavailable or empty; active protection preserved"
+        return order
+
     holding = holdings.get(str(order["stock_code"]))
 
     if not holding or int(holding.get("quantity") or 0) <= 0:
+        missing_count = int(order.get("position_missing_count") or 0) + 1
+        order["position_missing_count"] = missing_count
+        order["last_checked_at"] = _now()
+        order["last_error"] = (
+            "position not found in holdings "
+            f"({missing_count}/{POSITION_MISSING_CONFIRMATIONS})"
+        )
+        if missing_count < POSITION_MISSING_CONFIRMATIONS:
+            return order
+
         order["status"] = "closed"
         order["closed_at"] = _now()
         order.setdefault("events", []).append({"type": "position_closed", "at": _now()})
         return order
+
+    order.pop("position_missing_count", None)
+    if str(order.get("last_error") or "").startswith(("holdings unavailable", "position not found")):
+        order.pop("last_error", None)
 
     order["quantity"] = min(int(order["quantity"]), int(holding.get("quantity") or 0))
     _ensure_take_profit(order, env_dv, pending)
@@ -716,8 +758,7 @@ async def run_monitor_cycle() -> None:
             logger.exception("protective order check failed")
 
     if changed:
-        state["orders"] = updated_orders
-        await _save_state(state)
+        state = await _merge_updated_orders(updated_orders)
         await _sync_realtime_subscriptions(state)
 
 
@@ -762,8 +803,7 @@ async def handle_realtime_tick(tick: dict[str, Any]) -> None:
             logger.exception("realtime protective order check failed")
 
     if changed:
-        state["orders"] = updated_orders
-        await _save_state(state)
+        state = await _merge_updated_orders(updated_orders)
         await _sync_realtime_subscriptions(state)
 
 

@@ -169,10 +169,21 @@ export default function ReviewPage() {
       stock_code: holding.stock_code,
       exchange: holding.exchange || null,
     }));
+    let intentionallyClosed = false;
+
+    const clearRealtimeErrorMessage = () => {
+      setMessage((current) =>
+        current === "실시간 시세 연결 실패" || current === "실시간 시세 연결 오류"
+          ? ""
+          : current
+      );
+    };
 
     setPriceStreamState("connecting");
     websocket.onopen = () => {
+      if (intentionallyClosed) return;
       setPriceStreamState("connected");
+      clearRealtimeErrorMessage();
       websocket.send(JSON.stringify({ type: "subscribe", symbols }));
     };
     websocket.onmessage = (event) => {
@@ -187,6 +198,9 @@ export default function ReviewPage() {
         }
         if (payload.type === "status") {
           setRealtimeStatus(payload.realtime);
+          if (payload.realtime?.connected) {
+            clearRealtimeErrorMessage();
+          }
         }
         if (payload.type === "error") {
           setMessage(payload.message || "실시간 시세 연결 오류");
@@ -195,10 +209,20 @@ export default function ReviewPage() {
         setMessage("실시간 시세 메시지를 처리하지 못했습니다.");
       }
     };
-    websocket.onclose = () => setPriceStreamState("closed");
-    websocket.onerror = () => setMessage("실시간 시세 연결 실패");
+    websocket.onclose = () => {
+      if (!intentionallyClosed) {
+        setPriceStreamState("closed");
+      }
+    };
+    websocket.onerror = () => {
+      if (!intentionallyClosed) {
+        setPriceStreamState("closed");
+        setMessage("실시간 시세 연결 실패");
+      }
+    };
 
     return () => {
+      intentionallyClosed = true;
       websocket.close();
     };
   }, [authStatus.authenticated, holdings, market]);
