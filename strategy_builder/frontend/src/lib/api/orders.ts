@@ -84,6 +84,68 @@ export interface CancelOrderResponse {
   message: string;
 }
 
+export type ReservationMarket = "domestic" | "us";
+export type ReservationAction = "BUY" | "SELL";
+export type ReservationOrderType = "limit" | "market" | "preopen" | "moo";
+
+export interface ReservationOrderItem {
+  [key: string]: unknown;
+}
+
+export interface ReservationSubmitRequest {
+  market: ReservationMarket;
+  stock_code: string;
+  stock_name?: string;
+  action: ReservationAction;
+  quantity: number;
+  price: number;
+  order_type: ReservationOrderType;
+  exchange?: "NASD" | "NYSE" | "AMEX";
+  end_date?: string | null;
+  confirm_prod?: boolean;
+}
+
+export interface ReservationCancelRequest {
+  market: ReservationMarket;
+  reservation_order_no: string;
+  reservation_order_date: string;
+  reservation_order_org_no?: string;
+  confirm_prod?: boolean;
+}
+
+export interface ReservationModifyRequest extends ReservationSubmitRequest {
+  reservation_order_no: string;
+  reservation_order_date: string;
+  reservation_order_org_no: string;
+}
+
+export interface ReservationSubmitResponse {
+  status: "success" | "error";
+  message: string;
+  data?: Record<string, unknown>;
+}
+
+export interface ReservationListParams {
+  market?: ReservationMarket;
+  start_date?: string;
+  end_date?: string;
+  stock_code?: string;
+  action?: ReservationAction | "";
+  exchange?: "NASD" | "NYSE" | "AMEX";
+  include_cancelled?: boolean;
+}
+
+export interface ReservationListResponse {
+  status: "success" | "error";
+  message?: string;
+  orders: ReservationOrderItem[];
+  total_count: number;
+  market?: ReservationMarket;
+  start_date?: string;
+  end_date?: string;
+  data?: Record<string, unknown>;
+}
+
 export type ExitOrderType = "market" | "limit";
 
 export interface ProtectiveOrder {
@@ -215,6 +277,36 @@ export async function getPendingOrders(): Promise<PendingOrdersResponse> {
  */
 export async function cancelOrder(request: CancelOrderRequest): Promise<CancelOrderResponse> {
   return apiPost<CancelOrderResponse>("/api/orders/cancel", request);
+}
+
+export async function submitReservationOrder(
+  request: ReservationSubmitRequest
+): Promise<ReservationSubmitResponse> {
+  return apiPost<ReservationSubmitResponse>("/api/orders/reservations", request);
+}
+
+export async function getReservationOrders(
+  params: ReservationListParams = {}
+): Promise<ReservationListResponse> {
+  const search = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") return;
+    search.set(key, String(value));
+  });
+  const query = search.toString();
+  return apiGet<ReservationListResponse>(`/api/orders/reservations${query ? `?${query}` : ""}`);
+}
+
+export async function cancelReservationOrder(
+  request: ReservationCancelRequest
+): Promise<ReservationSubmitResponse> {
+  return apiPost<ReservationSubmitResponse>("/api/orders/reservations/cancel", request);
+}
+
+export async function modifyReservationOrder(
+  request: ReservationModifyRequest
+): Promise<ReservationSubmitResponse> {
+  return apiPost<ReservationSubmitResponse>("/api/orders/reservations/modify", request);
 }
 
 export async function getProtectiveOrders(): Promise<ProtectiveOrdersResponse> {

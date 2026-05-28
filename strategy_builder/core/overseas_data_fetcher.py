@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -36,6 +37,9 @@ _exchange_cache_lock = threading.Lock()
 _balance_cache_lock = threading.Lock()
 _balance_cache: dict[str, Any] = {"data": None, "timestamp": 0.0, "env_dv": None}
 _BALANCE_CACHE_TTL = 10
+US_DAYTIME_START = (10, 0)
+US_DAYTIME_END = (18, 0)
+US_EXCHANGES = {"NASD", "NYSE", "AMEX"}
 
 
 @dataclass(frozen=True)
@@ -58,9 +62,35 @@ class ExchangeResolution:
         return data
 
 
+@dataclass(frozen=True)
+class OverseasOrderResult:
+    dataframe: pd.DataFrame
+    success: bool
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    api_url: Optional[str] = None
+    tr_id: Optional[str] = None
+
+    def display_error(self) -> str:
+        parts = [part for part in (self.error_code, self.error_message) if part]
+        return " ".join(parts) if parts else "해외 주문 실행 실패"
+
+
 def normalize_env(env_dv: str = "real") -> str:
     """Map app modes to KIS overseas real/demo modes."""
     return "real" if env_dv in ("real", "prod") else "demo"
+
+
+def is_us_daytime_session(now: Optional[datetime] = None) -> bool:
+    """Return True during KIS US daytime trading hours in Korea time."""
+    korea_now = now.astimezone(ZoneInfo("Asia/Seoul")) if now else datetime.now(ZoneInfo("Asia/Seoul"))
+    if korea_now.weekday() >= 5:
+        return False
+    start_hour, start_minute = US_DAYTIME_START
+    end_hour, end_minute = US_DAYTIME_END
+    start = korea_now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    end = korea_now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    return start <= korea_now < end
 
 
 def _assert_trenv_ready(context: str = "") -> bool:
@@ -104,6 +134,20 @@ def _frame_from_output(value: Any) -> pd.DataFrame:
     if isinstance(value, list):
         return pd.DataFrame(value)
     return pd.DataFrame([value])
+
+
+def _response_error(res: Any, fallback: str) -> tuple[Optional[str], str]:
+    code = None
+    message = fallback
+    try:
+        code = str(res.getErrorCode() or "") or None
+    except Exception:
+        code = None
+    try:
+        message = str(res.getErrorMessage() or "") or fallback
+    except Exception:
+        message = fallback
+    return code, message
 
 
 def _trading_exchange(exchange: Optional[str]) -> Optional[str]:
@@ -444,7 +488,7 @@ def get_buyable_amount(
         return {"amount": 0, "quantity": 0}
 
 
-def execute_order(
+def submit_order(
     *,
     symbol: str,
     action: str,
@@ -452,16 +496,27 @@ def execute_order(
     price: float,
     env_dv: str = "real",
     exchange: Optional[str] = None,
-) -> pd.DataFrame:
+) -> OverseasOrderResult:
     if not _assert_trenv_ready(f"해외 주문 {symbol}"):
-        return pd.DataFrame()
+        return OverseasOrderResult(
+            dataframe=pd.DataFrame(),
+            success=False,
+            error_message="KIS API 인증이 필요합니다",
+        )
     resolution = resolve_exchange(symbol, exchange)
     mode = normalize_env(env_dv)
     trenv = ka.getTREnv()
     is_buy = action.upper() == "BUY"
-    tr_id = "TTTT1002U" if is_buy else "TTTT1006U"
-    if mode == "demo":
-        tr_id = "V" + tr_id[1:]
+    use_daytime = resolution.exchange in US_EXCHANGES and is_us_daytime_session()
+    if use_daytime:
+        api_url = "/uapi/overseas-stock/v1/trading/daytime-order"
+        tr_id = "TTTS6036U" if is_buy else "TTTS6037U"
+    else:
+        api_url = "/uapi/overseas-stock/v1/trading/order"
+        tr_id = "TTTT1002U" if is_buy else "TTTT1006U"
+        if mode == "demo":
+            tr_id = "V" + tr_id[1:]
+
     params = {
         "CANO": trenv.my_acct,
         "ACNT_PRDT_CD": trenv.my_prod,
@@ -471,25 +526,67 @@ def execute_order(
         "OVRS_ORD_UNPR": str(price),
         "CTAC_TLNO": "",
         "MGCO_APTM_ODNO": "",
-        "SLL_TYPE": "" if is_buy else "00",
         "ORD_SVR_DVSN_CD": "0",
         "ORD_DVSN": "00",
     }
+    if not use_daytime:
+        params["SLL_TYPE"] = "" if is_buy else "00"
+
     try:
         res = ka._url_fetch(
-            "/uapi/overseas-stock/v1/trading/order",
+            api_url,
             tr_id,
             "",
             params,
             postFlag=True,
         )
         if not res.isOK():
-            res.printError("/uapi/overseas-stock/v1/trading/order")
-            return pd.DataFrame()
-        return _frame_from_output(_body_get(res.getBody(), "output"))
+            code, message = _response_error(res, "해외 주문 실행 실패")
+            logger.error("해외 주문 실패 (%s %s): %s %s", action, resolution.symbol, code, message)
+            res.printError(api_url)
+            return OverseasOrderResult(
+                dataframe=pd.DataFrame(),
+                success=False,
+                error_code=code,
+                error_message=message,
+                api_url=api_url,
+                tr_id=tr_id,
+            )
+        dataframe = _frame_from_output(_body_get(res.getBody(), "output"))
+        return OverseasOrderResult(
+            dataframe=dataframe,
+            success=not dataframe.empty,
+            api_url=api_url,
+            tr_id=tr_id,
+        )
     except Exception as exc:
         logger.error("해외 주문 실행 에러 (%s): %s", symbol, exc)
-        return pd.DataFrame()
+        return OverseasOrderResult(
+            dataframe=pd.DataFrame(),
+            success=False,
+            error_message=str(exc),
+            api_url=api_url,
+            tr_id=tr_id,
+        )
+
+
+def execute_order(
+    *,
+    symbol: str,
+    action: str,
+    quantity: int,
+    price: float,
+    env_dv: str = "real",
+    exchange: Optional[str] = None,
+) -> pd.DataFrame:
+    return submit_order(
+        symbol=symbol,
+        action=action,
+        quantity=quantity,
+        price=price,
+        env_dv=env_dv,
+        exchange=exchange,
+    ).dataframe
 
 
 def get_pending_orders(env_dv: str = "real", exchange: str = "NASD") -> tuple[pd.DataFrame, bool]:

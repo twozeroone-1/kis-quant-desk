@@ -9,13 +9,13 @@ Account Information and Pending Orders API:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from core import data_fetcher, overseas_data_fetcher
+from core import data_fetcher, overseas_data_fetcher, reserved_orders
 from core.order_executor import OrderExecutor
 from core.signal import Action, Signal
 from core.data_fetcher import get_deposit, get_holdings, get_pending_orders, cancel_order, clear_balance_cache
@@ -373,7 +373,7 @@ async def execute_order(request: OrderRequest, http_request: Request):
                         logs=logs,
                     )
 
-            result = overseas_data_fetcher.execute_order(
+            order_result = overseas_data_fetcher.submit_order(
                 symbol=symbol,
                 action=request.action,
                 quantity=request.quantity,
@@ -382,11 +382,12 @@ async def execute_order(request: OrderRequest, http_request: Request):
                 exchange=resolution.exchange,
             )
 
-            if result.empty:
-                add_log("error", "해외주식 주문 실행 실패")
+            if not order_result.success or order_result.dataframe.empty:
+                error_message = f"해외주식 주문 실행 실패: {order_result.display_error()}"
+                add_log("error", error_message)
                 response = OrderResponse(
                     status="error",
-                    message="해외주식 주문 실행 실패",
+                    message=error_message,
                     logs=logs,
                 )
                 write_order_audit({
@@ -403,6 +404,7 @@ async def execute_order(request: OrderRequest, http_request: Request):
                 })
                 return response
 
+            result = order_result.dataframe
             order_id = str(result.iloc[0].get("ODNO", result.iloc[0].get("odno", "")))
             order_data = {
                 "order_id": order_id,
@@ -674,6 +676,440 @@ class CancelOrderResponse(BaseModel):
     success: bool
     order_no: str
     message: str
+
+
+class ReservationSubmitRequest(BaseModel):
+    """브로커 예약주문 접수 요청"""
+    market: str = "domestic"
+    stock_code: str
+    stock_name: str = ""
+    action: str
+    quantity: int
+    price: float = 0
+    order_type: str = "limit"
+    exchange: str | None = None
+    end_date: str | None = None
+    confirm_prod: bool = False
+
+
+class ReservationCancelRequest(BaseModel):
+    """브로커 예약주문 취소 요청"""
+    market: str = "domestic"
+    reservation_order_no: str
+    reservation_order_date: str
+    reservation_order_org_no: str = ""
+    confirm_prod: bool = False
+
+
+class ReservationModifyRequest(ReservationSubmitRequest):
+    """국내 예약주문 정정 요청"""
+    reservation_order_no: str
+    reservation_order_date: str
+    reservation_order_org_no: str = ""
+
+
+def _require_prod_confirmation(confirm_prod: bool) -> None:
+    env_dv = get_current_mode()
+    if env_dv in ("prod", "real") and not confirm_prod:
+        raise HTTPException(status_code=400, detail="실전 예약주문은 confirm_prod=true 확인이 필요합니다")
+
+
+def _validate_reservation_submit(request: ReservationSubmitRequest) -> None:
+    if request.market not in {"domestic", "us"}:
+        raise HTTPException(status_code=400, detail="시장 구분이 올바르지 않습니다")
+    if request.action not in {"BUY", "SELL"}:
+        raise HTTPException(status_code=400, detail="예약주문 방향이 올바르지 않습니다")
+    if request.quantity <= 0:
+        raise HTTPException(status_code=400, detail="예약주문 수량이 올바르지 않습니다")
+    if request.market == "domestic":
+        if request.order_type not in {"limit", "market", "preopen"}:
+            raise HTTPException(status_code=400, detail="국내 예약주문 방식이 올바르지 않습니다")
+        if request.order_type == "limit" and request.price <= 0:
+            raise HTTPException(status_code=400, detail="국내 지정가 예약주문 가격이 필요합니다")
+    else:
+        if request.order_type not in {"limit", "moo"}:
+            raise HTTPException(status_code=400, detail="미국 예약주문은 지정가 또는 매도 MOO만 지원합니다")
+        if request.order_type == "moo" and request.action != "SELL":
+            raise HTTPException(status_code=400, detail="MOO 예약주문은 미국 매도에만 사용할 수 있습니다")
+        if request.order_type == "limit" and request.price <= 0:
+            raise HTTPException(status_code=400, detail="미국 지정가 예약주문 가격이 필요합니다")
+
+
+def _assert_sellable_for_reservation(request: ReservationSubmitRequest, env_dv: str) -> None:
+    if request.action != "SELL":
+        return
+
+    if request.market == "us":
+        holdings_df = overseas_data_fetcher.get_holdings(env_dv)
+        symbol = request.stock_code.strip().upper()
+        if holdings_df.empty:
+            raise HTTPException(status_code=400, detail="미국 보유수량을 확인할 수 없어 예약매도를 차단했습니다")
+        row = holdings_df[holdings_df["stock_code"].astype(str) == symbol]
+    else:
+        holdings_df = get_holdings(env_dv)
+        if holdings_df.empty:
+            raise HTTPException(status_code=400, detail="국내 보유수량을 확인할 수 없어 예약매도를 차단했습니다")
+        row = holdings_df[holdings_df["stock_code"].astype(str) == request.stock_code.strip()]
+
+    if row.empty:
+        raise HTTPException(status_code=400, detail="미보유 종목은 예약매도할 수 없습니다")
+    holding_qty = int(float(row.iloc[0].get("quantity") or 0))
+    if holding_qty < request.quantity:
+        raise HTTPException(status_code=400, detail=f"예약매도 수량이 보유수량({holding_qty})을 초과합니다")
+
+
+def _reservation_error_response(result: reserved_orders.ReservedOrderResult) -> dict:
+    return {
+        "status": "error",
+        "message": result.display_error(),
+        "data": {
+            "api_url": result.api_url,
+            "tr_id": result.tr_id,
+            "error_code": result.error_code,
+        },
+    }
+
+
+def _normalize_reservation_submit_request(request: ReservationSubmitRequest) -> ReservationSubmitRequest:
+    request.market = request.market.strip().lower()
+    request.action = request.action.strip().upper()
+    request.order_type = request.order_type.strip().lower()
+    request.stock_code = request.stock_code.strip().upper() if request.market == "us" else request.stock_code.strip()
+    request.stock_name = request.stock_name.strip()
+    request.exchange = request.exchange.strip().upper() if request.exchange else None
+    request.end_date = _compact_date(request.end_date, "") or None
+    return request
+
+
+def _compact_date(value: str | None, default: str) -> str:
+    compact = (value or default).strip().replace("-", "")
+    if compact and (len(compact) != 8 or not compact.isdigit()):
+        raise HTTPException(status_code=400, detail="날짜는 YYYYMMDD 또는 YYYY-MM-DD 형식이어야 합니다")
+    return compact
+
+
+def _reservation_success_data(
+    *,
+    result: reserved_orders.ReservedOrderResult,
+    request: ReservationSubmitRequest | ReservationCancelRequest,
+    action_name: str,
+) -> dict:
+    data = reserved_orders.first_normalized_record(result)
+    return {
+        **data,
+        "market": request.market,
+        "action": getattr(request, "action", action_name),
+        "stock_code": getattr(request, "stock_code", ""),
+        "quantity": getattr(request, "quantity", None),
+        "price": getattr(request, "price", None),
+        "order_type": getattr(request, "order_type", None),
+        "api_url": result.api_url,
+        "tr_id": result.tr_id,
+        "records": result.records(),
+    }
+
+
+@router.post("/reservations")
+async def submit_reservation_order_api(request: ReservationSubmitRequest, http_request: Request):
+    """브로커 예약주문 접수."""
+    authenticated_user = http_request.headers.get("X-Authenticated-User", "unknown")
+    request = _normalize_reservation_submit_request(request)
+
+    if not is_authenticated():
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": get_current_mode(),
+            "action": "reserve_execute",
+            "stock_code": request.stock_code,
+            "quantity": request.quantity,
+            "price": request.price,
+            "order_type": request.order_type,
+            "result": "error",
+            "order_id": None,
+            "error_message": "인증이 필요합니다",
+        })
+        raise HTTPException(status_code=401, detail="인증이 필요합니다")
+
+    _validate_reservation_submit(request)
+    _require_prod_confirmation(request.confirm_prod)
+
+    env_dv = get_current_mode()
+    _assert_sellable_for_reservation(request, env_dv)
+
+    if request.market == "us":
+        result = reserved_orders.submit_us_reservation(
+            symbol=request.stock_code,
+            action=request.action,
+            quantity=request.quantity,
+            price=request.price,
+            order_type=request.order_type,
+            env_dv=env_dv,
+            exchange=request.exchange,
+        )
+    else:
+        result = reserved_orders.submit_domestic_reservation(
+            stock_code=request.stock_code,
+            action=request.action,
+            quantity=request.quantity,
+            price=request.price,
+            order_type=request.order_type,
+            env_dv=env_dv,
+            end_date=request.end_date,
+        )
+
+    if not result.success:
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": env_dv,
+            "action": "reserve_execute",
+            "stock_code": request.stock_code,
+            "quantity": request.quantity,
+            "price": request.price,
+            "order_type": request.order_type,
+            "result": "error",
+            "order_id": None,
+            "error_message": result.display_error(),
+        })
+        return _reservation_error_response(result)
+
+    data = _reservation_success_data(result=result, request=request, action_name="submit")
+    write_order_audit({
+        "authenticated_user": authenticated_user,
+        "mode": env_dv,
+        "action": "reserve_execute",
+        "stock_code": request.stock_code,
+        "quantity": request.quantity,
+        "price": request.price,
+        "order_type": request.order_type,
+        "result": "success",
+        "order_id": data.get("reservation_order_no"),
+        "error_message": None,
+    })
+    return {
+        "status": "success",
+        "message": "예약주문이 접수되었습니다",
+        "data": data,
+    }
+
+
+@router.get("/reservations")
+async def get_reservation_orders_api(
+    market: str = "domestic",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    stock_code: str = "",
+    action: str = "",
+    exchange: str = "NASD",
+    include_cancelled: bool = True,
+):
+    """브로커 예약주문 목록 조회."""
+    if not is_authenticated():
+        raise HTTPException(status_code=401, detail="인증이 필요합니다")
+
+    normalized_market = market.strip().lower()
+    if normalized_market not in {"domestic", "us"}:
+        raise HTTPException(status_code=400, detail="시장 구분이 올바르지 않습니다")
+
+    today = datetime.now().strftime("%Y%m%d")
+    default_start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+    start = _compact_date(start_date, default_start)
+    end = _compact_date(end_date, today)
+    normalized_action = action.strip().upper()
+    if normalized_action and normalized_action not in {"BUY", "SELL"}:
+        raise HTTPException(status_code=400, detail="예약주문 방향이 올바르지 않습니다")
+
+    if normalized_market == "us":
+        result = reserved_orders.list_us_reservations(
+            start_date=start,
+            end_date=end,
+            exchange=exchange.strip().upper() or "NASD",
+        )
+    else:
+        result = reserved_orders.list_domestic_reservations(
+            start_date=start,
+            end_date=end,
+            stock_code=stock_code.strip(),
+            action=normalized_action,
+            include_cancelled=include_cancelled,
+        )
+
+    if not result.success:
+        return {
+            **_reservation_error_response(result),
+            "orders": [],
+            "total_count": 0,
+        }
+
+    orders = result.records()
+    return {
+        "status": "success",
+        "orders": orders,
+        "total_count": len(orders),
+        "market": normalized_market,
+        "start_date": start,
+        "end_date": end,
+    }
+
+
+@router.post("/reservations/cancel")
+async def cancel_reservation_order_api(request: ReservationCancelRequest, http_request: Request):
+    """브로커 예약주문 취소."""
+    authenticated_user = http_request.headers.get("X-Authenticated-User", "unknown")
+    request.market = request.market.strip().lower()
+    request.reservation_order_no = request.reservation_order_no.strip()
+    request.reservation_order_date = _compact_date(request.reservation_order_date, "")
+    request.reservation_order_org_no = request.reservation_order_org_no.strip()
+
+    if not is_authenticated():
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": get_current_mode(),
+            "action": "reserve_cancel",
+            "stock_code": "",
+            "quantity": None,
+            "price": None,
+            "order_type": None,
+            "result": "error",
+            "order_id": request.reservation_order_no,
+            "error_message": "인증이 필요합니다",
+        })
+        raise HTTPException(status_code=401, detail="인증이 필요합니다")
+    if request.market not in {"domestic", "us"}:
+        raise HTTPException(status_code=400, detail="시장 구분이 올바르지 않습니다")
+    if not request.reservation_order_no or not request.reservation_order_date:
+        raise HTTPException(status_code=400, detail="예약주문번호와 주문일자가 필요합니다")
+
+    _require_prod_confirmation(request.confirm_prod)
+    env_dv = get_current_mode()
+
+    if request.market == "us":
+        result = reserved_orders.cancel_us_reservation(
+            reservation_order_date=request.reservation_order_date,
+            reservation_order_no=request.reservation_order_no,
+            env_dv=env_dv,
+        )
+    else:
+        if not request.reservation_order_org_no:
+            raise HTTPException(status_code=400, detail="국내 예약주문 취소에는 예약주문조직번호가 필요합니다")
+        result = reserved_orders.cancel_domestic_reservation(
+            reservation_order_no=request.reservation_order_no,
+            reservation_order_org_no=request.reservation_order_org_no,
+            reservation_order_date=request.reservation_order_date,
+        )
+
+    if not result.success:
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": env_dv,
+            "action": "reserve_cancel",
+            "stock_code": "",
+            "quantity": None,
+            "price": None,
+            "order_type": None,
+            "result": "error",
+            "order_id": request.reservation_order_no,
+            "error_message": result.display_error(),
+        })
+        return _reservation_error_response(result)
+
+    data = _reservation_success_data(result=result, request=request, action_name="cancel")
+    write_order_audit({
+        "authenticated_user": authenticated_user,
+        "mode": env_dv,
+        "action": "reserve_cancel",
+        "stock_code": "",
+        "quantity": None,
+        "price": None,
+        "order_type": None,
+        "result": "success",
+        "order_id": request.reservation_order_no,
+        "error_message": None,
+    })
+    return {
+        "status": "success",
+        "message": "예약주문 취소가 접수되었습니다",
+        "data": data,
+    }
+
+
+@router.post("/reservations/modify")
+async def modify_reservation_order_api(request: ReservationModifyRequest, http_request: Request):
+    """국내 브로커 예약주문 정정."""
+    authenticated_user = http_request.headers.get("X-Authenticated-User", "unknown")
+    request = _normalize_reservation_submit_request(request)
+    request.reservation_order_no = request.reservation_order_no.strip()
+    request.reservation_order_date = _compact_date(request.reservation_order_date, "")
+    request.reservation_order_org_no = request.reservation_order_org_no.strip()
+
+    if not is_authenticated():
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": get_current_mode(),
+            "action": "reserve_modify",
+            "stock_code": request.stock_code,
+            "quantity": request.quantity,
+            "price": request.price,
+            "order_type": request.order_type,
+            "result": "error",
+            "order_id": request.reservation_order_no,
+            "error_message": "인증이 필요합니다",
+        })
+        raise HTTPException(status_code=401, detail="인증이 필요합니다")
+
+    _validate_reservation_submit(request)
+    _require_prod_confirmation(request.confirm_prod)
+    if request.market != "domestic":
+        raise HTTPException(status_code=400, detail="미국 예약주문 정정은 KIS API에서 별도 지원되지 않습니다. 취소 후 재접수하세요")
+    if not request.reservation_order_no or not request.reservation_order_org_no or not request.reservation_order_date:
+        raise HTTPException(status_code=400, detail="예약주문번호, 조직번호, 주문일자가 필요합니다")
+
+    env_dv = get_current_mode()
+    _assert_sellable_for_reservation(request, env_dv)
+    result = reserved_orders.modify_domestic_reservation(
+        reservation_order_no=request.reservation_order_no,
+        reservation_order_org_no=request.reservation_order_org_no,
+        reservation_order_date=request.reservation_order_date,
+        stock_code=request.stock_code,
+        action=request.action,
+        quantity=request.quantity,
+        price=request.price,
+        order_type=request.order_type,
+        end_date=request.end_date,
+    )
+
+    if not result.success:
+        write_order_audit({
+            "authenticated_user": authenticated_user,
+            "mode": env_dv,
+            "action": "reserve_modify",
+            "stock_code": request.stock_code,
+            "quantity": request.quantity,
+            "price": request.price,
+            "order_type": request.order_type,
+            "result": "error",
+            "order_id": request.reservation_order_no,
+            "error_message": result.display_error(),
+        })
+        return _reservation_error_response(result)
+
+    data = _reservation_success_data(result=result, request=request, action_name="modify")
+    write_order_audit({
+        "authenticated_user": authenticated_user,
+        "mode": env_dv,
+        "action": "reserve_modify",
+        "stock_code": request.stock_code,
+        "quantity": request.quantity,
+        "price": request.price,
+        "order_type": request.order_type,
+        "result": "success",
+        "order_id": request.reservation_order_no,
+        "error_message": None,
+    })
+    return {
+        "status": "success",
+        "message": "예약주문 정정이 접수되었습니다",
+        "data": data,
+    }
 
 
 @router.get("/protective")

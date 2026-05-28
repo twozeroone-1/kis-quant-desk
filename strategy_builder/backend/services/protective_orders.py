@@ -17,7 +17,7 @@ import json
 import logging
 import math
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -43,6 +43,7 @@ MIN_MONITOR_INTERVAL_SECONDS = 5
 MAX_MONITOR_INTERVAL_SECONDS = 300
 REALTIME_FRESH_SECONDS = 30
 POSITION_MISSING_CONFIRMATIONS = 3
+EXIT_SUBMIT_RETRY_SECONDS = 60
 
 _monitor_task: Optional[asyncio.Task] = None
 _state_lock = asyncio.Lock()
@@ -180,6 +181,55 @@ def _is_recent_realtime(order: dict[str, Any]) -> bool:
     return (datetime.now() - checked_at).total_seconds() <= REALTIME_FRESH_SECONDS
 
 
+def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
+    if order.get("exit_submit_blocked"):
+        return False
+    value = order.get("exit_submit_failed_at")
+    if not value:
+        return True
+    try:
+        failed_at = datetime.fromisoformat(str(value))
+    except ValueError:
+        return True
+    return datetime.now() - failed_at >= timedelta(seconds=EXIT_SUBMIT_RETRY_SECONDS)
+
+
+def _is_non_retryable_submit_error(error: Optional[str]) -> bool:
+    if not error:
+        return False
+    return any(
+        marker in error
+        for marker in (
+            "모의투자에서는 해당업무가 제공되지 않습니다",
+            "해당업무가 제공되지 않습니다",
+            "제공하지 않습니다",
+            "not supported",
+            "not provided",
+        )
+    )
+
+
+def _strip_submit_blocked_prefix(error: str) -> str:
+    marker = " sell submit blocked: "
+    while marker in error:
+        error = error.split(marker, 1)[1]
+    return error
+
+
+def _non_retryable_submit_error(order: dict[str, Any]) -> Optional[str]:
+    last_error = _strip_submit_blocked_prefix(str(order.get("last_error") or ""))
+    if _is_non_retryable_submit_error(last_error):
+        return last_error
+
+    for event in reversed(order.get("events") or []):
+        if not str(event.get("type") or "").endswith("_submit_failed"):
+            continue
+        error = _strip_submit_blocked_prefix(str(event.get("error") or ""))
+        if _is_non_retryable_submit_error(error):
+            return error
+    return None
+
+
 async def _sync_realtime_subscriptions(state: dict[str, Any] | None = None) -> None:
     try:
         from backend.services.realtime_price_stream import get_realtime_price_stream
@@ -232,15 +282,15 @@ def _submit_exit_order(
     price: Optional[float] = None,
     market: str = "domestic",
     exchange: str | None = None,
-) -> tuple[Optional[str], Optional[str], bool]:
+) -> tuple[Optional[str], Optional[str], bool, Optional[str]]:
     if market == "us":
         order_price = float(price or 0)
         if order_price <= 0:
             price_info = overseas_data_fetcher.get_current_price(stock_code, env_dv, exchange)
             order_price = float(price_info.get("price") or 0)
         if order_price <= 0:
-            return None, None, False
-        result = overseas_data_fetcher.execute_order(
+            return None, None, False, "current price unavailable"
+        result = overseas_data_fetcher.submit_order(
             symbol=stock_code,
             action="SELL",
             quantity=quantity,
@@ -248,13 +298,14 @@ def _submit_exit_order(
             env_dv=env_dv,
             exchange=exchange,
         )
-        if result.empty:
-            return None, None, False
-        row = result.iloc[0]
+        if not result.success or result.dataframe.empty:
+            return None, None, False, result.display_error()
+        row = result.dataframe.iloc[0]
         return (
             str(row.get("ODNO", row.get("odno", ""))),
             str(row.get("KRX_FWDG_ORD_ORGNO", row.get("ord_gno_brno", ""))),
             True,
+            None,
         )
 
     signal = Signal(
@@ -268,13 +319,14 @@ def _submit_exit_order(
     )
     result = OrderExecutor(env_dv=env_dv).execute_signal(signal)
     if result.empty:
-        return None, None, False
+        return None, None, False, None
 
     row = result.iloc[0]
     return (
         str(row.get("ODNO", "")),
         str(row.get("KRX_FWDG_ORD_ORGNO", "")),
         True,
+        None,
     )
 
 
@@ -317,7 +369,7 @@ def _ensure_take_profit(order: dict[str, Any], env_dv: str, pending: dict[str, d
     if _is_order_pending(order.get("take_profit_order_no"), pending):
         return
 
-    order_no, org_no, ok = _submit_exit_order(
+    order_no, org_no, ok, error = _submit_exit_order(
         env_dv=env_dv,
         stock_code=str(order["stock_code"]),
         stock_name=str(order["stock_name"]),
@@ -343,6 +395,8 @@ def _ensure_take_profit(order: dict[str, Any], env_dv: str, pending: dict[str, d
         })
     else:
         order["take_profit_status"] = "submit_failed"
+        if error:
+            order["last_error"] = f"take_profit sell submit failed: {error}"
 
 
 def _submit_triggered_exit(
@@ -356,12 +410,24 @@ def _submit_triggered_exit(
     current_price: float,
 ) -> dict[str, Any]:
     order_type = "market" if order_type not in {"market", "limit"} else order_type
+    non_retryable_error = _non_retryable_submit_error(order)
+    if non_retryable_error:
+        order["exit_submit_blocked"] = True
+        order["last_error"] = f"{exit_reason} sell submit blocked: {non_retryable_error}"
+        return order
+
+    if not _exit_submit_retry_due(order):
+        return order
+
     market = str(order.get("market") or "domestic")
     if market == "us" and order_type == "market":
         order_type = "limit"
         price = current_price
+    if market == "us" and exit_reason == "stop_loss" and order_type == "limit":
+        limit_price = float(price or current_price)
+        price = min(limit_price, current_price)
 
-    order_no, org_no, ok = _submit_exit_order(
+    order_no, org_no, ok, error = _submit_exit_order(
         env_dv=env_dv,
         stock_code=str(order["stock_code"]),
         stock_name=str(order["stock_name"]),
@@ -379,15 +445,31 @@ def _submit_triggered_exit(
         order["exit_reason"] = exit_reason
         order["exit_order_type"] = order_type
         order["closed_at"] = _now()
+        order.pop("last_error", None)
+        order.pop("exit_submit_failed_at", None)
+        order.pop("exit_submit_blocked", None)
         order.setdefault("events", []).append({
             "type": f"{exit_reason}_submitted",
             "at": _now(),
             "order_no": order_no,
             "order_type": order_type,
+            "order_price": price if order_type == "limit" else None,
             "current_price": current_price,
         })
     else:
-        order["last_error"] = f"{exit_reason} sell submit failed"
+        detail = f": {error}" if error else ""
+        order["last_error"] = f"{exit_reason} sell submit failed{detail}"
+        order["exit_submit_failed_at"] = _now()
+        if _is_non_retryable_submit_error(error):
+            order["exit_submit_blocked"] = True
+        order.setdefault("events", []).append({
+            "type": f"{exit_reason}_submit_failed",
+            "at": _now(),
+            "order_type": order_type,
+            "order_price": price if order_type == "limit" else None,
+            "current_price": current_price,
+            "error": error,
+        })
     return order
 
 
@@ -492,7 +574,6 @@ def _check_realtime_trigger_sync(order: dict[str, Any], env_dv: str, current_pri
     order["last_price"] = current_price
     order["last_checked_at"] = _now()
     order["last_realtime_at"] = _now()
-    order.pop("last_error", None)
 
     take_profit_trigger = float(order.get("take_profit_trigger_price") or order.get("take_profit_price") or 0)
     if (
