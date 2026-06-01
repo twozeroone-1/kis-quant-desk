@@ -24,7 +24,7 @@ from uuid import uuid4
 
 import pandas as pd
 
-from core import data_fetcher, overseas_data_fetcher
+from core import data_fetcher, overseas_data_fetcher, reserved_orders
 from core.data_fetcher import cancel_order, get_holdings, get_pending_orders
 from core.order_executor import OrderExecutor
 from core.signal import Action, Signal
@@ -44,6 +44,7 @@ MAX_MONITOR_INTERVAL_SECONDS = 300
 REALTIME_FRESH_SECONDS = 30
 POSITION_MISSING_CONFIRMATIONS = 3
 EXIT_SUBMIT_RETRY_SECONDS = 60
+US_PAPER_EXIT_RETRY_SECONDS = 900
 
 _monitor_task: Optional[asyncio.Task] = None
 _state_lock = asyncio.Lock()
@@ -191,11 +192,33 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
         failed_at = datetime.fromisoformat(str(value))
     except ValueError:
         return True
-    return datetime.now() - failed_at >= timedelta(seconds=EXIT_SUBMIT_RETRY_SECONDS)
+    retry_seconds = EXIT_SUBMIT_RETRY_SECONDS
+    last_error = str(order.get("last_error") or "")
+    if (
+        order.get("market") == "us"
+        and order.get("env_dv") not in ("prod", "real")
+        and (
+            "모의투자에서는 해당업무가 제공되지 않습니다" in last_error
+            or "모의투자 예약주문시간" in last_error
+            or "초당 거래건수" in last_error
+            or "EGW00201" in last_error
+        )
+    ):
+        retry_seconds = US_PAPER_EXIT_RETRY_SECONDS
+    return datetime.now() - failed_at >= timedelta(seconds=retry_seconds)
 
 
 def _is_non_retryable_submit_error(error: Optional[str]) -> bool:
     if not error:
+        return False
+    if "reservation sell failed:" in error:
+        reservation_error = error.split("reservation sell failed:", 1)[1]
+        if "EGW00201" in reservation_error or "초당 거래건수" in reservation_error:
+            return False
+        error = reservation_error
+    if "미국주식 주간거래" in error and "제공하지 않습니다" in error:
+        return False
+    if "모의투자에서는 해당업무가 제공되지 않습니다" in error and "reservation sell failed" not in error:
         return False
     return any(
         marker in error
@@ -299,7 +322,33 @@ def _submit_exit_order(
             exchange=exchange,
         )
         if not result.success or result.dataframe.empty:
-            return None, None, False, result.display_error()
+            regular_error = result.display_error()
+            if env_dv not in ("prod", "real"):
+                reservation = reserved_orders.submit_us_reservation(
+                    symbol=stock_code,
+                    action="SELL",
+                    quantity=quantity,
+                    price=round(order_price, 2),
+                    order_type="limit",
+                    env_dv=env_dv,
+                    exchange=exchange,
+                )
+                if reservation.success and not reservation.dataframe.empty:
+                    data = reserved_orders.first_normalized_record(reservation)
+                    return (
+                        str(data.get("reservation_order_no") or ""),
+                        "reservation",
+                        True,
+                        None,
+                    )
+                return (
+                    None,
+                    None,
+                    False,
+                    f"regular sell failed: {regular_error}; "
+                    f"reservation sell failed: {reservation.display_error()}",
+                )
+            return None, None, False, regular_error
         row = result.dataframe.iloc[0]
         return (
             str(row.get("ODNO", row.get("odno", ""))),
@@ -410,16 +459,32 @@ def _submit_triggered_exit(
     current_price: float,
 ) -> dict[str, Any]:
     order_type = "market" if order_type not in {"market", "limit"} else order_type
+    market = str(order.get("market") or "domestic")
+    last_error = str(order.get("last_error") or "")
+    if (
+        market == "us"
+        and env_dv not in ("prod", "real")
+        and last_error.startswith(f"{exit_reason} sell submit blocked:")
+        and (
+            "해당업무" in last_error
+            or "미국주식 주간거래" in last_error
+            or "EGW00201" in last_error
+            or "초당 거래건수" in last_error
+        )
+    ):
+        order.pop("exit_submit_blocked", None)
+        order.pop("last_error", None)
+
     non_retryable_error = _non_retryable_submit_error(order)
     if non_retryable_error:
         order["exit_submit_blocked"] = True
         order["last_error"] = f"{exit_reason} sell submit blocked: {non_retryable_error}"
         return order
+    order.pop("exit_submit_blocked", None)
 
     if not _exit_submit_retry_due(order):
         return order
 
-    market = str(order.get("market") or "domestic")
     if market == "us" and order_type == "market":
         order_type = "limit"
         price = current_price

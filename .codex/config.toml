@@ -1,6 +1,7 @@
 openai_base_url = "http://127.0.0.1:18317/v1"
 model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
+model_reasoning_effort = "high"
+model_catalog_json = "/home/from0to01/open-trading-api/.codex/model-catalog-cliproxy.json"
 
 # Approval prefix rules are read from $CODEX_HOME/rules/default.rules.
 # Run Codex with CODEX_HOME set to this project's .codex directory to keep
@@ -89,13 +90,33 @@ inherit = "core"
 exclude = ["*SECRET*", "*TOKEN*", "KIS_APP*"]
 
 [features]
+hooks = true
+memories = true
+external_migration = true
+goals = true
+prevent_idle_sleep = true
 multi_agent = false
 shell_tool = true
+terminal_resize_reflow = true
+network_proxy = true
+mentions_v2 = true
+
+[plugins."agentmemory@agentmemory"]
+enabled = true
+
+[marketplaces.agentmemory]
+last_updated = "2026-05-31T23:33:29Z"
+last_revision = "fd9e3bd42d6208a33f0ee9de1442fdbb60eab106"
+source_type = "git"
+source = "https://github.com/rohitg00/agentmemory.git"
 
 [tui]
 notifications = true
 
 [tui.model_availability_nux]
+claude-opus-4-6-thinking = 4
+gemini-3-pro-high = 4
+gemini-pro-agent = 4
 "gpt-5.5" = 4
 
 [history]
@@ -107,3 +128,23 @@ trust_level = "trusted"
 
 [notice.model_migrations]
 "gpt-5.3-codex" = "gpt-5.4"
+
+[hooks.state]
+
+[hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:post_tool_use:0:0"]
+trusted_hash = "sha256:1b8a64f14c07f7f42d9e22ba4b4907027dbd7e4dc5d4db6c34c53b9263b2620b"
+
+[hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:pre_compact:0:0"]
+trusted_hash = "sha256:2d124c2cc70523587a243fb166c16aa343b2fca616fd9f77bd44ab74a75bcfae"
+
+[hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:pre_tool_use:0:0"]
+trusted_hash = "sha256:72fade31ac7a95e92bef200e83eae770f6961a9f6ff9f12596c3bccc1dfc566e"
+
+[hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:session_start:0:0"]
+trusted_hash = "sha256:7b09a5a4e6f0bd5f6c7441a26e91fd060c1b4481028cc26aded89331ef90a8b0"
+
+[hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:stop:0:0"]
+trusted_hash = "sha256:b9dfa7fe6d1c0cb5d9c539f73f44f7239043bfc2751126c317360b1dde249a3a"
+
+[hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:user_prompt_submit:0:0"]
+trusted_hash = "sha256:8f9e09b1ebf8c8b80a16c1c50203868d851c33942ce8e7cc1b26c4e4b6de891d"

@@ -507,7 +507,10 @@ def submit_order(
     mode = normalize_env(env_dv)
     trenv = ka.getTREnv()
     is_buy = action.upper() == "BUY"
-    use_daytime = resolution.exchange in US_EXCHANGES and is_us_daytime_session()
+    # KIS paper trading does not provide the US daytime-trading endpoint.
+    # Keep the daytime route limited to live mode; vps/demo uses the standard
+    # overseas order endpoint even during Korean daytime hours.
+    use_daytime = mode == "real" and resolution.exchange in US_EXCHANGES and is_us_daytime_session()
     if use_daytime:
         api_url = "/uapi/overseas-stock/v1/trading/daytime-order"
         tr_id = "TTTS6036U" if is_buy else "TTTS6037U"
