@@ -1,0 +1,3 @@
+display_name: Korean Market Auto Run
+short_description: Runs or schedules vps-only Korean-market paper trading with signals, risk limits, and protective orders.
+default_prompt: Run the Korean market auto-trading workflow in vps mode, using the standard open/mid/close schedule and protective-order checks.
