@@ -26,11 +26,13 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from market_candidate_selector import select_us_candidates
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_BUILDER = PROJECT_ROOT / "strategy_builder"
 RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "us_market_auto"
-CANDIDATES = [
+STATIC_CANDIDATES = [
     ("SPY", "NYSE"), ("QQQ", "NASD"), ("DIA", "NYSE"), ("IWM", "NYSE"),
     ("NVDA", "NASD"), ("MSFT", "NASD"), ("AVGO", "NASD"), ("AMD", "NASD"),
     ("AMZN", "NASD"), ("GOOGL", "NASD"), ("META", "NASD"), ("AAPL", "NASD"),
@@ -563,6 +565,26 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
     ]
     for item in payload["headlines"][:10]:
         lines.append(f"- {item['title']} ({item['source']})")
+    candidate_selection = payload.get("candidate_selection") or {}
+    selected_candidates = candidate_selection.get("selected") or []
+    if candidate_selection:
+        lines.extend([
+            "",
+            "## Candidate Selection",
+            f"- Mode: {candidate_selection.get('mode', '-')}",
+            f"- Fallback used: {candidate_selection.get('fallback_used', False)}",
+            f"- Generated at: {candidate_selection.get('generated_at', '-')}",
+            f"- Errors: {'; '.join(candidate_selection.get('errors') or []) or '-'}",
+            "",
+            "| Symbol | Exchange | Category | Score | Sources | Reasons |",
+            "|---|---|---|---:|---|---|",
+        ])
+        for item in selected_candidates:
+            lines.append(
+                f"| {item.get('symbol')} | {item.get('exchange', '')} | {item.get('category', '-')} | "
+                f"{float(item.get('score') or 0):.2f} | {', '.join(item.get('sources') or [])} | "
+                f"{', '.join(item.get('reasons') or [])} |"
+            )
     for action in ("BUY", "SELL", "HOLD", "ERROR"):
         rows = [signal for signal in payload["signals"] if signal.get("action") == action]
         if not rows:
@@ -674,6 +696,13 @@ async def main() -> int:
             "signals": [],
             "planned_buys": [],
             "orders": [],
+            "candidate_selection": {
+                "mode": os.environ.get("US_MARKET_CANDIDATE_MODE", "dynamic"),
+                "selected": [],
+                "fallback_used": False,
+                "errors": [],
+                "generated_at": now.isoformat(timespec="seconds"),
+            },
         }
         state.setdefault("runs", []).append({
             "slot": args.slot,
@@ -693,8 +722,19 @@ async def main() -> int:
 
     headlines = fetch_headlines()
     news_summary = summarize_news(headlines)
+    account_before = await account_status(odf, reserved_orders, list_protective_orders)
+    equity = float(account_before["equity"])
+    cash = float(account_before["cash"])
+    holdings = account_before["holdings"]
+    candidate_selection = select_us_candidates(
+        ranking_fetcher=odf,
+        holdings=holdings,
+        static_candidates=STATIC_CANDIDATES,
+    )
     signals = []
-    for symbol, exchange in CANDIDATES:
+    for candidate in candidate_selection.get("selected", []):
+        symbol = str(candidate.get("symbol") or candidate.get("code")).upper()
+        exchange = str(candidate.get("exchange") or "NASD")
         try:
             signals.append(signal_for(symbol, exchange, odf, indicators))
         except Exception as exc:
@@ -706,11 +746,6 @@ async def main() -> int:
                 "reason": str(exc),
                 "price": 0.0,
             })
-
-    account_before = await account_status(odf, reserved_orders, list_protective_orders)
-    equity = float(account_before["equity"])
-    cash = float(account_before["cash"])
-    holdings = account_before["holdings"]
     submitted_sells = place_sells(signals, holdings, odf)
     planned_orders = build_orders(signals, equity, cash, state)
 
@@ -736,6 +771,7 @@ async def main() -> int:
         },
         "account": {"equity": equity, "cash": cash, "holdings": holdings},
         "account_before": account_before,
+        "candidate_selection": candidate_selection,
         "signals": signals,
         "submitted_sells": submitted_sells,
         "planned_buys": planned_orders,

@@ -227,13 +227,13 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 
 #### 한국장 자동매매 운영
 
-`.codex/scripts/kr_market_auto_run.py`는 한국장 뉴스/매크로 요약, 국내 대형주/ETF 시그널, BUY/SELL/HOLD 분리, 주문 후보 산출, 보유/미체결/예약/보호주문 재조회를 한 번에 수행하는 자동 실행 스크립트입니다.
+`.codex/scripts/kr_market_auto_run.py`는 한국장 뉴스/매크로 요약, 유동성 기반 동적 후보군 시그널, BUY/SELL/HOLD 분리, 주문 후보 산출, 보유/미체결/예약/보호주문 재조회를 한 번에 수행하는 자동 실행 스크립트입니다.
 
 **공통 동작**
 
 | 항목 | 내용 |
 |------|------|
-| 후보군 | 삼성전자, SK하이닉스, 현대차, LG에너지솔루션, 기아, KB금융, 신한지주, LG전자, KODEX 200, KODEX 반도체 |
+| 후보군 | 기본 `KR_MARKET_CANDIDATE_MODE=dynamic`. 거래량, 체결강도, 시가총액, 외국인/기관 수급 기반으로 보수 유동성 후보를 선별하고, API 실패 또는 후보 부족 시 기존 대형주/ETF 고정 후보군으로 fallback |
 | 신호 기준 | BUY 강도 `0.70` 이상만 신규 매수 후보 |
 | 기본 보호라인 | 익절 `+6%`, 손절 `-3%` |
 | 휴장일 처리 | `.codex/scripts/kr_market_calendar.py`로 KRX 거래일을 확인하고, 휴장/주말이면 주문 없이 `market_closed` 리포트만 생성 |
@@ -266,7 +266,7 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 .codex/scripts/run_us_market_auto_once.sh close 20260603 20260602
 ```
 
-미국장 모의 자동화도 `8081`의 `builder-backend-vps`만 사용합니다. 실행 결과는 `.codex/runtime/us_market_auto/`에 저장되며, 장중 신규 매수와 보호주문 점검은 실전 `8083`과 분리됩니다.
+미국장 모의 자동화도 `8081`의 `builder-backend-vps`만 사용합니다. 기본 `US_MARKET_CANDIDATE_MODE=dynamic`으로 거래대금, 시가총액, 매수체결강도, 거래량 급증 랭킹에서 NASDAQ/NYSE/AMEX 유동성 후보를 선별하며, `SPY`, `QQQ`, `DIA`, `IWM`은 core ETF로 유지합니다. 랭킹 API 실패 또는 후보 부족 시 기존 고정 후보군으로 fallback합니다. 실행 결과는 `.codex/runtime/us_market_auto/`에 저장되며, 장중 신규 매수와 보호주문 점검은 실전 `8083`과 분리됩니다.
 
 **국내 실전투자(prod) 일일 실행**
 

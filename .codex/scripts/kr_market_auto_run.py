@@ -23,13 +23,15 @@ from xml.etree import ElementTree
 
 import requests
 
+from market_candidate_selector import select_kr_candidates
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto"
 PROD_RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto_prod"
 PROD_AUTO_CONFIRM_VALUE = "I_UNDERSTAND_REAL_ORDERS"
 
-CANDIDATES = [
+STATIC_CANDIDATES = [
     ("005930", "삼성전자", "대형주"),
     ("000660", "SK하이닉스", "대형주"),
     ("005380", "현대차", "대형주"),
@@ -452,11 +454,12 @@ def register_protection_for_holdings(
     after_account: dict[str, Any],
     trade_mode: str,
     prod_confirmed: bool,
+    candidate_codes: set[str],
 ) -> list[dict[str, Any]]:
     protections = []
     for row in after_account.get("holdings", []):
         code = str(row.get("stock_code"))
-        if before_codes and code not in before_codes and code not in {order[0] for order in CANDIDATES}:
+        if before_codes and code not in before_codes and code not in candidate_codes:
             continue
         qty = int(float(row.get("quantity") or 0))
         entry = float(row.get("avg_price") or row.get("current_price") or 0)
@@ -507,6 +510,27 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
     for item in payload["headlines"][:10]:
         lines.append(f"- {item['title']} ({item['source']})")
 
+    candidate_selection = payload.get("candidate_selection") or {}
+    selected_candidates = candidate_selection.get("selected") or []
+    if candidate_selection:
+        lines.extend([
+            "",
+            "## Candidate Selection",
+            f"- Mode: {candidate_selection.get('mode', '-')}",
+            f"- Fallback used: {candidate_selection.get('fallback_used', False)}",
+            f"- Generated at: {candidate_selection.get('generated_at', '-')}",
+            f"- Errors: {'; '.join(candidate_selection.get('errors') or []) or '-'}",
+            "",
+            "| 종목 | 구분 | 점수 | 원천 | 선정 이유 |",
+            "|---|---|---:|---|---|",
+        ])
+        for item in selected_candidates:
+            lines.append(
+                f"| {item.get('name', item.get('code'))}({item.get('code')}) | {item.get('category', '-')} | "
+                f"{float(item.get('score') or 0):.2f} | {', '.join(item.get('sources') or [])} | "
+                f"{', '.join(item.get('reasons') or [])} |"
+            )
+
     if not payload.get("trading_day", {}).get("is_open", True):
         lines.extend([
             "",
@@ -556,8 +580,12 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         "| 종목 | 구분 | 신호 | 강도 | 현재가 | 예상 수량 | 예상 금액 | 배분 비중 | 익절가(+6%) | 손절가(-3%) | 주문 방식 | 주문 여부 |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
     ])
+    candidate_categories = {
+        str(item.get("code")): item.get("category", "대형주")
+        for item in selected_candidates
+    }
     for order in payload["planned_buys"]:
-        kind = next((item[2] for item in CANDIDATES if item[0] == order["code"]), "대형주")
+        kind = candidate_categories.get(str(order["code"]), "대형주")
         lines.append(
             f"| {order.get('name')}({order['code']}) | {kind} | BUY | {order['strength']:.2f} | "
             f"{order['target_price']:,.0f} | {order['quantity']} | {order['amount']:,.0f} | "
@@ -651,6 +679,13 @@ def main() -> int:
             "order_block_reasons": order_block_reasons,
             "strategy_sell_execution_enabled": strategy_sell_enabled,
             "trading_day": trading_day,
+            "candidate_selection": {
+                "mode": os.environ.get("KR_MARKET_CANDIDATE_MODE", "dynamic"),
+                "selected": [],
+                "fallback_used": False,
+                "errors": [],
+                "generated_at": now.isoformat(timespec="seconds"),
+            },
             "safety": {
                 "mode": args.trade_mode,
                 "total_new_buy_pct": TOTAL_BUY_PCT,
@@ -682,8 +717,13 @@ def main() -> int:
     news_summary = summarize_news(headlines)
     account_before = account_snapshot()
     before_holding_codes = set(holding_by_code(account_before["account"]).keys())
+    candidate_selection = select_kr_candidates(
+        api_get=lambda path: api("GET", path),
+        account=account_before["account"],
+        static_candidates=STATIC_CANDIDATES,
+    )
 
-    stock_codes = [code for code, _, _ in CANDIDATES]
+    stock_codes = [str(item["code"]) for item in candidate_selection.get("selected", [])]
     signals_response = api("POST", "/api/strategies/execute", json={
         "strategy_id": "custom:today_krx_macro_rebound",
         "stocks": stock_codes,
@@ -708,6 +748,7 @@ def main() -> int:
         "headlines": headlines,
         "news_summary": news_summary,
         "signals": signals,
+        "candidate_selection": candidate_selection,
         "planned_buys": planned_buys,
         "submitted_sells": sells,
         "account_before": account_before,
@@ -741,7 +782,13 @@ def main() -> int:
     time.sleep(3.0)
     account_mid = account_snapshot()
     protections = (
-        register_protection_for_holdings(before_holding_codes, account_mid["account"], args.trade_mode, prod_confirmed)
+        register_protection_for_holdings(
+            before_holding_codes,
+            account_mid["account"],
+            args.trade_mode,
+            prod_confirmed,
+            set(stock_codes),
+        )
         if can_submit_orders
         else []
     )
@@ -756,6 +803,7 @@ def main() -> int:
         "news_summary": news_summary,
         "signals": signals,
         "signal_groups": groups,
+        "candidate_selection": candidate_selection,
         "planned_buys": report_buys,
         "raw_planned_buys": planned_buys,
         "executable_buys": executable_buys,

@@ -76,6 +76,23 @@ class OverseasOrderResult:
         return " ".join(parts) if parts else "해외 주문 실행 실패"
 
 
+@dataclass(frozen=True)
+class OverseasRankingResult:
+    dataframe: pd.DataFrame
+    success: bool
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+    api_url: Optional[str] = None
+    tr_id: Optional[str] = None
+
+    def display_error(self) -> str:
+        parts = [part for part in (self.error_code, self.error_message) if part]
+        return " ".join(parts) if parts else "해외 랭킹 조회 실패"
+
+    def records(self) -> list[dict[str, Any]]:
+        return [] if self.dataframe.empty else self.dataframe.to_dict("records")
+
+
 def normalize_env(env_dv: str = "real") -> str:
     """Map app modes to KIS overseas real/demo modes."""
     return "real" if env_dv in ("real", "prod") else "demo"
@@ -332,6 +349,115 @@ def get_daily_prices(
     except Exception as exc:
         logger.error("해외 일봉 조회 에러 (%s): %s", symbol, exc)
         return pd.DataFrame()
+
+
+def _fetch_overseas_ranking(
+    *,
+    api_url: str,
+    tr_id: str,
+    exchange: str,
+    params: dict[str, Any],
+    max_depth: int = 1,
+) -> OverseasRankingResult:
+    if not _assert_trenv_ready(f"해외 랭킹 조회 {exchange}"):
+        return OverseasRankingResult(pd.DataFrame(), False, error_message="KIS API 인증이 필요합니다")
+    frames: list[pd.DataFrame] = []
+    keyb = str(params.get("KEYB") or "")
+    tr_cont = ""
+    try:
+        for _ in range(max(1, max_depth)):
+            call_params = {**params, "EXCD": _price_exchange(exchange) or exchange, "KEYB": keyb}
+            res = ka._url_fetch(api_url, tr_id, tr_cont, call_params)
+            if not res.isOK():
+                code, message = _response_error(res, "해외 랭킹 조회 실패")
+                logger.warning("해외 랭킹 조회 실패 (%s/%s): %s %s", api_url, exchange, code, message)
+                res.printError(api_url)
+                return OverseasRankingResult(
+                    pd.DataFrame(),
+                    False,
+                    error_code=code,
+                    error_message=message,
+                    api_url=api_url,
+                    tr_id=tr_id,
+                )
+            body = res.getBody()
+            frame = _frame_from_output(_body_get(body, "output2"))
+            if not frame.empty:
+                frames.append(frame)
+            header_cont = str(getattr(res.getHeader(), "tr_cont", "") or "")
+            if header_cont not in {"M", "F"}:
+                break
+            keyb = str(_body_get(body, "keyb", keyb) or keyb)
+            tr_cont = "N"
+            ka.smart_sleep()
+        dataframe = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return OverseasRankingResult(dataframe, True, api_url=api_url, tr_id=tr_id)
+    except Exception as exc:
+        logger.error("해외 랭킹 조회 에러 (%s/%s): %s", api_url, exchange, exc)
+        return OverseasRankingResult(pd.DataFrame(), False, error_message=str(exc), api_url=api_url, tr_id=tr_id)
+
+
+def get_overseas_trade_value_rank(
+    *,
+    exchange: str = "NAS",
+    nday: str = "0",
+    vol_rang: str = "2",
+    max_depth: int = 1,
+) -> OverseasRankingResult:
+    return _fetch_overseas_ranking(
+        api_url="/uapi/overseas-stock/v1/ranking/trade-pbmn",
+        tr_id="HHDFS76320010",
+        exchange=exchange,
+        params={"NDAY": nday, "VOL_RANG": vol_rang, "AUTH": "", "PRC1": "", "PRC2": ""},
+        max_depth=max_depth,
+    )
+
+
+def get_overseas_market_cap_rank(
+    *,
+    exchange: str = "NAS",
+    vol_rang: str = "2",
+    max_depth: int = 1,
+) -> OverseasRankingResult:
+    return _fetch_overseas_ranking(
+        api_url="/uapi/overseas-stock/v1/ranking/market-cap",
+        tr_id="HHDFS76350100",
+        exchange=exchange,
+        params={"VOL_RANG": vol_rang, "AUTH": ""},
+        max_depth=max_depth,
+    )
+
+
+def get_overseas_volume_power_rank(
+    *,
+    exchange: str = "NAS",
+    nday: str = "0",
+    vol_rang: str = "2",
+    max_depth: int = 1,
+) -> OverseasRankingResult:
+    return _fetch_overseas_ranking(
+        api_url="/uapi/overseas-stock/v1/ranking/volume-power",
+        tr_id="HHDFS76280000",
+        exchange=exchange,
+        params={"NDAY": nday, "VOL_RANG": vol_rang, "AUTH": ""},
+        max_depth=max_depth,
+    )
+
+
+def get_overseas_volume_surge_rank(
+    *,
+    exchange: str = "NAS",
+    minx: str = "3",
+    vol_rang: str = "2",
+    max_depth: int = 1,
+) -> OverseasRankingResult:
+    return _fetch_overseas_ranking(
+        api_url="/uapi/overseas-stock/v1/ranking/volume-surge",
+        tr_id="HHDFS76270000",
+        exchange=exchange,
+        params={"MINX": minx, "VOL_RANG": vol_rang, "AUTH": ""},
+        max_depth=max_depth,
+    )
 
 
 def _fetch_balance_raw(env_dv: str = "real") -> Optional[dict[str, Any]]:
