@@ -27,6 +27,7 @@
 - `appkey`, `appsecret`, 토큰 등 민감 정보를 코드에 하드코딩하거나 출력하지 않는다.
 - `~/KIS/config/kis_devlp.yaml`을 사용자 요청 없이 읽거나 수정하지 않는다.
 - Strategy Builder 운영 엔드포인트는 `8081`/`8083` 기준으로 판단한다. `8000`은 컨테이너 내부 또는 로컬 개발용 백엔드 포트일 수 있으므로 모의/실전 운영 상태 판단에 사용하지 않는다.
+- 포트, cron, 인증, 자동화, 주문 경로처럼 운영 의도가 중요한 상태를 판단하기 전에는 `MEMORY.md`, 최근 git 커밋, 가능한 경우 agentmemory 기록을 먼저 확인하고, 현재 관측값이 의도된 구조인지 임시/개발 상태인지 구분한다.
 - `http://ww.tailea9a3f.ts.net:8081` 및 `http://127.0.0.1:8081`은 모의투자(`vps`) 전용 Strategy Builder 엔드포인트다.
 - `http://ww.tailea9a3f.ts.net:8083` 및 `http://127.0.0.1:8083`은 실전투자(`prod`) 전용 Strategy Builder 엔드포인트다.
 - `KIS_LOCK_MODE` 분리 규칙을 따른다. `8081`은 `prod` 로그인을 거부해야 하고, `8083`은 `vps` 로그인을 거부해야 한다.
