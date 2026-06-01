@@ -52,6 +52,10 @@ def env_fraction(name: str, default: float) -> float:
     return value / 100 if value > 1 else value
 
 
+def env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "y", "on", "allow"}
+
+
 TOTAL_BUY_PCT = env_fraction("KR_MARKET_TOTAL_BUY_PCT", 0.10)
 DAILY_LOSS_PCT = env_fraction("KR_MARKET_DAILY_LOSS_PCT", 0.005)
 STOP_LOSS_PCT = 0.03
@@ -71,6 +75,14 @@ def prod_auto_confirmed(args_confirmed: bool) -> bool:
 
 def order_execution_enabled(trade_mode: str, prod_confirmed: bool) -> bool:
     return trade_mode != "prod" or prod_confirmed
+
+
+def prod_llm_orders_enabled(trade_mode: str, llm_mode: str) -> bool:
+    return trade_mode != "prod" or llm_mode == "live-prod"
+
+
+def strategy_sell_execution_enabled(trade_mode: str) -> bool:
+    return trade_mode != "prod" or env_truthy("KR_PROD_ALLOW_STRATEGY_SELL")
 
 
 def is_live_llm_mode(mode: str) -> bool:
@@ -476,6 +488,8 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         f"- Time: {payload['started_at']}",
         f"- Mode: {payload.get('trade_mode', payload.get('safety', {}).get('mode', 'vps'))}",
         f"- Order execution enabled: {payload.get('order_execution_enabled', True)}",
+        f"- Order block reasons: {', '.join(payload.get('order_block_reasons') or []) or '-'}",
+        f"- Strategy SELL execution enabled: {payload.get('strategy_sell_execution_enabled', True)}",
         f"- Regime: {payload['news_summary']['regime']}",
         f"- LLM mode: {payload.get('llm_mode', 'off')}",
         f"- Equity: {payload['account_before']['account'].get('deposit', {}).get('total_eval', 0):,}원",
@@ -589,7 +603,13 @@ def main() -> int:
     global RUNTIME_DIR
     RUNTIME_DIR = runtime_dir_for(args.trade_mode)
     prod_confirmed = prod_auto_confirmed(args.prod_auto_confirm)
-    can_submit_orders = order_execution_enabled(args.trade_mode, prod_confirmed)
+    order_block_reasons = []
+    if args.trade_mode == "prod" and not prod_confirmed:
+        order_block_reasons.append("one_time_prod_approval_missing")
+    if not prod_llm_orders_enabled(args.trade_mode, args.llm_mode):
+        order_block_reasons.append("prod_requires_live_prod_llm")
+    can_submit_orders = order_execution_enabled(args.trade_mode, prod_confirmed) and prod_llm_orders_enabled(args.trade_mode, args.llm_mode)
+    strategy_sell_enabled = strategy_sell_execution_enabled(args.trade_mode)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
     report_base = RUNTIME_DIR / f"{now.strftime('%Y%m%d_%H%M%S')}_{args.slot}"
@@ -618,6 +638,8 @@ def main() -> int:
             "trade_mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
             "order_execution_enabled": can_submit_orders,
+            "order_block_reasons": order_block_reasons,
+            "strategy_sell_execution_enabled": strategy_sell_enabled,
             "trading_day": trading_day,
             "safety": {
                 "mode": args.trade_mode,
@@ -627,6 +649,8 @@ def main() -> int:
                 "stop_loss_pct": STOP_LOSS_PCT,
                 "min_buy_strength": MIN_BUY_STRENGTH,
                 "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
+                "order_block_reasons": order_block_reasons,
+                "strategy_sell_execution_enabled": strategy_sell_enabled,
             },
         }
         state.setdefault("runs", []).append({
@@ -659,7 +683,7 @@ def main() -> int:
     signals = signals_response.get("results", [])
     groups = signal_groups(signals)
     sells = []
-    if can_submit_orders:
+    if can_submit_orders and strategy_sell_enabled:
         sells = place_sells(
             groups.get("SELL", []),
             holding_by_code(account_before["account"]),
@@ -681,6 +705,8 @@ def main() -> int:
             "mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
             "order_execution_enabled": can_submit_orders,
+            "order_block_reasons": order_block_reasons,
+            "strategy_sell_execution_enabled": strategy_sell_enabled,
             "total_new_buy_pct": TOTAL_BUY_PCT,
             "daily_loss_pct": DAILY_LOSS_PCT,
             "take_profit_pct": TAKE_PROFIT_PCT,
@@ -696,7 +722,7 @@ def main() -> int:
     report_buys = annotate_buys_for_report(planned_buys, executable_buys, args.llm_mode)
     if not can_submit_orders and args.trade_mode == "prod":
         report_buys = [
-            {**order, "order_decision": "실전 자동승인 미설정/미주문"}
+            {**order, "order_decision": f"실전 주문 차단({','.join(order_block_reasons)})/미주문"}
             for order in report_buys
         ]
     buys = place_buys(executable_buys, args.trade_mode, prod_confirmed) if can_submit_orders else []
@@ -733,11 +759,15 @@ def main() -> int:
         "trade_mode": args.trade_mode,
         "prod_auto_confirmed": prod_confirmed,
         "order_execution_enabled": can_submit_orders,
+        "order_block_reasons": order_block_reasons,
+        "strategy_sell_execution_enabled": strategy_sell_enabled,
         "trading_day": trading_day,
         "safety": {
             "mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
             "order_execution_enabled": can_submit_orders,
+            "order_block_reasons": order_block_reasons,
+            "strategy_sell_execution_enabled": strategy_sell_enabled,
             "total_new_buy_pct": TOTAL_BUY_PCT,
             "daily_loss_pct": DAILY_LOSS_PCT,
             "take_profit_pct": TAKE_PROFIT_PCT,

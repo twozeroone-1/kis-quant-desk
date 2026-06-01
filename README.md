@@ -213,6 +213,79 @@ graph LR
 - 실전 주문 전에는 반드시 모의투자로 동작을 검증하세요.
 - 해외주식 `HDFSCNT0`는 공식 샘플상 “실시간지연체결가” API이며, 미국은 무료 0분 지연으로 설명되어 있지만 시세 권한과 장 구분에 따라 체감 지연이 달라질 수 있습니다.
 
+#### 한국장 자동매매 운영
+
+`.codex/scripts/kr_market_auto_run.py`는 한국장 뉴스/매크로 요약, 국내 대형주/ETF 시그널, BUY/SELL/HOLD 분리, 주문 후보 산출, 보유/미체결/예약/보호주문 재조회를 한 번에 수행하는 자동 실행 스크립트입니다.
+
+**공통 동작**
+
+| 항목 | 내용 |
+|------|------|
+| 후보군 | 삼성전자, SK하이닉스, 현대차, LG에너지솔루션, 기아, KB금융, 신한지주, LG전자, KODEX 200, KODEX 반도체 |
+| 신호 기준 | BUY 강도 `0.70` 이상만 신규 매수 후보 |
+| 기본 보호라인 | 익절 `+6%`, 손절 `-3%` |
+| 휴장일 처리 | `.codex/scripts/kr_market_calendar.py`로 KRX 거래일을 확인하고, 휴장/주말이면 주문 없이 `market_closed` 리포트만 생성 |
+| LLM 판단 | `KR_MARKET_LLM_MODE=live-vps` 또는 `live-prod`일 때 CLIProxyAPI/OpenAI 호환 LLM이 BUY 후보를 승인, 축소, 차단 |
+| 보호주문 한계 | KIS 서버 OCO가 아니라 앱 레벨 감시입니다. 백엔드, 인증, 네트워크가 중단되면 자동 감시도 중단될 수 있습니다. |
+
+**국내 모의투자(vps) 일일 실행**
+
+```bash
+# 한국장 09:10 / 12:30 / 15:10 KST 크론 설치
+.codex/scripts/install_kr_market_auto_daily_cron.sh
+
+# 특정 슬롯 수동 실행
+.codex/scripts/run_kr_market_auto_once.sh open 20260602
+.codex/scripts/run_kr_market_auto_once.sh mid 20260602
+.codex/scripts/run_kr_market_auto_once.sh close 20260602
+```
+
+모의투자 실행은 `KIS_LOCK_MODE=vps`, `KIS_DEFAULT_MODE=vps`를 사용하며, 실전 주문을 호출하지 않습니다. 실행 결과는 `.codex/runtime/kr_market_auto/`에 JSON/Markdown 리포트로 저장됩니다.
+
+**국내 실전투자(prod) 일일 실행**
+
+실전 버전은 기본적으로 리포트 전용입니다. 날짜와 슬롯별 1회성 승인 파일이 있을 때만 실제 주문이 제출됩니다.
+
+```bash
+# 실전 크론 설치. 기본은 주문 없이 리포트만 생성
+.codex/scripts/install_kr_market_auto_prod_daily_cron.sh
+
+# 특정 날짜/슬롯에 대해 실전 주문 1회 승인
+.codex/scripts/approve_kr_market_auto_prod_once.sh 20260602 open
+
+# 승인 파일 없이 수동 실행하면 리포트만 생성하고 주문은 제출하지 않음
+.codex/scripts/run_kr_market_auto_prod_once.sh open 20260602
+```
+
+승인 파일은 `.codex/runtime/kr_market_auto_prod/approvals/YYYYMMDD_<slot>.approved` 형식이며, 실행 시작 시 소비되고 삭제됩니다. `.codex/local/kr_market_auto_prod.env`에 `KIS_PROD_AUTO_CONFIRM`이 남아 있어도 `run_kr_market_auto_prod_once.sh`가 이를 제거하므로 영구 자동승인으로 쓰이지 않습니다.
+
+실전 주문은 `KR_MARKET_LLM_MODE=live-prod`일 때만 제출됩니다. `off` 또는 `shadow` 모드에서는 승인 파일이 있어도 리포트만 생성하고 주문은 차단합니다.
+
+전략 신호 `SELL`은 보호주문 손익절 매도와 별도입니다. 보호주문 매도는 설정된 리스크 관리 규칙에 따라 자동 감시되지만, 전략 신호 `SELL`의 자동 실행은 기본적으로 꺼져 있습니다. 실험 중 전략 SELL까지 자동 실행하려면 명시적으로 플래그를 켭니다.
+
+```bash
+KR_PROD_ALLOW_STRATEGY_SELL=true \
+  .codex/scripts/run_kr_market_auto_prod_once.sh open 20260602
+```
+
+실전 래퍼의 현재 실험용 기본 리스크는 `KR_MARKET_TOTAL_BUY_PCT=100`, `KR_MARKET_DAILY_LOSS_PCT=3`입니다. 이는 테스트 목적의 공격적인 설정이며, 일반 운영 전에는 낮은 값으로 조정해야 합니다.
+
+```bash
+# 예: 신규 매수 10%, 일 손실 0.5%로 낮춰 실행
+KR_MARKET_TOTAL_BUY_PCT=10 KR_MARKET_DAILY_LOSS_PCT=0.5 \
+  .codex/scripts/run_kr_market_auto_prod_once.sh open 20260602
+```
+
+**현재 운영 정책**
+
+| 항목 | 정책 |
+|------|----------|
+| 실전 승인 | 날짜/슬롯별 1회성 승인 파일이 있을 때만 주문 제출. 승인 파일은 실행 시작 시 삭제됩니다. |
+| prod LLM | `live-prod` 필수. `off`/`shadow`는 분석 리포트만 생성합니다. |
+| 전략 SELL 자동 실행 | 기본 차단. `KR_PROD_ALLOW_STRATEGY_SELL=true`일 때만 자동 실행합니다. 보호주문 손익절 SELL은 별도 감시 규칙으로 동작합니다. |
+| 실전 크론 슬롯 | 초기 실험은 `open` 1회가 가장 단순합니다. 하루 3회로 확장한다면 `open`은 신규 매수 가능, `mid`/`close`는 기본적으로 보유/미체결/보호주문 점검 위주로 운영하는 구성이 안전합니다. |
+| BUY 배분 정책 | 현재 실험 설정은 강도 1순위 후보에 집중 배분하는 방식입니다. 분산 운용으로 전환하려면 강도 비례 배분 로직을 복구합니다. |
+
 #### Docker 운영
 
 KIS Quant Desk는 Docker Compose로 `builder-backend`, `builder-frontend`, `caddy`를 실행해 `http://<host>:8081`에 Strategy Builder를 노출합니다.

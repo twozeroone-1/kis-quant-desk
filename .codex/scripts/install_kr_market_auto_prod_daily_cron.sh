@@ -4,20 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="/home/from0to01/open-trading-api"
 LOG_DIR="$PROJECT_ROOT/.codex/runtime/kr_market_auto_prod"
 CRON_LOG="$LOG_DIR/cron_daily.log"
-PROD_ENV="$PROJECT_ROOT/.codex/local/kr_market_auto_prod.env"
 mkdir -p "$LOG_DIR"
-
-if [[ ! -f "$PROD_ENV" ]] || ! grep -q '^export KIS_PROD_AUTO_CONFIRM=I_UNDERSTAND_REAL_ORDERS$' "$PROD_ENV"; then
-  cat >&2 <<EOF
-Refusing to install prod daily cron.
-
-Create $PROD_ENV with:
-export KIS_PROD_AUTO_CONFIRM=I_UNDERSTAND_REAL_ORDERS
-
-This cron can submit real KIS orders once BUY/SELL signals pass risk gates.
-EOF
-  exit 1
-fi
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
@@ -37,3 +24,14 @@ EOF
 
 crontab "$tmp"
 crontab -l | grep 'KIS_KR_MARKET_AUTO_PROD_DAILY'
+cat <<EOF
+
+Installed prod KRX cron in report-only mode by default.
+To allow one real-order run, create:
+  $LOG_DIR/approvals/YYYYMMDD_<open|mid|close|manual>.approved
+with exactly:
+  I_UNDERSTAND_REAL_ORDERS
+The approval file is consumed before that run starts.
+Helper:
+  $PROJECT_ROOT/.codex/scripts/approve_kr_market_auto_prod_once.sh YYYYMMDD open
+EOF
