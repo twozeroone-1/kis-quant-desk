@@ -140,6 +140,7 @@ class ProtectiveReviewRequest(BaseModel):
     market: str = "domestic"
     exchange: str | None = None
     currency: str = "KRW"
+    confirm_prod: bool = False
 
 
 class ProtectiveSettingsRequest(BaseModel):
@@ -296,6 +297,25 @@ async def execute_order(request: OrderRequest, http_request: Request):
         add_log("success", "주문 검증 완료")
 
         env_dv = get_current_mode()
+
+        if env_dv in ("prod", "real") and not request.confirm_prod:
+            add_log("error", "실전 주문은 confirm_prod=true 확인이 필요합니다")
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": env_dv,
+                "action": "execute",
+                "stock_code": request.stock_code,
+                "quantity": request.quantity,
+                "price": request.price,
+                "order_type": request.order_type,
+                "result": "error",
+                "order_id": None,
+                "error_message": "confirm_prod required",
+            })
+            raise HTTPException(
+                status_code=400,
+                detail="실전 주문은 confirm_prod=true 확인이 필요합니다",
+            )
 
         if request.market == "us":
             if request.order_type != "limit":
@@ -602,6 +622,8 @@ async def execute_order(request: OrderRequest, http_request: Request):
         })
         return response
 
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"주문 실행 에러: {e}")
         add_log("error", f"주문 실행 에러: {str(e)}")
@@ -1146,6 +1168,8 @@ async def upsert_protective_order_api(request: ProtectiveReviewRequest):
     """보유 종목의 손익절 감시 설정을 저장합니다."""
     if not is_authenticated():
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
+    if get_current_mode() in ("prod", "real") and not request.confirm_prod:
+        raise HTTPException(status_code=400, detail="실전 보호주문은 confirm_prod=true 확인이 필요합니다")
     if request.quantity <= 0:
         raise HTTPException(status_code=400, detail="감시 수량이 올바르지 않습니다")
     if request.entry_price <= 0:

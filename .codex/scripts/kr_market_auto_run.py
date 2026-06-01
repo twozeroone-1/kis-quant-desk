@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Scheduled KRX paper-trading run.
+"""Scheduled KRX trading run.
 
-VPS-only automation for the user's intraday Korean-market workflow. It keeps
-the strategy and risk rules local, records the required pre-order table, and
-uses the Strategy Builder API for signals, orders, reservations, and protection.
+Automation for the user's Korean-market workflow. It keeps the strategy and
+risk rules local, records the required pre-order table, and uses the Strategy
+Builder API for signals, orders, reservations, and protection.
 """
 
 from __future__ import annotations
@@ -26,7 +26,9 @@ import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto"
+PROD_RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto_prod"
 API_BASE = os.environ.get("KIS_STRATEGY_API", "http://127.0.0.1:8000")
+PROD_AUTO_CONFIRM_VALUE = "I_UNDERSTAND_REAL_ORDERS"
 
 CANDIDATES = [
     ("005930", "삼성전자", "대형주"),
@@ -41,13 +43,38 @@ CANDIDATES = [
     ("091160", "KODEX 반도체", "ETF"),
 ]
 
-TOTAL_BUY_PCT = 0.10
-DAILY_LOSS_PCT = 0.005
+
+def env_fraction(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = float(raw.strip().rstrip("%"))
+    return value / 100 if value > 1 else value
+
+
+TOTAL_BUY_PCT = env_fraction("KR_MARKET_TOTAL_BUY_PCT", 0.10)
+DAILY_LOSS_PCT = env_fraction("KR_MARKET_DAILY_LOSS_PCT", 0.005)
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 MIN_BUY_STRENGTH = 0.70
 LLM_DECIDER_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_llm_decider.py"
 CALENDAR_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_calendar.py"
+
+
+def runtime_dir_for(trade_mode: str) -> Path:
+    return PROD_RUNTIME_DIR if trade_mode == "prod" else PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto"
+
+
+def prod_auto_confirmed(args_confirmed: bool) -> bool:
+    return args_confirmed or os.environ.get("KIS_PROD_AUTO_CONFIRM") == PROD_AUTO_CONFIRM_VALUE
+
+
+def order_execution_enabled(trade_mode: str, prod_confirmed: bool) -> bool:
+    return trade_mode != "prod" or prod_confirmed
+
+
+def is_live_llm_mode(mode: str) -> bool:
+    return mode in {"live-vps", "live-prod"}
 
 
 def api(method: str, path: str, **kwargs) -> Any:
@@ -178,14 +205,12 @@ def build_buy_orders(results: list[dict[str, Any]], account: dict[str, Any], sta
         and float(row.get("target_price") or 0) > 0
     ]
     candidates.sort(key=lambda row: float(row.get("strength") or 0), reverse=True)
-    total_strength = sum(float(row.get("strength") or 0) for row in candidates) or 1
     remaining = usable_budget
     orders: list[dict[str, Any]] = []
 
     for row in candidates:
         price = float(row["target_price"])
-        target_amount = min(usable_budget * float(row["strength"]) / total_strength, remaining)
-        qty = int(target_amount // price)
+        qty = int(remaining // price)
         if qty <= 0:
             continue
         amount = qty * price
@@ -267,7 +292,7 @@ def apply_llm_decision(
 ) -> list[dict[str, Any]]:
     if mode in {"off", "shadow"}:
         return planned_buys
-    if mode != "live-vps":
+    if not is_live_llm_mode(mode):
         raise RuntimeError(f"invalid llm mode: {mode}")
     if not llm_result or llm_result.get("status") != "success":
         return []
@@ -308,7 +333,7 @@ def annotate_buys_for_report(
     executable_buys: list[dict[str, Any]],
     mode: str,
 ) -> list[dict[str, Any]]:
-    if mode != "live-vps":
+    if not is_live_llm_mode(mode):
         return planned_buys
 
     executable_by_code = {str(order.get("code")): order for order in executable_buys}
@@ -341,7 +366,12 @@ def holding_by_code(account: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(row.get("stock_code")): row for row in account.get("holdings", [])}
 
 
-def place_sells(results: list[dict[str, Any]], holdings: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def place_sells(
+    results: list[dict[str, Any]],
+    holdings: dict[str, dict[str, Any]],
+    trade_mode: str,
+    prod_confirmed: bool,
+) -> list[dict[str, Any]]:
     submitted = []
     for signal in results:
         if signal.get("action") != "SELL" or float(signal.get("strength") or 0) < 0.5:
@@ -361,7 +391,7 @@ def place_sells(results: list[dict[str, Any]], holdings: dict[str, dict[str, Any
             "quantity": qty,
             "signal_reason": signal.get("reason") or "SELL signal",
             "market": "domestic",
-            "confirm_prod": False,
+            "confirm_prod": trade_mode == "prod" and prod_confirmed,
         }
         result = api("POST", "/api/orders/execute", json=payload)
         signal["order_status"] = result.get("status")
@@ -371,7 +401,11 @@ def place_sells(results: list[dict[str, Any]], holdings: dict[str, dict[str, Any
     return submitted
 
 
-def place_buys(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def place_buys(
+    orders: list[dict[str, Any]],
+    trade_mode: str,
+    prod_confirmed: bool,
+) -> list[dict[str, Any]]:
     submitted = []
     for order in orders:
         payload = {
@@ -383,7 +417,7 @@ def place_buys(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "quantity": int(order["quantity"]),
             "signal_reason": order.get("reason") or "BUY signal",
             "market": "domestic",
-            "confirm_prod": False,
+            "confirm_prod": trade_mode == "prod" and prod_confirmed,
         }
         result = api("POST", "/api/orders/execute", json=payload)
         order["order_status"] = result.get("status")
@@ -393,7 +427,12 @@ def place_buys(orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return submitted
 
 
-def register_protection_for_holdings(before_codes: set[str], after_account: dict[str, Any]) -> list[dict[str, Any]]:
+def register_protection_for_holdings(
+    before_codes: set[str],
+    after_account: dict[str, Any],
+    trade_mode: str,
+    prod_confirmed: bool,
+) -> list[dict[str, Any]]:
     protections = []
     for row in after_account.get("holdings", []):
         code = str(row.get("stock_code"))
@@ -420,6 +459,7 @@ def register_protection_for_holdings(before_codes: set[str], after_account: dict
             "market": "domestic",
             "exchange": None,
             "currency": "KRW",
+            "confirm_prod": trade_mode == "prod" and prod_confirmed,
         }
         try:
             protections.append(api("POST", "/api/orders/protective", json=payload))
@@ -434,7 +474,8 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         f"# KRX Market Auto Run - {payload['slot']}",
         "",
         f"- Time: {payload['started_at']}",
-        f"- Mode: vps only",
+        f"- Mode: {payload.get('trade_mode', payload.get('safety', {}).get('mode', 'vps'))}",
+        f"- Order execution enabled: {payload.get('order_execution_enabled', True)}",
         f"- Regime: {payload['news_summary']['regime']}",
         f"- LLM mode: {payload.get('llm_mode', 'off')}",
         f"- Equity: {payload['account_before']['account'].get('deposit', {}).get('total_eval', 0):,}원",
@@ -499,7 +540,7 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
             f"| {order.get('name')}({order['code']}) | {kind} | BUY | {order['strength']:.2f} | "
             f"{order['target_price']:,.0f} | {order['quantity']} | {order['amount']:,.0f} | "
             f"{order['weight']*100:.1f}% | {order['take_profit']:,.0f} | {order['stop_loss']:,.0f} | "
-            f"일반 모의 시장가 | {order['order_decision']} |"
+            f"일반 {payload.get('trade_mode', 'vps')} 시장가 | {order['order_decision']} |"
         )
 
     lines.extend([
@@ -529,12 +570,26 @@ def main() -> int:
     parser.add_argument("--slot", required=True, choices=["open", "mid", "close", "manual"])
     parser.add_argument("--date", required=True)
     parser.add_argument(
+        "--trade-mode",
+        choices=["vps", "prod"],
+        default=os.environ.get("KIS_TRADE_MODE", "vps"),
+    )
+    parser.add_argument(
         "--llm-mode",
-        choices=["off", "shadow", "live-vps"],
+        choices=["off", "shadow", "live-vps", "live-prod"],
         default=os.environ.get("KR_MARKET_LLM_MODE", "off"),
+    )
+    parser.add_argument(
+        "--prod-auto-confirm",
+        action="store_true",
+        help="Allow prod order submission for this run. Prefer KIS_PROD_AUTO_CONFIRM for cron.",
     )
     args = parser.parse_args()
 
+    global RUNTIME_DIR
+    RUNTIME_DIR = runtime_dir_for(args.trade_mode)
+    prod_confirmed = prod_auto_confirmed(args.prod_auto_confirm)
+    can_submit_orders = order_execution_enabled(args.trade_mode, prod_confirmed)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
     report_base = RUNTIME_DIR / f"{now.strftime('%Y%m%d_%H%M%S')}_{args.slot}"
@@ -560,9 +615,12 @@ def main() -> int:
             "account_after": {"account": {"deposit": {}}, "pending": {}, "reservations": {}, "protective": {}},
             "llm_mode": args.llm_mode,
             "llm_result": None,
+            "trade_mode": args.trade_mode,
+            "prod_auto_confirmed": prod_confirmed,
+            "order_execution_enabled": can_submit_orders,
             "trading_day": trading_day,
             "safety": {
-                "mode": "vps",
+                "mode": args.trade_mode,
                 "total_new_buy_pct": TOTAL_BUY_PCT,
                 "daily_loss_pct": DAILY_LOSS_PCT,
                 "take_profit_pct": TAKE_PROFIT_PCT,
@@ -582,9 +640,9 @@ def main() -> int:
         write_report(report_base.with_suffix(".md"), payload)
         return 0
 
-    auth = api("POST", "/api/auth/login", json={"mode": "vps"})
-    if auth.get("mode") != "vps":
-        raise RuntimeError(f"not vps mode: {auth}")
+    auth = api("POST", "/api/auth/login", json={"mode": args.trade_mode})
+    if auth.get("mode") != args.trade_mode:
+        raise RuntimeError(f"not {args.trade_mode} mode: {auth}")
 
     headlines = fetch_headlines()
     news_summary = summarize_news(headlines)
@@ -600,7 +658,14 @@ def main() -> int:
     })
     signals = signals_response.get("results", [])
     groups = signal_groups(signals)
-    sells = place_sells(groups.get("SELL", []), holding_by_code(account_before["account"]))
+    sells = []
+    if can_submit_orders:
+        sells = place_sells(
+            groups.get("SELL", []),
+            holding_by_code(account_before["account"]),
+            args.trade_mode,
+            prod_confirmed,
+        )
     planned_buys = build_buy_orders(signals, account_before["account"], state)
     llm_context = {
         "slot": args.slot,
@@ -613,7 +678,9 @@ def main() -> int:
         "submitted_sells": sells,
         "account_before": account_before,
         "safety": {
-            "mode": "vps",
+            "mode": args.trade_mode,
+            "prod_auto_confirmed": prod_confirmed,
+            "order_execution_enabled": can_submit_orders,
             "total_new_buy_pct": TOTAL_BUY_PCT,
             "daily_loss_pct": DAILY_LOSS_PCT,
             "take_profit_pct": TAKE_PROFIT_PCT,
@@ -624,13 +691,24 @@ def main() -> int:
     }
     llm_result = run_llm_decision(args.llm_mode, llm_context)
     executable_buys = apply_llm_decision(planned_buys, llm_result, args.llm_mode)
+    if not can_submit_orders:
+        executable_buys = []
     report_buys = annotate_buys_for_report(planned_buys, executable_buys, args.llm_mode)
-    buys = place_buys(executable_buys)
+    if not can_submit_orders and args.trade_mode == "prod":
+        report_buys = [
+            {**order, "order_decision": "실전 자동승인 미설정/미주문"}
+            for order in report_buys
+        ]
+    buys = place_buys(executable_buys, args.trade_mode, prod_confirmed) if can_submit_orders else []
 
     api("POST", "/api/orders/account/clear-cache")
     time.sleep(3.0)
     account_mid = account_snapshot()
-    protections = register_protection_for_holdings(before_holding_codes, account_mid["account"])
+    protections = (
+        register_protection_for_holdings(before_holding_codes, account_mid["account"], args.trade_mode, prod_confirmed)
+        if can_submit_orders
+        else []
+    )
     time.sleep(1.0)
     account_after = account_snapshot()
 
@@ -652,9 +730,14 @@ def main() -> int:
         "account_after": account_after,
         "llm_mode": args.llm_mode,
         "llm_result": llm_result,
+        "trade_mode": args.trade_mode,
+        "prod_auto_confirmed": prod_confirmed,
+        "order_execution_enabled": can_submit_orders,
         "trading_day": trading_day,
         "safety": {
-            "mode": "vps",
+            "mode": args.trade_mode,
+            "prod_auto_confirmed": prod_confirmed,
+            "order_execution_enabled": can_submit_orders,
             "total_new_buy_pct": TOTAL_BUY_PCT,
             "daily_loss_pct": DAILY_LOSS_PCT,
             "take_profit_pct": TAKE_PROFIT_PCT,
