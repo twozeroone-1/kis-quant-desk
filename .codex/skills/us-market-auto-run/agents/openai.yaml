@@ -1,0 +1,3 @@
+name: us-market-auto-run
+short_description: Runs or schedules vps-only US-market paper trading with LLM approval, risk limits, reservations, and protective orders.
+default_prompt: Run the US market auto-trading workflow in vps mode, using the standard open/mid/close KST schedule and protective-order checks.

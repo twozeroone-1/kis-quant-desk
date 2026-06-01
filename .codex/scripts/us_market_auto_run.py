@@ -2,7 +2,7 @@
 """Scheduled US market news/signal/order run for KIS paper trading.
 
 This script is intentionally vps-only. It fetches recent market headlines,
-builds a short-term news-aware signal model, sizes BUY candidates under daily
+builds a short-term news-aware signal model, sizes BUY candidates under session
 risk limits, submits paper overseas limit orders, and registers app-level
 protective sell triggers after fills are visible in holdings.
 """
@@ -11,16 +11,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.util
 import json
 import math
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -36,13 +38,13 @@ CANDIDATES = [
     ("LLY", "NYSE"), ("COST", "NASD"),
 ]
 
-TOTAL_BUY_PCT = 0.03
-PER_SYMBOL_PCT = 0.01
+TOTAL_BUY_PCT = 0.10
 DAILY_LOSS_PCT = 0.005
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 MIN_BUY_STRENGTH = 0.70
 MIN_SECONDS_BETWEEN_KIS_CALLS = 0.85
+US_EXCHANGES = ("NASD", "NYSE", "AMEX")
 
 
 def _json_default(value: Any) -> Any:
@@ -59,10 +61,32 @@ def _json_default(value: Any) -> Any:
 def load_modules():
     sys.path.insert(0, str(STRATEGY_BUILDER))
     import kis_auth as ka
-    from core import indicators, overseas_data_fetcher
-    from backend.services.protective_orders import upsert_existing_position_protection
+    from core import indicators, overseas_data_fetcher, reserved_orders
+    from backend.services.protective_orders import list_protective_orders, upsert_existing_position_protection
 
-    return ka, indicators, overseas_data_fetcher, upsert_existing_position_protection
+    return ka, indicators, overseas_data_fetcher, reserved_orders, upsert_existing_position_protection, list_protective_orders
+
+
+def load_helper(module_name: str, filename: str):
+    path = PROJECT_ROOT / ".codex" / "scripts" / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load helper: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def us_regular_hours_now(now: datetime | None = None) -> bool:
+    """Approximate US regular session in KST.
+
+    The user schedule is KST-based and intentionally works in both DST and
+    standard-time seasons: 23:45 is after the regular open in either season,
+    and 04:45 is near the end during DST.
+    """
+    kst_now = now.astimezone(ZoneInfo("Asia/Seoul")) if now else datetime.now(ZoneInfo("Asia/Seoul"))
+    current = kst_now.time()
+    return current >= dt_time(22, 30) or current <= dt_time(6, 0)
 
 
 def fetch_headlines() -> list[dict[str, str]]:
@@ -176,8 +200,8 @@ def signal_for(symbol: str, exchange: str, odf, indicators) -> dict[str, Any]:
     }
 
 
-def today_state_path(now: datetime) -> Path:
-    return RUNTIME_DIR / f"{now.strftime('%Y%m%d')}.json"
+def session_state_path(session_date: str) -> Path:
+    return RUNTIME_DIR / f"{session_date}.json"
 
 
 def load_today_state(path: Path) -> dict[str, Any]:
@@ -204,14 +228,70 @@ def account_equity(odf) -> tuple[float, float, list[dict[str, Any]]]:
     return equity, cash, holdings
 
 
+def holdings_by_symbol(holdings: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {str(row.get("stock_code")).upper(): row for row in holdings}
+
+
+def list_pending_by_exchange(odf) -> dict[str, Any]:
+    data: dict[str, Any] = {"status": "success", "orders": [], "errors": []}
+    for exchange in US_EXCHANGES:
+        df, ok = odf.get_pending_orders("vps", exchange=exchange)
+        time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
+        if not ok:
+            data["errors"].append({"exchange": exchange, "message": "pending query failed"})
+            continue
+        if not df.empty:
+            data["orders"].extend(df.to_dict("records"))
+    if data["errors"]:
+        data["status"] = "partial_error" if data["orders"] else "error"
+    data["total_count"] = len(data["orders"])
+    return data
+
+
+def list_reservations_by_exchange(reserved_orders) -> dict[str, Any]:
+    today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
+    data: dict[str, Any] = {"status": "success", "orders": [], "errors": []}
+    for exchange in US_EXCHANGES:
+        result = reserved_orders.list_us_reservations(start_date=today, end_date=today, exchange=exchange)
+        time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
+        if not result.success:
+            data["errors"].append({
+                "exchange": exchange,
+                "error_code": result.error_code,
+                "message": result.display_error(),
+                "api_url": result.api_url,
+                "tr_id": result.tr_id,
+            })
+            continue
+        for record in result.records():
+            data["orders"].append({"exchange": exchange, **record})
+    if data["errors"]:
+        data["status"] = "partial_error" if data["orders"] else "error"
+    data["total_count"] = len(data["orders"])
+    return data
+
+
+async def account_status(odf, reserved_orders, list_protective_orders) -> dict[str, Any]:
+    equity, cash, holdings = account_equity(odf)
+    pending = list_pending_by_exchange(odf)
+    reservations = list_reservations_by_exchange(reserved_orders)
+    protective = await list_protective_orders()
+    return {
+        "equity": equity,
+        "cash": cash,
+        "holdings": holdings,
+        "pending": pending,
+        "reservations": reservations,
+        "protective": protective,
+    }
+
+
 def build_orders(signals: list[dict[str, Any]], equity: float, cash: float, state: dict[str, Any]) -> list[dict[str, Any]]:
     bought_today = sum(float(order.get("notional") or 0) for order in state.get("orders", []))
     total_budget = max(0.0, equity * TOTAL_BUY_PCT - bought_today)
     risk_budget = max(0.0, equity * DAILY_LOSS_PCT - (bought_today * STOP_LOSS_PCT))
     risk_capital = risk_budget / STOP_LOSS_PCT if STOP_LOSS_PCT else 0
     usable_budget = min(total_budget, risk_capital, cash)
-    per_symbol_cap = equity * PER_SYMBOL_PCT
-
     buy_signals = [
         signal for signal in signals
         if signal["action"] == "BUY"
@@ -226,7 +306,6 @@ def build_orders(signals: list[dict[str, Any]], equity: float, cash: float, stat
     for signal in buy_signals:
         price = float(signal["price"])
         target_notional = min(
-            per_symbol_cap,
             usable_budget * float(signal["strength"]) / total_strength,
             remaining,
         )
@@ -239,13 +318,101 @@ def build_orders(signals: list[dict[str, Any]], equity: float, cash: float, stat
             **signal,
             "quantity": qty,
             "notional": notional,
+            "weight": round(float(signal["strength"]) / total_strength, 4),
             "risk_amount": round(notional * STOP_LOSS_PCT, 2),
             "limit_price": price,
         })
     return orders
 
 
-def wait_for_holding(odf, symbol: str, exchange: str, min_qty: int, attempts: int = 8) -> dict[str, Any] | None:
+def apply_llm_decision(
+    planned_orders: list[dict[str, Any]],
+    llm_result: dict[str, Any],
+    live_mode: bool,
+) -> list[dict[str, Any]]:
+    if not planned_orders:
+        return []
+    if not live_mode:
+        return planned_orders
+    if llm_result.get("status") != "success":
+        return []
+    decision = llm_result.get("decision", {})
+    if not decision.get("should_trade"):
+        return []
+    approvals = {
+        str(item.get("symbol")).upper(): item
+        for item in decision.get("approved_buys", [])
+    }
+    approved_orders = []
+    for order in planned_orders:
+        symbol = str(order.get("symbol")).upper()
+        approval = approvals.get(symbol)
+        if not approval:
+            continue
+        qty = min(int(order.get("quantity") or 0), int(approval.get("max_quantity") or 0))
+        if qty <= 0:
+            continue
+        adjusted = {**order}
+        if qty != int(order.get("quantity") or 0):
+            adjusted["quantity"] = qty
+            adjusted["notional"] = round(qty * float(order.get("limit_price") or order.get("price") or 0), 2)
+            adjusted["risk_amount"] = round(adjusted["notional"] * STOP_LOSS_PCT, 2)
+        adjusted["llm_confidence"] = approval.get("confidence")
+        adjusted["llm_reason"] = approval.get("reason")
+        approved_orders.append(adjusted)
+    return approved_orders
+
+
+def annotate_llm_decisions(planned_orders: list[dict[str, Any]], executable_orders: list[dict[str, Any]], llm_mode: str) -> list[dict[str, Any]]:
+    executable = {str(order.get("symbol")).upper(): order for order in executable_orders}
+    rows = []
+    for order in planned_orders:
+        symbol = str(order.get("symbol")).upper()
+        if llm_mode == "off":
+            rows.append({**order, "order_decision": "주문"})
+        elif symbol in executable:
+            rows.append({**executable[symbol], "order_decision": "LLM 승인/주문"})
+        else:
+            rows.append({**order, "order_decision": "LLM 차단/미주문"})
+    return rows
+
+
+def place_sells(signals: list[dict[str, Any]], holdings: list[dict[str, Any]], odf) -> list[dict[str, Any]]:
+    held = holdings_by_symbol(holdings)
+    submitted = []
+    for signal in signals:
+        if signal.get("action") != "SELL" or float(signal.get("strength") or 0) < MIN_BUY_STRENGTH:
+            continue
+        symbol = str(signal.get("symbol")).upper()
+        holding = held.get(symbol)
+        qty = int(float((holding or {}).get("quantity") or 0))
+        if qty <= 0:
+            signal["order_status"] = "skipped_no_holding"
+            submitted.append(signal)
+            continue
+        price = float(signal.get("price") or (holding or {}).get("current_price") or 0)
+        result = odf.submit_order(
+            symbol=symbol,
+            action="SELL",
+            quantity=qty,
+            price=price,
+            env_dv="vps",
+            exchange=signal.get("exchange"),
+        )
+        row = result.dataframe.iloc[0].to_dict() if result.success and not result.dataframe.empty else {}
+        submitted.append({
+            **signal,
+            "quantity": qty,
+            "limit_price": price,
+            "order_status": "submitted" if result.success else "failed",
+            "order_no": str(row.get("ODNO") or row.get("odno") or ""),
+            "last_error": None if result.success else result.display_error(),
+        })
+        time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
+    return submitted
+
+
+def wait_for_holding(odf, symbol: str, exchange: str, min_qty: int, attempts: int = 30) -> dict[str, Any] | None:
     for _ in range(attempts):
         holdings_df = odf.get_holdings("vps")
         if not holdings_df.empty:
@@ -253,11 +420,18 @@ def wait_for_holding(odf, symbol: str, exchange: str, min_qty: int, attempts: in
                 data = row.to_dict()
                 if str(data.get("stock_code")).upper() == symbol and int(float(data.get("quantity") or 0)) >= min_qty:
                     return data
-        time.sleep(2.0)
+        time.sleep(3.0)
     return None
 
 
-async def place_orders(orders: list[dict[str, Any]], odf, upsert_protection) -> list[dict[str, Any]]:
+async def place_orders(
+    orders: list[dict[str, Any]],
+    odf,
+    reserved_orders,
+    upsert_protection,
+    *,
+    use_reservations: bool,
+) -> list[dict[str, Any]]:
     submitted: list[dict[str, Any]] = []
     for order in orders:
         symbol = order["symbol"]
@@ -284,7 +458,32 @@ async def place_orders(orders: list[dict[str, Any]], odf, upsert_protection) -> 
             order["buyable_amount"] = round(buyable_amount, 2)
             order["buyable_quantity"] = buyable_qty
 
-        result = odf.execute_order(
+        if use_reservations:
+            result = reserved_orders.submit_us_reservation(
+                symbol=symbol,
+                action="BUY",
+                quantity=qty,
+                price=price,
+                order_type="limit",
+                env_dv="vps",
+                exchange=exchange,
+            )
+            time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
+            order["order_status"] = "reservation_submitted" if result.success else "reservation_failed"
+            order["order_method"] = "미국 모의 예약매수 limit"
+            order["reservation_result"] = {
+                "status": "success" if result.success else "error",
+                "message": None if result.success else result.display_error(),
+                "api_url": result.api_url,
+                "tr_id": result.tr_id,
+                "error_code": result.error_code,
+                "records": result.records(),
+            }
+            order["protection_status"] = "not_registered_until_fill"
+            submitted.append(order)
+            continue
+
+        result = odf.submit_order(
             symbol=symbol,
             action="BUY",
             quantity=qty,
@@ -293,14 +492,16 @@ async def place_orders(orders: list[dict[str, Any]], odf, upsert_protection) -> 
             exchange=exchange,
         )
         time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
-        if result.empty:
+        if not result.success or result.dataframe.empty:
             order["order_status"] = "failed"
+            order["last_error"] = result.display_error()
             submitted.append(order)
             continue
 
-        row = result.iloc[0].to_dict()
+        row = result.dataframe.iloc[0].to_dict()
         order_no = str(row.get("ODNO", row.get("odno", "")))
         order["order_status"] = "submitted"
+        order["order_method"] = "미국 모의 일반 지정가"
         order["order_no"] = order_no
 
         holding = wait_for_holding(odf, symbol, exchange, qty)
@@ -341,54 +542,153 @@ async def place_orders(orders: list[dict[str, Any]], odf, upsert_protection) -> 
 
 
 def write_report(path: Path, payload: dict[str, Any]) -> None:
+    planned_rows = payload.get("planned_buys_display", payload.get("planned_buys", []))
+    post_rows = payload.get("account_after", {}).get("holdings", payload.get("account", {}).get("holdings", []))
+    protective_orders = payload.get("account_after", {}).get("protective", {}).get("orders", [])
+    pending_count = payload.get("account_after", {}).get("pending", {}).get("total_count", 0)
+    reservation_status = payload.get("account_after", {}).get("reservations", {}).get("status", "unknown")
     lines = [
         f"# US Market Auto Run - {payload['slot']}",
         "",
         f"- Time: {payload['started_at']}",
+        f"- US session date: {payload['date']}",
         f"- Regime: {payload['news_summary']['regime']}",
+        f"- LLM mode: {payload.get('llm_mode', 'off')}",
+        f"- Order mode: vps only",
         f"- Equity: ${payload['account']['equity']:,.2f}",
         f"- Cash: ${payload['account']['cash']:,.2f}",
+        f"- Protective orders are app-level monitoring, not KIS server OCO; backend/auth/network health matters.",
         "",
         "## Headlines",
     ]
     for item in payload["headlines"][:10]:
         lines.append(f"- {item['title']} ({item['source']})")
-    lines.extend(["", "## Signals", "| Symbol | Action | Strength | Price | Reason |", "|---|---:|---:|---:|---|"])
-    for signal in payload["signals"]:
+    for action in ("BUY", "SELL", "HOLD", "ERROR"):
+        rows = [signal for signal in payload["signals"] if signal.get("action") == action]
+        if not rows:
+            continue
+        lines.extend(["", f"## {action} Signals", "| Symbol | Exchange | Action | Strength | Price | Reason |", "|---|---|---:|---:|---:|---|"])
+        for signal in rows:
+            lines.append(
+                f"| {signal['symbol']} | {signal.get('exchange', '')} | {signal['action']} | "
+                f"{signal.get('strength', 0):.2f} | ${float(signal.get('price') or 0):.2f} | {signal.get('reason', '')} |"
+            )
+
+    lines.extend([
+        "",
+        "## Pre-Buy Table",
+        "| 종목 | 구분 | 신호 | 강도 | 현재가 | 예상 수량 | 예상 금액 | 배분 비중 | 익절가(+6%) | 손절가(-3%) | 주문 방식 | 주문 여부 |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|",
+    ])
+    if not planned_rows:
+        lines.append("| - | - | - | - | - | - | - | - | - | - | - | 매수 후보 없음 |")
+    for order in planned_rows:
+        weight = float(order.get("weight") or 0)
         lines.append(
-            f"| {signal['symbol']} | {signal['action']} | {signal.get('strength', 0):.2f} | "
-            f"${float(signal.get('price') or 0):.2f} | {signal.get('reason', '')} |"
+            f"| {order['symbol']} | {order.get('exchange', '')} | BUY | {float(order.get('strength') or 0):.2f} | "
+            f"${float(order.get('price') or order.get('limit_price') or 0):.2f} | {int(order.get('quantity') or 0)} | "
+            f"${float(order.get('notional') or 0):,.2f} | {weight*100:.1f}% | "
+            f"${float(order.get('take_profit') or 0):.2f} | ${float(order.get('stop_loss') or 0):.2f} | "
+            f"{order.get('order_method') or payload.get('planned_order_method', '미국 모의 지정가')} | {order.get('order_decision', '주문')} |"
         )
-    lines.extend(["", "## Orders", "| Symbol | Qty | Notional | Status | TP | SL | Protection |", "|---|---:|---:|---|---:|---:|---|"])
+
+    lines.extend(["", "## Submitted Orders", "| Symbol | Qty | Notional | Status | TP | SL | Protection | Error |", "|---|---:|---:|---|---:|---:|---|---|"])
     for order in payload["orders"]:
         lines.append(
             f"| {order['symbol']} | {order.get('quantity', 0)} | ${order.get('notional', 0):,.2f} | "
             f"{order.get('order_status')} | ${float(order.get('take_profit') or 0):.2f} | "
-            f"${float(order.get('stop_loss') or 0):.2f} | {order.get('protection_status', '')} |"
+            f"${float(order.get('stop_loss') or 0):.2f} | {order.get('protection_status', '')} | {order.get('last_error') or ''} |"
         )
+    lines.extend([
+        "",
+        "## Post-Fill Status",
+        "| 종목 | 체결 수량 | 평균단가 | 익절 지정가 | 손절 지정가 | 보호주문 상태 | 예약/미체결 상태 |",
+        "|---|---:|---:|---:|---:|---|---|",
+    ])
+    for row in post_rows:
+        symbol = str(row.get("stock_code") or "").upper()
+        protection = next((item for item in reversed(protective_orders) if str(item.get("stock_code")).upper() == symbol), {})
+        lines.append(
+            f"| {symbol} | {int(float(row.get('quantity') or 0))} | ${float(row.get('avg_price') or 0):.2f} | "
+            f"${float(protection.get('take_profit_price') or protection.get('take_profit_limit_price') or 0):.2f} | "
+            f"${float(protection.get('stop_loss_price') or protection.get('stop_loss_limit_price') or 0):.2f} | "
+            f"{protection.get('status', 'none')} | reservations={reservation_status}, pending={pending_count} |"
+        )
+    reservation_errors = payload.get("account_after", {}).get("reservations", {}).get("errors", [])
+    if reservation_errors:
+        lines.extend(["", "## Reservation API Errors"])
+        for error in reservation_errors:
+            lines.append(f"- {error}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def cleanup_cron_if_done(state: dict[str, Any]) -> None:
+def write_market_closed_report(path: Path, payload: dict[str, Any]) -> None:
+    lines = [
+        f"# US Market Auto Run - {payload['slot']}",
+        "",
+        f"- Time: {payload['started_at']}",
+        f"- US session date: {payload['date']}",
+        "- Regime: market_closed",
+        f"- LLM mode: {payload.get('llm_mode', 'off')}",
+        "- Order mode: vps only",
+        "",
+        "## Market Closed",
+        f"- Source: {payload.get('trading_day', {}).get('source')}",
+        f"- Status: {payload.get('trading_day', {}).get('status')}",
+        f"- Reason: {payload.get('trading_day', {}).get('record')}",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cleanup_cron_if_done(state: dict[str, Any], session_date: str) -> None:
     slots = {run.get("slot") for run in state.get("runs", [])}
-    if not {"mid", "close"}.issubset(slots):
+    if not {"open", "mid", "close"}.issubset(slots):
         return
-    os.system("(crontab -l 2>/dev/null | grep -v 'KIS_US_MARKET_AUTO_20260522') | crontab -")
+    os.system(f"(crontab -l 2>/dev/null | grep -v 'KIS_US_MARKET_AUTO_{session_date}') | crontab -")
 
 
 async def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--slot", required=True, choices=["mid", "close", "manual"])
-    parser.add_argument("--date", default="20260522")
+    parser.add_argument("--slot", required=True, choices=["open", "mid", "close", "manual"])
+    parser.add_argument("--date", required=True, help="US session date key in YYYYMMDD, shared by all slots")
+    parser.add_argument("--llm-mode", choices=["off", "shadow", "live-vps"], default=os.environ.get("US_MARKET_LLM_MODE", "live-vps"))
     args = parser.parse_args()
 
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Asia/Seoul"))
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     report_base = RUNTIME_DIR / f"{now.strftime('%Y%m%d_%H%M%S')}_{args.slot}"
-    state_path = today_state_path(now)
+    state_path = session_state_path(args.date)
     state = load_today_state(state_path)
 
-    ka, indicators, odf, upsert_protection = load_modules()
+    calendar = load_helper("us_market_calendar", "us_market_calendar.py")
+    trading_day = calendar.market_status(args.date)
+    if not trading_day.get("is_open"):
+        payload = {
+            "slot": args.slot,
+            "date": args.date,
+            "started_at": now.isoformat(timespec="seconds"),
+            "llm_mode": args.llm_mode,
+            "trading_day": trading_day,
+            "news_summary": {"regime": "market_closed"},
+            "headlines": [],
+            "signals": [],
+            "planned_buys": [],
+            "orders": [],
+        }
+        state.setdefault("runs", []).append({
+            "slot": args.slot,
+            "started_at": payload["started_at"],
+            "report": str(report_base.with_suffix(".md")),
+            "market_closed": True,
+            "trading_day": trading_day,
+        })
+        save_today_state(state_path, state)
+        report_base.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+        write_market_closed_report(report_base.with_suffix(".md"), payload)
+        cleanup_cron_if_done(state, args.date)
+        return 0
+
+    ka, indicators, odf, reserved_orders, upsert_protection, list_protective_orders = load_modules()
     ka.auth(svr="vps")
 
     headlines = fetch_headlines()
@@ -407,24 +707,65 @@ async def main() -> int:
                 "price": 0.0,
             })
 
-    equity, cash, holdings = account_equity(odf)
+    account_before = await account_status(odf, reserved_orders, list_protective_orders)
+    equity = float(account_before["equity"])
+    cash = float(account_before["cash"])
+    holdings = account_before["holdings"]
+    submitted_sells = place_sells(signals, holdings, odf)
     planned_orders = build_orders(signals, equity, cash, state)
-    submitted_orders = await place_orders(planned_orders, odf, upsert_protection)
 
-    payload = {
+    pre_payload = {
         "slot": args.slot,
+        "date": args.date,
         "started_at": now.isoformat(timespec="seconds"),
         "headlines": headlines,
         "news_summary": news_summary,
+        "llm_mode": args.llm_mode,
+        "trading_day": trading_day,
         "strategy": {
             "name": "US news-aware EMA/ROC/RSI trend filter",
             "entry": "EMA20 > EMA50 and ROC20 > 4 and 50 < RSI14 < 72",
             "exit": "EMA20 < EMA50 or ROC20 < -3 or RSI14 > 78",
-            "risk": {"take_profit_pct": 6, "stop_loss_pct": 3},
+            "risk": {
+                "total_new_buy_pct": round(TOTAL_BUY_PCT * 100, 2),
+                "daily_loss_pct": round(DAILY_LOSS_PCT * 100, 2),
+                "take_profit_pct": round(TAKE_PROFIT_PCT * 100, 2),
+                "stop_loss_pct": round(STOP_LOSS_PCT * 100, 2),
+                "per_symbol_cap": None,
+            },
         },
         "account": {"equity": equity, "cash": cash, "holdings": holdings},
+        "account_before": account_before,
         "signals": signals,
+        "submitted_sells": submitted_sells,
+        "planned_buys": planned_orders,
+        "orders": [],
+    }
+    llm_result = {"status": "disabled", "decision": {"should_trade": bool(planned_orders), "approved_buys": []}}
+    executable_orders = planned_orders
+    if args.llm_mode != "off":
+        decider = load_helper("us_market_llm_decider", "us_market_llm_decider.py")
+        llm_result = decider.call_llm(pre_payload) if args.llm_mode in {"shadow", "live-vps"} else llm_result
+        executable_orders = apply_llm_decision(planned_orders, llm_result, live_mode=args.llm_mode == "live-vps")
+
+    regular_hours = us_regular_hours_now(now)
+    submitted_orders = await place_orders(
+        executable_orders,
+        odf,
+        reserved_orders,
+        upsert_protection,
+        use_reservations=not regular_hours,
+    )
+    account_after = await account_status(odf, reserved_orders, list_protective_orders)
+    planned_display = annotate_llm_decisions(planned_orders, executable_orders, args.llm_mode)
+
+    payload = {
+        **pre_payload,
+        "llm": llm_result,
+        "planned_order_method": "미국 모의 일반 지정가" if regular_hours else "미국 모의 예약매수 limit",
+        "planned_buys_display": planned_display,
         "orders": submitted_orders,
+        "account_after": account_after,
     }
 
     state.setdefault("runs", []).append({
@@ -434,12 +775,12 @@ async def main() -> int:
         "orders": submitted_orders,
     })
     state.setdefault("orders", []).extend(
-        order for order in submitted_orders if order.get("order_status") == "submitted"
+        order for order in submitted_orders if order.get("order_status") in {"submitted", "reservation_submitted"}
     )
     save_today_state(state_path, state)
     report_base.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
     write_report(report_base.with_suffix(".md"), payload)
-    cleanup_cron_if_done(state)
+    cleanup_cron_if_done(state, args.date)
     return 0
 
 
