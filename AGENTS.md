@@ -26,6 +26,12 @@
 
 - `appkey`, `appsecret`, 토큰 등 민감 정보를 코드에 하드코딩하거나 출력하지 않는다.
 - `~/KIS/config/kis_devlp.yaml`을 사용자 요청 없이 읽거나 수정하지 않는다.
+- Strategy Builder 운영 엔드포인트는 `8081`/`8083` 기준으로 판단한다. `8000`은 컨테이너 내부 또는 로컬 개발용 백엔드 포트일 수 있으므로 모의/실전 운영 상태 판단에 사용하지 않는다.
+- `http://ww.tailea9a3f.ts.net:8081` 및 `http://127.0.0.1:8081`은 모의투자(`vps`) 전용 Strategy Builder 엔드포인트다.
+- `http://ww.tailea9a3f.ts.net:8083` 및 `http://127.0.0.1:8083`은 실전투자(`prod`) 전용 Strategy Builder 엔드포인트다.
+- `KIS_LOCK_MODE` 분리 규칙을 따른다. `8081`은 `prod` 로그인을 거부해야 하고, `8083`은 `vps` 로그인을 거부해야 한다.
+- 분리 목적은 모의 자동화를 `8081`에서 매일 계속 돌려 수익률·안정성을 검증하고, 실전 자동화 테스트는 `8083`에서 별도 승인 절차로 동시에 검증하기 위함이다.
+- 자동화 스크립트에서 API 엔드포인트를 바꿔야 하면 공통 `KIS_STRATEGY_API`보다 모드별 `KIS_VPS_STRATEGY_API` 또는 `KIS_PROD_STRATEGY_API`를 우선 사용한다.
 - 실전(`prod`) 주문 전에 종목·수량·예상금액을 표시하고 반드시 사용자 확인을 받는다.
 - 실전(`prod`) 예약주문 접수·취소·정정 전에도 종목·수량·가격·예상금액·모드를 표시하고 반드시 사용자 확인을 받는다.
 - 실전(`prod`) 손익절 감시 설정 전에도 종목·수량·도달가·주문방식·모드를 표시하고 반드시 사용자 확인을 받는다.
@@ -89,6 +95,8 @@
 
 ## Operational Checks
 
+- Strategy Builder 모의 상태 확인: `curl -s http://127.0.0.1:8081/api/auth/status`
+- Strategy Builder 실전 상태 확인: `curl -s http://127.0.0.1:8083/api/auth/status`
 - 백테스팅은 Docker + MCP 엔드포인트 `http://127.0.0.1:3846/mcp` 가 필요하다.
   - MCP 상태 확인: `curl -s http://127.0.0.1:3846/health`
   - MCP가 내려가 있으면: `bash backtester/scripts/start_mcp.sh`

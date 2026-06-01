@@ -27,7 +27,6 @@ import requests
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto"
 PROD_RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto_prod"
-API_BASE = os.environ.get("KIS_STRATEGY_API", "http://127.0.0.1:8000")
 PROD_AUTO_CONFIRM_VALUE = "I_UNDERSTAND_REAL_ORDERS"
 
 CANDIDATES = [
@@ -63,6 +62,15 @@ TAKE_PROFIT_PCT = 0.06
 MIN_BUY_STRENGTH = 0.70
 LLM_DECIDER_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_llm_decider.py"
 CALENDAR_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_calendar.py"
+
+
+def api_base_for(trade_mode: str) -> str:
+    if trade_mode == "prod":
+        return os.environ.get("KIS_PROD_STRATEGY_API") or os.environ.get("KIS_STRATEGY_API") or "http://127.0.0.1:8083"
+    return os.environ.get("KIS_VPS_STRATEGY_API") or os.environ.get("KIS_STRATEGY_API") or "http://127.0.0.1:8081"
+
+
+API_BASE = api_base_for(os.environ.get("KIS_TRADE_MODE", "vps"))
 
 
 def runtime_dir_for(trade_mode: str) -> Path:
@@ -580,6 +588,7 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
 
 
 def main() -> int:
+    global API_BASE
     parser = argparse.ArgumentParser()
     parser.add_argument("--slot", required=True, choices=["open", "mid", "close", "manual"])
     parser.add_argument("--date", required=True)
@@ -599,6 +608,7 @@ def main() -> int:
         help="Allow prod order submission for this run. Prefer KIS_PROD_AUTO_CONFIRM for cron.",
     )
     args = parser.parse_args()
+    API_BASE = api_base_for(args.trade_mode)
 
     global RUNTIME_DIR
     RUNTIME_DIR = runtime_dir_for(args.trade_mode)

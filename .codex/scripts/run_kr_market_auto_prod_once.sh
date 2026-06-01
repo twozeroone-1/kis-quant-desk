@@ -17,6 +17,8 @@ if [[ -f "$PROD_ENV" ]]; then
   # shellcheck disable=SC1090
   source "$PROD_ENV"
 fi
+API_BASE="${KIS_PROD_STRATEGY_API:-http://127.0.0.1:8083}"
+export KIS_STRATEGY_API="$API_BASE"
 
 export KIS_CONFIG_ROOT="/home/from0to01/KIS/config"
 export KIS_TOKEN_ROOT="/home/from0to01/.local/state/kis-stack/token-prod"
@@ -52,16 +54,16 @@ else
   echo "approval file required: $approval_file"
 fi
 
-status="$(curl -fsS http://127.0.0.1:8000/api/auth/status 2>/dev/null || true)"
+status="$(curl -fsS "$API_BASE/api/auth/status" 2>/dev/null || true)"
 if [[ -z "$status" ]]; then
-  setsid bash -c "cd '$PROJECT_ROOT/strategy_builder' && export KIS_LOCK_MODE=prod KIS_DEFAULT_MODE=prod KIS_TOKEN_ROOT='$KIS_TOKEN_ROOT' KIS_MODE_FILE='$KIS_MODE_FILE' KIS_RUNTIME_DIR='$KIS_RUNTIME_DIR' && exec '$UV_BIN' run uvicorn backend.main:app --host 127.0.0.1 --port 8000" \
-    >> "$LOG_DIR/backend.log" 2>&1 < /dev/null &
+  (cd "$PROJECT_ROOT" && docker compose --env-file .env.production -f compose.yml up -d builder-backend-prod builder-frontend caddy) \
+    >> "$LOG_DIR/backend.log" 2>&1
   sleep 5
-else
-  if ! printf '%s' "$status" | grep -q '"mode"[[:space:]]*:[[:space:]]*"prod"'; then
-    echo "error: strategy_builder backend is already running but is not in prod mode: $status" >&2
-    exit 1
-  fi
+  status="$(curl -fsS "$API_BASE/api/auth/status" 2>/dev/null || true)"
+fi
+if ! printf '%s' "$status" | grep -q '"mode"[[:space:]]*:[[:space:]]*"prod"'; then
+  echo "error: Strategy Builder prod endpoint is not available at $API_BASE: $status" >&2
+  exit 1
 fi
 
 cd "$PROJECT_ROOT/strategy_builder"

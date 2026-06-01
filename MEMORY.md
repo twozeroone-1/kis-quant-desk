@@ -9,3 +9,4 @@
 - `KIS_LOCK_MODE` is enabled so `8081` rejects prod login and `8083` rejects vps login.
 - `open-trading-agent.service` is explicitly pinned to `8081` for vps risk monitoring.
 - Live/prod orders must use `8083` and still require explicit user confirmation before submission.
+- Purpose: keep daily vps automation and paper PnL/stability testing running on `8081` while separately testing approved prod automation on `8083`.

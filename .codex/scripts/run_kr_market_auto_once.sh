@@ -9,6 +9,8 @@ if [[ -f "$LOCAL_ENV" ]]; then
   # shellcheck disable=SC1090
   source "$LOCAL_ENV"
 fi
+API_BASE="${KIS_VPS_STRATEGY_API:-http://127.0.0.1:8081}"
+export KIS_STRATEGY_API="$API_BASE"
 export KIS_CONFIG_ROOT="/home/from0to01/KIS/config"
 export KIS_TOKEN_ROOT="/home/from0to01/.local/state/kis-stack/token-vps"
 export KIS_MODE_FILE="$KIS_TOKEN_ROOT/KIS_MODE"
@@ -27,10 +29,16 @@ if [[ "$today" != "$scheduled_date" ]]; then
   exit 0
 fi
 
-if ! curl -fsS http://127.0.0.1:8000/api/auth/status >/dev/null 2>&1; then
-  setsid bash -c "cd '$PROJECT_ROOT/strategy_builder' && export KIS_LOCK_MODE=vps KIS_DEFAULT_MODE=vps && exec '$UV_BIN' run uvicorn backend.main:app --host 127.0.0.1 --port 8000" \
-    >> "$LOG_DIR/backend.log" 2>&1 < /dev/null &
+status="$(curl -fsS "$API_BASE/api/auth/status" 2>/dev/null || true)"
+if [[ -z "$status" ]]; then
+  (cd "$PROJECT_ROOT" && docker compose --env-file .env.production -f compose.yml up -d builder-backend-vps builder-frontend caddy) \
+    >> "$LOG_DIR/backend.log" 2>&1
   sleep 5
+  status="$(curl -fsS "$API_BASE/api/auth/status" 2>/dev/null || true)"
+fi
+if ! printf '%s' "$status" | grep -q '"mode"[[:space:]]*:[[:space:]]*"vps"'; then
+  echo "error: Strategy Builder vps endpoint is not available at $API_BASE: $status" >&2
+  exit 1
 fi
 
 cd "$PROJECT_ROOT/strategy_builder"

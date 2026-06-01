@@ -133,9 +133,21 @@ graph LR
 | `backtester/` | 과거 검증 + 파라미터 최적화 | Docker 기반 QuantConnect Lean, HTML 리포트 ([README](backtester/README.md)) |
 | `MCP/` | AI 도구 연결 | KIS Code Assistant + Trading MCP ([README](MCP/README.MD)) |
 
+#### KIS Quant Desk 운영 포트
+
+KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도록 Strategy Builder 백엔드를 분리 운영합니다. 두 백엔드는 컨테이너 내부에서는 각각 `8000`을 사용하지만, 운영 판단은 Caddy가 노출하는 외부 포트 기준으로 합니다.
+
+| 포트 | 용도 | 백엔드 서비스 | 런타임/토큰 | 운영 목적 |
+|------|------|---------------|-------------|-----------|
+| `8081` | 모의투자 `vps` | `builder-backend-vps` | `token-vps`, `runtime-vps` | 매일 자동화를 돌려 수익률과 안정성을 검증 |
+| `8082` | 백테스터 | `backtest-backend` | Lean workspace | 전략 백테스트와 리포트 생성 |
+| `8083` | 실전투자 `prod` | `builder-backend-prod` | `token-prod`, `runtime-prod` | 승인 기반 실전 자동화 테스트 |
+
+`KIS_LOCK_MODE`가 적용되어 `8081`은 `prod` 로그인을 거부하고, `8083`은 `vps` 로그인을 거부해야 합니다. `127.0.0.1:8000`은 컨테이너 내부 또는 로컬 개발용 백엔드 포트일 수 있으므로 운영 상태 판단에 사용하지 않습니다.
+
 #### KIS Quant Desk — `/execute` 주문 실행 화면
 
-`strategy_builder`의 실행 화면은 `http://<host>:8081/execute`에서 전략 신호 확인, 계좌 상태 확인, 주문 실행을 한 화면에서 처리하도록 확장되어 있습니다.
+`strategy_builder`의 실행 화면은 `http://<host>:8081/execute` 또는 `http://<host>:8083/execute`에서 전략 신호 확인, 계좌 상태 확인, 주문 실행을 한 화면에서 처리하도록 확장되어 있습니다. 모의 자동화와 검증은 `8081`, 승인 기반 실전 테스트는 `8083`을 사용합니다.
 
 | 항목 | 상세 |
 |------|------|
@@ -180,7 +192,7 @@ graph LR
 
 #### 전략 검토 — 보유종목 손익절 감시
 
-`http://<host>:8081/review`의 **전략 검토** 화면은 이미 보유 중인 한국/미국 주식에 손절·익절 감시 조건을 붙이는 운영 화면입니다. 전략 빌더에서 새 주문을 만들 때 붙는 보호주문과 달리, 이 화면은 “현재 계좌에 이미 있는 포지션”을 대상으로 합니다.
+`http://<host>:8081/review` 또는 `http://<host>:8083/review`의 **전략 검토** 화면은 이미 보유 중인 한국/미국 주식에 손절·익절 감시 조건을 붙이는 운영 화면입니다. 전략 빌더에서 새 주문을 만들 때 붙는 보호주문과 달리, 이 화면은 “현재 계좌에 이미 있는 포지션”을 대상으로 합니다.
 
 | 항목 | 상세 |
 |------|------|
@@ -240,11 +252,25 @@ graph LR
 .codex/scripts/run_kr_market_auto_once.sh close 20260602
 ```
 
-모의투자 실행은 `KIS_LOCK_MODE=vps`, `KIS_DEFAULT_MODE=vps`를 사용하며, 실전 주문을 호출하지 않습니다. 실행 결과는 `.codex/runtime/kr_market_auto/`에 JSON/Markdown 리포트로 저장됩니다.
+모의투자 실행은 `8081`의 `builder-backend-vps`를 사용합니다. 래퍼는 `KIS_LOCK_MODE=vps`, `KIS_DEFAULT_MODE=vps`를 설정하고, 기본 API 엔드포인트를 `http://127.0.0.1:8081`로 고정해 실전 주문을 호출하지 않습니다. 실행 결과는 `.codex/runtime/kr_market_auto/`에 JSON/Markdown 리포트로 저장됩니다. 엔드포인트를 바꿔야 하면 `KIS_VPS_STRATEGY_API`를 사용합니다.
+
+**미국 모의투자(vps) 일일 실행**
+
+```bash
+# 미국장 23:45 / 02:45 / 04:45 KST 크론 설치
+.codex/scripts/install_us_market_auto_daily_cron.sh
+
+# 특정 슬롯 수동 실행
+.codex/scripts/run_us_market_auto_once.sh open 20260602
+.codex/scripts/run_us_market_auto_once.sh mid 20260603 20260602
+.codex/scripts/run_us_market_auto_once.sh close 20260603 20260602
+```
+
+미국장 모의 자동화도 `8081`의 `builder-backend-vps`만 사용합니다. 실행 결과는 `.codex/runtime/us_market_auto/`에 저장되며, 장중 신규 매수와 보호주문 점검은 실전 `8083`과 분리됩니다.
 
 **국내 실전투자(prod) 일일 실행**
 
-실전 버전은 기본적으로 리포트 전용입니다. 날짜와 슬롯별 1회성 승인 파일이 있을 때만 실제 주문이 제출됩니다.
+실전 버전은 `8083`의 `builder-backend-prod`를 사용하며 기본적으로 리포트 전용입니다. 날짜와 슬롯별 1회성 승인 파일이 있을 때만 실제 주문이 제출됩니다.
 
 ```bash
 # 실전 크론 설치. 기본은 주문 없이 리포트만 생성
@@ -257,7 +283,7 @@ graph LR
 .codex/scripts/run_kr_market_auto_prod_once.sh open 20260602
 ```
 
-승인 파일은 `.codex/runtime/kr_market_auto_prod/approvals/YYYYMMDD_<slot>.approved` 형식이며, 실행 시작 시 소비되고 삭제됩니다. `.codex/local/kr_market_auto_prod.env`에 `KIS_PROD_AUTO_CONFIRM`이 남아 있어도 `run_kr_market_auto_prod_once.sh`가 이를 제거하므로 영구 자동승인으로 쓰이지 않습니다.
+승인 파일은 `.codex/runtime/kr_market_auto_prod/approvals/YYYYMMDD_<slot>.approved` 형식이며, 실행 시작 시 소비되고 삭제됩니다. `.codex/local/kr_market_auto_prod.env`에 `KIS_PROD_AUTO_CONFIRM`이 남아 있어도 `run_kr_market_auto_prod_once.sh`가 이를 제거하므로 영구 자동승인으로 쓰이지 않습니다. 엔드포인트를 바꿔야 하면 `KIS_PROD_STRATEGY_API`를 사용합니다.
 
 실전 주문은 `KR_MARKET_LLM_MODE=live-prod`일 때만 제출됩니다. `off` 또는 `shadow` 모드에서는 승인 파일이 있어도 리포트만 생성하고 주문은 차단합니다.
 
@@ -288,17 +314,20 @@ KR_MARKET_TOTAL_BUY_PCT=10 KR_MARKET_DAILY_LOSS_PCT=0.5 \
 
 #### Docker 운영
 
-KIS Quant Desk는 Docker Compose로 `builder-backend`, `builder-frontend`, `caddy`를 실행해 `http://<host>:8081`에 Strategy Builder를 노출합니다.
+KIS Quant Desk는 Docker Compose로 `builder-backend-vps`, `builder-backend-prod`, `builder-frontend`, `backtest-*`, `caddy`를 실행합니다. Caddy가 `8081`, `8082`, `8083`을 외부 운영 포트로 노출합니다.
 
 ```bash
 # 저장소 루트에서 실행
-docker compose --env-file .env.production -f compose.yml up -d --build builder-backend builder-frontend caddy
+docker compose --env-file .env.production -f compose.yml up -d --build \
+  builder-backend-vps builder-backend-prod builder-frontend \
+  backtest-backend backtest-frontend caddy
 
 # 상태 확인
 docker compose --env-file .env.production -f compose.yml ps
 
-# 백엔드 로그 확인
-docker logs -f kis-stack-builder-backend-1
+# 모의/실전 백엔드 로그 확인
+docker logs -f kis-stack-builder-backend-vps-1
+docker logs -f kis-stack-builder-backend-prod-1
 
 # 프론트 로그 확인
 docker logs -f kis-stack-builder-frontend-1
@@ -308,16 +337,20 @@ docker logs -f kis-stack-builder-frontend-1
 
 | 경로 | 용도 |
 |------|------|
-| `/builder` | 전략 빌더. 지표/조건/리스크를 조합하고 `.kis.yaml`로 내보냅니다. |
-| `/execute` | 전략 실행. 한국/미국 종목에 대해 시그널을 생성하고 주문을 실행합니다. |
-| `/review` | 전략 검토. 보유 종목의 손절/익절 감시 조건과 실시간 시세 상태를 관리합니다. |
+| `http://<host>:8081/builder` | 모의투자 전략 빌더. 지표/조건/리스크를 조합하고 `.kis.yaml`로 내보냅니다. |
+| `http://<host>:8081/execute` | 모의투자 전략 실행. 한국/미국 종목에 대해 시그널을 생성하고 주문을 실행합니다. |
+| `http://<host>:8081/review` | 모의투자 보유 종목의 손절/익절 감시 조건과 실시간 시세 상태를 관리합니다. |
+| `http://<host>:8083/builder` | 실전투자 전략 빌더. 실전 테스트 전용 포트입니다. |
+| `http://<host>:8083/execute` | 실전투자 전략 실행. 실제 주문은 서버 확인값과 에이전트/사용자 승인이 있어야 제출됩니다. |
+| `http://<host>:8083/review` | 실전투자 보유 종목 보호주문 감시 설정 화면입니다. |
+| `http://<host>:8082` | 백테스터 UI입니다. |
 
 운영 전 확인할 항목:
 
 - `~ /KIS/config/kis_devlp.yaml` 또는 컨테이너에 마운트되는 KIS 설정 파일에 앱키, 앱시크릿, 계좌번호가 설정되어 있어야 합니다.
-- UI 우측 상단 설정에서 `vps`(모의) 또는 `prod`(실전) 인증을 완료해야 합니다.
+- `8081` UI 우측 상단 설정에서는 `vps`(모의), `8083` UI 우측 상단 설정에서는 `prod`(실전) 인증을 완료해야 합니다.
 - Caddy Basic Auth를 사용하는 배포에서는 브라우저 접속 시 Basic Auth와 앱 내부 KIS 인증이 모두 필요합니다.
-- `.runtime/protective_orders.json`은 런타임 상태 파일입니다. 백업/초기화 정책을 운영 환경에 맞춰 정하세요.
+- `runtime-vps`와 `runtime-prod`의 보호주문 상태 파일은 서로 분리됩니다. 백업/초기화 정책을 운영 환경에 맞춰 정하세요.
 
 #### 포함된 예시 전략
 
