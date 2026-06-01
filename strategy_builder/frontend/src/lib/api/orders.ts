@@ -172,6 +172,25 @@ export interface ProtectiveOrder {
   exit_reason?: string;
   exit_order_type?: ExitOrderType;
   last_error?: string;
+  app_exit_reservation_status?: "waiting_retry" | string;
+  app_exit_reserved_at?: string;
+  app_exit_reason?: string;
+  app_exit_reservation?: {
+    status?: string;
+    market?: "us";
+    env_dv?: string;
+    stock_code?: string;
+    exchange?: string | null;
+    quantity?: number;
+    exit_reason?: string;
+    order_type?: ExitOrderType;
+    limit_price?: number | null;
+    current_price?: number;
+    reserved_at?: string;
+    last_attempt_at?: string;
+    last_error?: string;
+    note?: string;
+  };
 }
 
 export interface ProtectiveOrdersResponse {

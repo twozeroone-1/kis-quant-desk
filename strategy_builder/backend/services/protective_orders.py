@@ -45,6 +45,12 @@ REALTIME_FRESH_SECONDS = 30
 POSITION_MISSING_CONFIRMATIONS = 3
 EXIT_SUBMIT_RETRY_SECONDS = 60
 US_PAPER_EXIT_RETRY_SECONDS = 900
+US_PAPER_LOCAL_RESERVATION_MARKERS = (
+    "90000000",
+    "40490000",
+    "모의투자에서는 해당업무가 제공되지 않습니다",
+    "모의투자 예약주문시간",
+)
 
 _monitor_task: Optional[asyncio.Task] = None
 _state_lock = asyncio.Lock()
@@ -194,11 +200,13 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
         return True
     retry_seconds = EXIT_SUBMIT_RETRY_SECONDS
     last_error = str(order.get("last_error") or "")
+    app_reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
     if (
         order.get("market") == "us"
         and order.get("env_dv") not in ("prod", "real")
         and (
-            "모의투자에서는 해당업무가 제공되지 않습니다" in last_error
+            app_reservation.get("status") == "waiting_retry"
+            or "모의투자에서는 해당업무가 제공되지 않습니다" in last_error
             or "모의투자 예약주문시간" in last_error
             or "초당 거래건수" in last_error
             or "EGW00201" in last_error
@@ -206,6 +214,74 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
     ):
         retry_seconds = US_PAPER_EXIT_RETRY_SECONDS
     return datetime.now() - failed_at >= timedelta(seconds=retry_seconds)
+
+
+def _should_create_local_us_paper_reservation(env_dv: str, market: str, error: Optional[str]) -> bool:
+    if market != "us" or env_dv in ("prod", "real") or not error:
+        return False
+    return any(marker in error for marker in US_PAPER_LOCAL_RESERVATION_MARKERS)
+
+
+def _mark_local_us_paper_reservation(
+    order: dict[str, Any],
+    *,
+    exit_reason: str,
+    order_type: str,
+    price: Optional[float],
+    current_price: float,
+    error: str,
+) -> None:
+    existing = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
+    reserved_at = existing.get("reserved_at") or _now()
+    reservation = {
+        "status": "waiting_retry",
+        "market": "us",
+        "env_dv": order.get("env_dv") or "vps",
+        "stock_code": order.get("stock_code"),
+        "exchange": order.get("exchange"),
+        "quantity": int(order.get("quantity") or 0),
+        "exit_reason": exit_reason,
+        "order_type": order_type,
+        "limit_price": price if order_type == "limit" else None,
+        "current_price": current_price,
+        "reserved_at": reserved_at,
+        "last_attempt_at": _now(),
+        "last_error": error,
+        "note": "KIS paper US sell/reservation was unavailable; Strategy Builder will retry from the app monitor.",
+    }
+    order["status"] = "active"
+    order["app_exit_reservation"] = reservation
+    order["app_exit_reservation_status"] = "waiting_retry"
+    order["app_exit_reserved_at"] = reserved_at
+    order["app_exit_reason"] = exit_reason
+    order["exit_submit_failed_at"] = _now()
+    order.pop("last_error", None)
+    order.pop("exit_submit_blocked", None)
+
+
+def _retry_local_exit_reservation(order: dict[str, Any], env_dv: str, current_price: float) -> dict[str, Any] | None:
+    reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
+    if reservation.get("status") != "waiting_retry":
+        return None
+    exit_reason = str(reservation.get("exit_reason") or order.get("app_exit_reason") or "stop_loss")
+    order_type = str(reservation.get("order_type") or order.get("stop_loss_order_type") or "limit")
+    if order_type not in {"market", "limit"}:
+        order_type = "limit"
+    price = reservation.get("limit_price")
+    if price in (None, ""):
+        price = current_price
+    return _submit_triggered_exit(
+        order,
+        env_dv,
+        reason=(
+            f"미국 모의 로컬 예약매도 재시도: {exit_reason}, "
+            f"현재가 {current_price}"
+        ),
+        exit_reason=exit_reason,
+        order_type=order_type,
+        price=float(price) if order_type == "limit" else None,
+        current_price=current_price,
+    )
 
 
 def _is_non_retryable_submit_error(error: Optional[str]) -> bool:
@@ -513,6 +589,10 @@ def _submit_triggered_exit(
         order.pop("last_error", None)
         order.pop("exit_submit_failed_at", None)
         order.pop("exit_submit_blocked", None)
+        order.pop("app_exit_reservation", None)
+        order.pop("app_exit_reservation_status", None)
+        order.pop("app_exit_reserved_at", None)
+        order.pop("app_exit_reason", None)
         order.setdefault("events", []).append({
             "type": f"{exit_reason}_submitted",
             "at": _now(),
@@ -522,6 +602,26 @@ def _submit_triggered_exit(
             "current_price": current_price,
         })
     else:
+        if _should_create_local_us_paper_reservation(env_dv, market, error):
+            detail = str(error or "")
+            _mark_local_us_paper_reservation(
+                order,
+                exit_reason=exit_reason,
+                order_type=order_type,
+                price=price if order_type == "limit" else None,
+                current_price=current_price,
+                error=detail,
+            )
+            order.setdefault("events", []).append({
+                "type": f"{exit_reason}_app_reserved",
+                "at": _now(),
+                "order_type": order_type,
+                "order_price": price if order_type == "limit" else None,
+                "current_price": current_price,
+                "error": detail,
+            })
+            return order
+
         detail = f": {error}" if error else ""
         order["last_error"] = f"{exit_reason} sell submit failed{detail}"
         order["exit_submit_failed_at"] = _now()
@@ -591,6 +691,9 @@ def _check_order_sync(order: dict[str, Any], env_dv: str) -> dict[str, Any]:
 
     order["last_price"] = current_price
     order["last_checked_at"] = _now()
+    retried = _retry_local_exit_reservation(order, env_dv, current_price)
+    if retried is not None:
+        return retried
 
     take_profit_trigger = float(order.get("take_profit_trigger_price") or order.get("take_profit_price") or 0)
     if (
@@ -639,6 +742,9 @@ def _check_realtime_trigger_sync(order: dict[str, Any], env_dv: str, current_pri
     order["last_price"] = current_price
     order["last_checked_at"] = _now()
     order["last_realtime_at"] = _now()
+    retried = _retry_local_exit_reservation(order, env_dv, current_price)
+    if retried is not None:
+        return retried
 
     take_profit_trigger = float(order.get("take_profit_trigger_price") or order.get("take_profit_price") or 0)
     if (

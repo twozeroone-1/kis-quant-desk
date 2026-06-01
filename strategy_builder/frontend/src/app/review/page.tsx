@@ -51,6 +51,7 @@ const parseNumber = (value: string): number | null => {
 };
 
 const orderTypeLabel = (value?: string) => (value === "market" ? "시장가" : "지정가");
+const exitReasonLabel = (value?: string) => (value === "take_profit" ? "익절" : value === "stop_loss" ? "손절" : "매도");
 
 const holdingKey = (market: ReviewMarket, holding: Pick<Holding, "stock_code" | "exchange">) =>
   `${market}:${holding.stock_code}:${holding.exchange || ""}`;
@@ -458,6 +459,7 @@ export default function ReviewPage() {
             const savedProtection = savedProtectionByKey.get(key);
             const activeProtection = activeProtectionByKey.get(key);
             const draft = drafts[key] || defaultDraft(holding, savedProtection, market);
+            const appReservation = activeProtection?.app_exit_reservation;
             const livePrice = livePrices[key]?.price;
             const displayPrice = livePrice || holding.current_price;
             const profitPositive = Number(holding.profit_rate) >= 0;
@@ -634,7 +636,17 @@ export default function ReviewPage() {
                     <span>익절 주문: {orderTypeLabel(activeProtection.take_profit_order_type)}</span>
                     <span>손절 주문: {orderTypeLabel(activeProtection.stop_loss_order_type)}</span>
                     <span>마지막 점검: {activeProtection.last_checked_at || "-"}</span>
-                    {activeProtection.last_error && <span className="text-red-600">오류: {activeProtection.last_error}</span>}
+                    {appReservation?.status === "waiting_retry" && (
+                      <span className="text-amber-600">
+                        로컬 예약매도 대기: {exitReasonLabel(appReservation.exit_reason)}{" "}
+                        {orderTypeLabel(appReservation.order_type)}
+                        {appReservation.limit_price ? ` ${formatMoney(appReservation.limit_price, currency)}` : ""} 재시도
+                      </span>
+                    )}
+                    {appReservation?.last_error && (
+                      <span className="text-slate-500">최근 KIS 응답: {appReservation.last_error}</span>
+                    )}
+                    {activeProtection.last_error && !appReservation && <span className="text-red-600">오류: {activeProtection.last_error}</span>}
                   </div>
                 )}
               </article>
