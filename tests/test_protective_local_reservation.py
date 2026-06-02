@@ -168,9 +168,25 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
             "app_exit_reservation": {"status": "broker_submitted"},
         }
 
-        self.assertFalse(protective_orders._exit_submit_retry_due(broker_submitted))
-        self.assertTrue(protective_orders._exit_submit_retry_due(waiting_retry))
-        self.assertTrue(protective_orders._exit_submit_retry_due(stale_broker_submitted))
+        with patch.object(protective_orders, "_is_us_regular_session_now", return_value=False):
+            self.assertFalse(protective_orders._exit_submit_retry_due(broker_submitted))
+            self.assertTrue(protective_orders._exit_submit_retry_due(waiting_retry))
+            self.assertTrue(protective_orders._exit_submit_retry_due(stale_broker_submitted))
+
+        with patch.object(protective_orders, "_is_us_regular_session_now", return_value=True):
+            self.assertFalse(protective_orders._exit_submit_retry_due(broker_submitted))
+
+    def test_broker_submitted_retries_during_us_regular_session(self):
+        old = (datetime.now() - timedelta(minutes=6)).isoformat(timespec="seconds")
+        broker_submitted = {
+            "market": "us",
+            "env_dv": "vps",
+            "exit_submit_failed_at": old,
+            "app_exit_reservation": {"status": "broker_submitted"},
+        }
+
+        with patch.object(protective_orders, "_is_us_regular_session_now", return_value=True):
+            self.assertTrue(protective_orders._exit_submit_retry_due(broker_submitted))
 
     def test_exit_submitted_retries_when_holding_still_present_without_pending(self):
         order = {

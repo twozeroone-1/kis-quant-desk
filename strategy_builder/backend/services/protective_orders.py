@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -46,6 +47,7 @@ POSITION_MISSING_CONFIRMATIONS = 3
 EXIT_SUBMIT_RETRY_SECONDS = 60
 US_PAPER_LOCAL_RESERVATION_RETRY_SECONDS = 60
 US_PAPER_BROKER_RESERVATION_RETRY_SECONDS = 6 * 60 * 60
+US_PAPER_BROKER_RESERVATION_REGULAR_RETRY_SECONDS = 5 * 60
 EXIT_PENDING_REPRICE_SECONDS = 60
 US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT = 2.0
 US_PAPER_LOCAL_RESERVATION_MARKERS = (
@@ -192,6 +194,17 @@ def _is_recent_realtime(order: dict[str, Any]) -> bool:
     return (datetime.now() - checked_at).total_seconds() <= REALTIME_FRESH_SECONDS
 
 
+def _is_us_regular_session_now() -> bool:
+    kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
+    current = kst_now.time()
+    weekday = kst_now.weekday()
+    if current >= datetime.strptime("22:30", "%H:%M").time():
+        return weekday <= 4
+    if current <= datetime.strptime("06:00", "%H:%M").time():
+        return 1 <= weekday <= 5
+    return False
+
+
 def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
     if order.get("exit_submit_blocked"):
         return False
@@ -208,6 +221,8 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
     if order.get("market") == "us" and order.get("env_dv") not in ("prod", "real"):
         if app_reservation.get("status") == "broker_submitted":
             retry_seconds = US_PAPER_BROKER_RESERVATION_RETRY_SECONDS
+            if _is_us_regular_session_now():
+                retry_seconds = US_PAPER_BROKER_RESERVATION_REGULAR_RETRY_SECONDS
         elif (
             app_reservation.get("status") == "waiting_retry"
             or "모의투자에서는 해당업무가 제공되지 않습니다" in last_error
