@@ -146,8 +146,9 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
         price = protective_orders._us_stop_loss_order_price(265.54, 261.26)
         self.assertEqual(price, 256.03)
 
-    def test_broker_submitted_uses_fast_retry_not_paper_error_backoff(self):
+    def test_us_paper_waiting_retry_is_fast_but_broker_reservation_is_not_duplicated(self):
         old = (datetime.now() - timedelta(seconds=61)).isoformat(timespec="seconds")
+        very_old = (datetime.now() - timedelta(hours=7)).isoformat(timespec="seconds")
         broker_submitted = {
             "market": "us",
             "env_dv": "vps",
@@ -160,9 +161,16 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
             "exit_submit_failed_at": old,
             "app_exit_reservation": {"status": "waiting_retry"},
         }
+        stale_broker_submitted = {
+            "market": "us",
+            "env_dv": "vps",
+            "exit_submit_failed_at": very_old,
+            "app_exit_reservation": {"status": "broker_submitted"},
+        }
 
-        self.assertTrue(protective_orders._exit_submit_retry_due(broker_submitted))
-        self.assertFalse(protective_orders._exit_submit_retry_due(waiting_retry))
+        self.assertFalse(protective_orders._exit_submit_retry_due(broker_submitted))
+        self.assertTrue(protective_orders._exit_submit_retry_due(waiting_retry))
+        self.assertTrue(protective_orders._exit_submit_retry_due(stale_broker_submitted))
 
     def test_exit_submitted_retries_when_holding_still_present_without_pending(self):
         order = {

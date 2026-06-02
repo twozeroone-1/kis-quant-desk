@@ -44,7 +44,8 @@ MAX_MONITOR_INTERVAL_SECONDS = 300
 REALTIME_FRESH_SECONDS = 30
 POSITION_MISSING_CONFIRMATIONS = 3
 EXIT_SUBMIT_RETRY_SECONDS = 60
-US_PAPER_EXIT_RETRY_SECONDS = 900
+US_PAPER_LOCAL_RESERVATION_RETRY_SECONDS = 60
+US_PAPER_BROKER_RESERVATION_RETRY_SECONDS = 6 * 60 * 60
 EXIT_PENDING_REPRICE_SECONDS = 60
 US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT = 2.0
 US_PAPER_LOCAL_RESERVATION_MARKERS = (
@@ -204,18 +205,17 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
     retry_seconds = EXIT_SUBMIT_RETRY_SECONDS
     last_error = str(order.get("last_error") or "")
     app_reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
-    if (
-        order.get("market") == "us"
-        and order.get("env_dv") not in ("prod", "real")
-        and (
+    if order.get("market") == "us" and order.get("env_dv") not in ("prod", "real"):
+        if app_reservation.get("status") == "broker_submitted":
+            retry_seconds = US_PAPER_BROKER_RESERVATION_RETRY_SECONDS
+        elif (
             app_reservation.get("status") == "waiting_retry"
             or "모의투자에서는 해당업무가 제공되지 않습니다" in last_error
             or "모의투자 예약주문시간" in last_error
             or "초당 거래건수" in last_error
             or "EGW00201" in last_error
-        )
-    ):
-        retry_seconds = US_PAPER_EXIT_RETRY_SECONDS
+        ):
+            retry_seconds = US_PAPER_LOCAL_RESERVATION_RETRY_SECONDS
     return datetime.now() - failed_at >= timedelta(seconds=retry_seconds)
 
 
