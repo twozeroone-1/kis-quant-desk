@@ -723,6 +723,8 @@ def get_pending_orders(env_dv: str = "real", exchange: str = "NASD") -> tuple[pd
         return pd.DataFrame(), False
     try:
         trenv = ka.getTREnv()
+        mode = normalize_env(env_dv)
+        tr_id = "TTTS3018R" if mode == "real" else "VTTS3018R"
         params = {
             "CANO": trenv.my_acct,
             "ACNT_PRDT_CD": trenv.my_prod,
@@ -733,7 +735,7 @@ def get_pending_orders(env_dv: str = "real", exchange: str = "NASD") -> tuple[pd
         }
         res = ka._url_fetch(
             "/uapi/overseas-stock/v1/trading/inquire-nccs",
-            "TTTS3018R",
+            tr_id,
             "",
             params,
         )

@@ -941,10 +941,12 @@ async def get_reservation_orders_api(
         raise HTTPException(status_code=400, detail="예약주문 방향이 올바르지 않습니다")
 
     if normalized_market == "us":
+        env_dv = get_current_mode()
         result = reserved_orders.list_us_reservations(
             start_date=start,
             end_date=end,
             exchange=exchange.strip().upper() or "NASD",
+            env_dv=env_dv,
         )
     else:
         result = reserved_orders.list_domestic_reservations(

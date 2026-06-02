@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -106,6 +107,107 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
         self.assertEqual(updated["status"], "exit_submitted")
         self.assertEqual(updated["exit_order_no"], "12345")
         self.assertNotIn("app_exit_reservation", updated)
+
+    def test_broker_reservation_success_keeps_us_paper_protection_active(self):
+        order = {
+            "id": "order-1",
+            "status": "active",
+            "env_dv": "vps",
+            "market": "us",
+            "exchange": "NASD",
+            "stock_code": "AMZN",
+            "stock_name": "Amazon.com",
+            "quantity": 1,
+            "stop_loss_order_type": "limit",
+            "events": [],
+        }
+
+        with patch.object(
+            protective_orders,
+            "_submit_exit_order",
+            return_value=("258", "reservation", True, None),
+        ):
+            updated = protective_orders._submit_triggered_exit(
+                order,
+                "vps",
+                reason="test stop",
+                exit_reason="stop_loss",
+                order_type="limit",
+                price=265.54,
+                current_price=261.26,
+            )
+
+        self.assertEqual(updated["status"], "active")
+        self.assertEqual(updated["app_exit_reservation_status"], "broker_submitted")
+        self.assertEqual(updated["app_exit_reservation"]["reservation_order_no"], "258")
+        self.assertEqual(updated["events"][-1]["type"], "stop_loss_reservation_submitted")
+
+    def test_us_stop_loss_uses_marketable_limit_below_current_price(self):
+        price = protective_orders._us_stop_loss_order_price(265.54, 261.26)
+        self.assertEqual(price, 256.03)
+
+    def test_broker_submitted_uses_fast_retry_not_paper_error_backoff(self):
+        old = (datetime.now() - timedelta(seconds=61)).isoformat(timespec="seconds")
+        broker_submitted = {
+            "market": "us",
+            "env_dv": "vps",
+            "exit_submit_failed_at": old,
+            "app_exit_reservation": {"status": "broker_submitted"},
+        }
+        waiting_retry = {
+            "market": "us",
+            "env_dv": "vps",
+            "exit_submit_failed_at": old,
+            "app_exit_reservation": {"status": "waiting_retry"},
+        }
+
+        self.assertTrue(protective_orders._exit_submit_retry_due(broker_submitted))
+        self.assertFalse(protective_orders._exit_submit_retry_due(waiting_retry))
+
+    def test_exit_submitted_retries_when_holding_still_present_without_pending(self):
+        order = {
+            "id": "order-1",
+            "status": "exit_submitted",
+            "env_dv": "prod",
+            "market": "us",
+            "exchange": "NASD",
+            "stock_code": "GOOGL",
+            "stock_name": "Alphabet A",
+            "quantity": 1,
+            "entry_price": 390.86,
+            "stop_loss_order_type": "limit",
+            "stop_loss_price": 379.13,
+            "stop_loss_limit_price": 379.13,
+            "exit_reason": "stop_loss",
+            "exit_order_type": "limit",
+            "exit_order_no": "254",
+            "exit_org_no": "",
+            "events": [],
+        }
+
+        with patch.object(
+            protective_orders,
+            "_get_holding_map",
+            return_value={"GOOGL": {"quantity": 1, "current_price": 366.56}},
+        ), patch.object(
+            protective_orders,
+            "_get_pending_order_map",
+            return_value={},
+        ), patch.object(
+            protective_orders,
+            "_current_order_price",
+            side_effect=lambda target, env_dv, holding: float(holding["current_price"]),
+        ), patch.object(
+            protective_orders,
+            "_submit_exit_order",
+            return_value=("255", "broker", True, None),
+        ):
+            updated = protective_orders._reconcile_exit_submitted_sync(order, "prod")
+
+        self.assertEqual(updated["status"], "exit_submitted")
+        self.assertEqual(updated["exit_order_no"], "255")
+        self.assertEqual(updated["events"][-2]["type"], "exit_retry_position_still_held")
+        self.assertEqual(updated["events"][-1]["type"], "stop_loss_submitted")
 
 
 if __name__ == "__main__":

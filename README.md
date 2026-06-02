@@ -133,6 +133,38 @@ graph LR
 | `backtester/` | 과거 검증 + 파라미터 최적화 | Docker 기반 QuantConnect Lean, HTML 리포트 ([README](backtester/README.md)) |
 | `MCP/` | AI 도구 연결 | KIS Code Assistant + Trading MCP ([README](MCP/README.MD)) |
 
+#### KIS Skills 동작 방식
+
+Codex 같은 코드 에이전트는 사용자 요청 문구를 보고 `.codex/skills/` 아래의 KIS 전용 Skill을 선택합니다. Skill은 직접 주문을 대신 보장하는 기능이 아니라, 어떤 API와 스크립트를 어떤 순서로 호출해야 하는지 정의한 운영 절차입니다. 실제 source of truth는 Strategy Builder API, 백테스터 MCP, KIS Open API 응답입니다.
+
+| 사용자 요청 예시 | 활성 Skill | 주 작업 |
+|------------------|------------|---------|
+| `전략 만들어줘`, `RSI 전략` | `kis-strategy-builder` | 프리셋 확인, 지표 조합, `.kis.yaml` 전략 생성 |
+| `백테스트 해줘`, `수익률 확인` | `kis-backtester` | 백테스터 MCP로 과거 성과, MDD, 샤프, 최적화 실행 |
+| `신호 확인`, `자동매매`, `주문 넣어줘` | `kis-order-executor` | BUY/SELL/HOLD 신호 확인 후 모의 주문 또는 실전 승인 절차 |
+| `예약주문`, `미국장 예약` | `kis-reservation-order` | `/api/orders/reservations` 계열 API로 예약 접수/조회/취소 |
+| `손절 설정`, `익절 설정`, `보호주문` | `kis-protective-order` | 보유종목 기준 앱 레벨 손익절 감시 설정과 점검 |
+| `한국장 3번 실행`, `매일 AI 트레이딩` | `kr-market-auto-run` | 한국장 후보 선정, 뉴스/LLM 판단, 주문, 보호주문, 리포트 |
+| `미국장 3번 실행`, `미국 모의 자동매매` | `us-market-auto-run` | 미국장 후보 선정, 신호 분리, 주문/예약, 보호주문 catch-up |
+| `잔고 확인`, `보유종목` | `my-status` | 계좌, 보유종목, 지수 상태 조회 |
+| `auth vps`, `auth prod` | `auth` | 모의/실전 인증 및 토큰 갱신 |
+
+**실행 순서**
+
+1. 요청 문구로 Skill을 고릅니다.
+2. Skill의 `SKILL.md`가 지정한 API, MCP 도구, 로컬 스크립트만 사용합니다.
+3. 모의/실전 모드를 확인합니다. 운영 판단은 `8081`(vps), `8083`(prod) 기준입니다.
+4. 주문 전에는 신호, 보유수량, 매수가능금액, 미체결, 보호주문 가능 여부를 확인합니다.
+5. 실전 주문, 실전 예약주문, 실전 보호주문 설정은 종목, 수량, 가격, 예상금액, 모드를 표시하고 사용자 확인을 받은 뒤 진행합니다.
+
+**안전 기준**
+
+- 기본값은 모의투자 `vps`입니다.
+- `8081`은 `builder-backend-vps`, `8083`은 `builder-backend-prod`입니다. `127.0.0.1:8000`은 컨테이너 내부 또는 개발용 포트일 수 있어 운영 상태 판단에 사용하지 않습니다.
+- `KIS_LOCK_MODE`로 `8081`은 실전 로그인, `8083`은 모의 로그인을 거부해야 합니다.
+- 보호주문은 KIS 서버 OCO가 아니라 Strategy Builder 앱 레벨 감시입니다. 백엔드, 인증, 네트워크가 중단되면 자동 감시도 중단될 수 있습니다.
+- 미국 모의투자 예약조회는 KIS 응답상 `OPSQ0002` 또는 `EGW00201`이 나올 수 있으므로, 자동화는 보유종목, 미체결, 보호주문 상태를 함께 보고 판단합니다.
+
 #### KIS Quant Desk 운영 포트
 
 KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도록 Strategy Builder 백엔드를 분리 운영합니다. 두 백엔드는 컨테이너 내부에서는 각각 `8000`을 사용하지만, 운영 판단은 Caddy가 노출하는 외부 포트 기준으로 합니다.

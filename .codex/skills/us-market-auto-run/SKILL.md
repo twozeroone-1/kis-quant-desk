@@ -51,8 +51,8 @@ This schedule intentionally works across US daylight-saving and standard-time se
    - `.codex/scripts/us_market_calendar.py --date YYYYMMDD --check-open`
    - If closed, fail closed: no orders, no LLM trading decision, write a market-closed report.
 2. Confirm backend/auth:
-   - `curl -s http://127.0.0.1:8000/api/auth/status`
-   - If down, start with `KIS_LOCK_MODE=vps`.
+   - `curl -s http://127.0.0.1:8081/api/auth/status`
+   - If down, start the `builder-backend-vps` service with `KIS_LOCK_MODE=vps`.
    - Authenticate with vps only.
 3. Fetch and summarize US-market news using the script's Google News RSS queries.
 4. Run the US news-aware EMA/ROC/RSI trend filter over the large-cap/ETF candidate basket.

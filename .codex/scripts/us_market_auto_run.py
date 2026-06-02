@@ -45,8 +45,11 @@ DAILY_LOSS_PCT = 0.005
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 MIN_BUY_STRENGTH = 0.70
+MIN_SELL_STRENGTH = 0.50
+MARKETABLE_SELL_LIMIT_BUFFER_PCT = 0.02
 MIN_SECONDS_BETWEEN_KIS_CALLS = 0.85
 US_EXCHANGES = ("NASD", "NYSE", "AMEX")
+ACTIVE_PROTECTION_STATUSES = {"active", "exit_submitted"}
 
 
 def _json_default(value: Any) -> Any:
@@ -234,6 +237,16 @@ def holdings_by_symbol(holdings: list[dict[str, Any]]) -> dict[str, dict[str, An
     return {str(row.get("stock_code")).upper(): row for row in holdings}
 
 
+def marketable_sell_limit(price: float) -> float:
+    return round(float(price) * (1 - MARKETABLE_SELL_LIMIT_BUFFER_PCT), 2) if price > 0 else 0.0
+
+
+def clear_balance_cache(odf) -> None:
+    clear = getattr(odf, "clear_balance_cache", None)
+    if callable(clear):
+        clear()
+
+
 def list_pending_by_exchange(odf) -> dict[str, Any]:
     data: dict[str, Any] = {"status": "success", "orders": [], "errors": []}
     for exchange in US_EXCHANGES:
@@ -254,7 +267,12 @@ def list_reservations_by_exchange(reserved_orders) -> dict[str, Any]:
     today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
     data: dict[str, Any] = {"status": "success", "orders": [], "errors": []}
     for exchange in US_EXCHANGES:
-        result = reserved_orders.list_us_reservations(start_date=today, end_date=today, exchange=exchange)
+        result = reserved_orders.list_us_reservations(
+            start_date=today,
+            end_date=today,
+            exchange=exchange,
+            env_dv="vps",
+        )
         time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
         if not result.success:
             data["errors"].append({
@@ -383,7 +401,7 @@ def place_sells(signals: list[dict[str, Any]], holdings: list[dict[str, Any]], o
     held = holdings_by_symbol(holdings)
     submitted = []
     for signal in signals:
-        if signal.get("action") != "SELL" or float(signal.get("strength") or 0) < MIN_BUY_STRENGTH:
+        if signal.get("action") != "SELL" or float(signal.get("strength") or 0) < MIN_SELL_STRENGTH:
             continue
         symbol = str(signal.get("symbol")).upper()
         holding = held.get(symbol)
@@ -392,7 +410,12 @@ def place_sells(signals: list[dict[str, Any]], holdings: list[dict[str, Any]], o
             signal["order_status"] = "skipped_no_holding"
             submitted.append(signal)
             continue
-        price = float(signal.get("price") or (holding or {}).get("current_price") or 0)
+        reference_price = float(signal.get("price") or (holding or {}).get("current_price") or 0)
+        price = marketable_sell_limit(reference_price)
+        if price <= 0:
+            signal["order_status"] = "skipped_no_price"
+            submitted.append(signal)
+            continue
         result = odf.submit_order(
             symbol=symbol,
             action="SELL",
@@ -416,6 +439,7 @@ def place_sells(signals: list[dict[str, Any]], holdings: list[dict[str, Any]], o
 
 def wait_for_holding(odf, symbol: str, exchange: str, min_qty: int, attempts: int = 30) -> dict[str, Any] | None:
     for _ in range(attempts):
+        clear_balance_cache(odf)
         holdings_df = odf.get_holdings("vps")
         if not holdings_df.empty:
             for _, row in holdings_df.iterrows():
@@ -543,12 +567,80 @@ async def place_orders(
     return submitted
 
 
+def state_order_symbols(state: dict[str, Any]) -> set[str]:
+    return {
+        str(order.get("symbol")).upper()
+        for order in state.get("orders", [])
+        if order.get("order_status") in {"submitted", "reservation_submitted"}
+        and order.get("symbol")
+    }
+
+
+def active_protection_symbols(protective_payload: dict[str, Any]) -> set[str]:
+    orders = protective_payload.get("orders", []) if isinstance(protective_payload, dict) else []
+    return {
+        str(order.get("stock_code")).upper()
+        for order in orders
+        if str(order.get("market") or "domestic") == "us"
+        and str(order.get("env_dv") or "vps") == "vps"
+        and order.get("status") in ACTIVE_PROTECTION_STATUSES
+        and order.get("stop_loss_enabled")
+        and order.get("stock_code")
+    }
+
+
+async def register_missing_protection_for_holdings(
+    holdings: list[dict[str, Any]],
+    protective_payload: dict[str, Any],
+    upsert_protection,
+    eligible_symbols: set[str],
+) -> list[dict[str, Any]]:
+    protected = active_protection_symbols(protective_payload)
+    protections: list[dict[str, Any]] = []
+    for row in holdings:
+        symbol = str(row.get("stock_code")).upper()
+        if not symbol or symbol in protected or symbol not in eligible_symbols:
+            continue
+        qty = int(float(row.get("quantity") or 0))
+        entry_price = float(row.get("avg_price") or row.get("current_price") or 0)
+        if qty <= 0 or entry_price <= 0:
+            continue
+        exchange = str(row.get("exchange") or "NASD")
+        try:
+            protection = await upsert_protection(
+                env_dv="vps",
+                stock_code=symbol,
+                stock_name=str(row.get("stock_name") or symbol),
+                quantity=qty,
+                entry_price=entry_price,
+                enabled=True,
+                take_profit_enabled=True,
+                take_profit_trigger_price=round(entry_price * (1 + TAKE_PROFIT_PCT), 2),
+                take_profit_order_type="limit",
+                take_profit_limit_price=round(entry_price * (1 + TAKE_PROFIT_PCT), 2),
+                stop_loss_enabled=True,
+                stop_loss_trigger_price=round(entry_price * (1 - STOP_LOSS_PCT), 2),
+                stop_loss_order_type="limit",
+                stop_loss_limit_price=round(entry_price * (1 - STOP_LOSS_PCT), 2),
+                market="us",
+                exchange=exchange,
+                currency="USD",
+            )
+            protections.append({"status": "success", "stock_code": symbol, "protection": protection})
+            protected.add(symbol)
+        except Exception as exc:
+            protections.append({"status": "error", "stock_code": symbol, "message": str(exc)})
+        time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
+    return protections
+
+
 def write_report(path: Path, payload: dict[str, Any]) -> None:
     planned_rows = payload.get("planned_buys_display", payload.get("planned_buys", []))
     post_rows = payload.get("account_after", {}).get("holdings", payload.get("account", {}).get("holdings", []))
     protective_orders = payload.get("account_after", {}).get("protective", {}).get("orders", [])
     pending_count = payload.get("account_after", {}).get("pending", {}).get("total_count", 0)
     reservation_status = payload.get("account_after", {}).get("reservations", {}).get("status", "unknown")
+    catchup_protections = payload.get("catchup_protections", [])
     lines = [
         f"# US Market Auto Run - {payload['slot']}",
         "",
@@ -621,6 +713,14 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
             f"{order.get('order_status')} | ${float(order.get('take_profit') or 0):.2f} | "
             f"${float(order.get('stop_loss') or 0):.2f} | {order.get('protection_status', '')} | {order.get('last_error') or ''} |"
         )
+    if catchup_protections:
+        lines.extend(["", "## Catch-Up Protections", "| Symbol | Status | Protection Status | Error |", "|---|---|---|---|"])
+        for item in catchup_protections:
+            protection = item.get("protection") if isinstance(item.get("protection"), dict) else {}
+            lines.append(
+                f"| {item.get('stock_code')} | {item.get('status')} | "
+                f"{protection.get('status', '')} | {item.get('message', '')} |"
+            )
     lines.extend([
         "",
         "## Post-Fill Status",
@@ -726,6 +826,7 @@ async def main() -> int:
     equity = float(account_before["equity"])
     cash = float(account_before["cash"])
     holdings = account_before["holdings"]
+    before_symbols = set(holdings_by_symbol(holdings).keys())
     candidate_selection = select_us_candidates(
         ranking_fetcher=odf,
         holdings=holdings,
@@ -792,7 +893,23 @@ async def main() -> int:
         upsert_protection,
         use_reservations=not regular_hours,
     )
+    clear_balance_cache(odf)
     account_after = await account_status(odf, reserved_orders, list_protective_orders)
+    eligible_protection_symbols = (
+        before_symbols
+        | {str(item.get("symbol") or item.get("code")).upper() for item in candidate_selection.get("selected", [])}
+        | state_order_symbols(state)
+        | {str(order.get("symbol")).upper() for order in submitted_orders if order.get("symbol")}
+    )
+    catchup_protections = await register_missing_protection_for_holdings(
+        account_after["holdings"],
+        account_after.get("protective", {}),
+        upsert_protection,
+        eligible_protection_symbols,
+    )
+    if catchup_protections:
+        clear_balance_cache(odf)
+        account_after = await account_status(odf, reserved_orders, list_protective_orders)
     planned_display = annotate_llm_decisions(planned_orders, executable_orders, args.llm_mode)
 
     payload = {
@@ -801,6 +918,7 @@ async def main() -> int:
         "planned_order_method": "미국 모의 일반 지정가" if regular_hours else "미국 모의 예약매수 limit",
         "planned_buys_display": planned_display,
         "orders": submitted_orders,
+        "catchup_protections": catchup_protections,
         "account_after": account_after,
     }
 

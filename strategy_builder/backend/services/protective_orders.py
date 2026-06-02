@@ -45,12 +45,15 @@ REALTIME_FRESH_SECONDS = 30
 POSITION_MISSING_CONFIRMATIONS = 3
 EXIT_SUBMIT_RETRY_SECONDS = 60
 US_PAPER_EXIT_RETRY_SECONDS = 900
+EXIT_PENDING_REPRICE_SECONDS = 60
+US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT = 2.0
 US_PAPER_LOCAL_RESERVATION_MARKERS = (
     "90000000",
     "40490000",
     "모의투자에서는 해당업무가 제공되지 않습니다",
     "모의투자 예약주문시간",
 )
+US_PAPER_LOCAL_RESERVATION_RETRY_STATUS = "waiting_retry"
 
 _monitor_task: Optional[asyncio.Task] = None
 _state_lock = asyncio.Lock()
@@ -259,9 +262,51 @@ def _mark_local_us_paper_reservation(
     order.pop("exit_submit_blocked", None)
 
 
+def _mark_broker_us_paper_reservation(
+    order: dict[str, Any],
+    *,
+    exit_reason: str,
+    order_type: str,
+    price: Optional[float],
+    current_price: float,
+    order_no: Optional[str],
+) -> None:
+    existing = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
+    reserved_at = existing.get("reserved_at") or _now()
+    reservation = {
+        "status": "broker_submitted",
+        "market": "us",
+        "env_dv": order.get("env_dv") or "vps",
+        "stock_code": order.get("stock_code"),
+        "exchange": order.get("exchange"),
+        "quantity": int(order.get("quantity") or 0),
+        "exit_reason": exit_reason,
+        "order_type": order_type,
+        "limit_price": price if order_type == "limit" else None,
+        "current_price": current_price,
+        "reserved_at": reserved_at,
+        "last_attempt_at": _now(),
+        "reservation_order_no": str(order_no or ""),
+        "note": "KIS paper US reservation was accepted; Strategy Builder will keep monitoring until the holding disappears.",
+    }
+    order["status"] = "active"
+    order["app_exit_reservation"] = reservation
+    order["app_exit_reservation_status"] = "broker_submitted"
+    order["app_exit_reserved_at"] = reserved_at
+    order["app_exit_reason"] = exit_reason
+    order["exit_order_no"] = str(order_no or "")
+    order["exit_org_no"] = "reservation"
+    order["exit_reason"] = exit_reason
+    order["exit_order_type"] = order_type
+    order["exit_submit_failed_at"] = _now()
+    order.pop("closed_at", None)
+    order.pop("last_error", None)
+    order.pop("exit_submit_blocked", None)
+
+
 def _retry_local_exit_reservation(order: dict[str, Any], env_dv: str, current_price: float) -> dict[str, Any] | None:
     reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
-    if reservation.get("status") != "waiting_retry":
+    if reservation.get("status") != US_PAPER_LOCAL_RESERVATION_RETRY_STATUS:
         return None
     exit_reason = str(reservation.get("exit_reason") or order.get("app_exit_reason") or "stop_loss")
     order_type = str(reservation.get("order_type") or order.get("stop_loss_order_type") or "limit")
@@ -282,6 +327,159 @@ def _retry_local_exit_reservation(order: dict[str, Any], env_dv: str, current_pr
         price=float(price) if order_type == "limit" else None,
         current_price=current_price,
     )
+
+
+def _order_timestamp(order: dict[str, Any], *keys: str) -> Optional[datetime]:
+    for key in keys:
+        value = order.get(key)
+        if not value:
+            continue
+        try:
+            return datetime.fromisoformat(str(value))
+        except ValueError:
+            continue
+    return None
+
+
+def _current_order_price(order: dict[str, Any], env_dv: str, holding: dict[str, Any]) -> float:
+    market = str(order.get("market") or "domestic")
+    if market == "us":
+        price_info = overseas_data_fetcher.get_current_price(
+            str(order["stock_code"]),
+            env_dv,
+            order.get("exchange"),
+        )
+    else:
+        price_info = data_fetcher.get_current_price(str(order["stock_code"]), env_dv)
+    current_price = float(price_info.get("price") or holding.get("current_price") or order.get("last_price") or 0)
+    if current_price > 0:
+        order["last_price"] = current_price
+        order["last_checked_at"] = _now()
+    return current_price
+
+
+def _us_stop_loss_order_price(configured_price: Optional[float], current_price: float) -> float:
+    if current_price <= 0:
+        return float(configured_price or 0)
+    marketable_price = current_price * (1 - US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT / 100)
+    if configured_price and configured_price > 0:
+        marketable_price = min(float(configured_price), marketable_price)
+    return _round_price("us", marketable_price, "down")
+
+
+def _reconcile_exit_submitted_sync(order: dict[str, Any], env_dv: str) -> dict[str, Any]:
+    if order.get("status") != "exit_submitted":
+        return order
+
+    market = str(order.get("market") or "domestic")
+    holdings = _get_holding_map(env_dv, market)
+    if not holdings:
+        order["last_checked_at"] = _now()
+        order["last_error"] = "holdings unavailable or empty; submitted exit preserved"
+        return order
+
+    holding = holdings.get(str(order.get("stock_code")))
+    if not holding or int(holding.get("quantity") or 0) <= 0:
+        order["status"] = "closed"
+        order["closed_at"] = _now()
+        order["last_checked_at"] = _now()
+        order.pop("last_error", None)
+        order.setdefault("events", []).append({"type": "position_closed_after_exit_submit", "at": _now()})
+        return order
+
+    order["quantity"] = min(int(order.get("quantity") or 0), int(holding.get("quantity") or 0))
+    order["last_checked_at"] = _now()
+    if market == "us" and env_dv not in ("prod", "real") and order.get("exit_org_no") == "reservation":
+        previous_exit_attempt_at = (
+            order.get("exit_submitted_at")
+            or order.get("closed_at")
+            or order.get("exit_submit_failed_at")
+        )
+        _mark_broker_us_paper_reservation(
+            order,
+            exit_reason=str(order.get("exit_reason") or "stop_loss"),
+            order_type=str(order.get("exit_order_type") or order.get("stop_loss_order_type") or "limit"),
+            price=(
+                float(order.get("stop_loss_limit_price") or order.get("stop_loss_price") or 0)
+                if order.get("exit_order_type", order.get("stop_loss_order_type")) == "limit"
+                else None
+            ),
+            current_price=float(holding.get("current_price") or order.get("last_price") or 0),
+            order_no=str(order.get("exit_order_no") or ""),
+        )
+        order["exit_submit_failed_at"] = previous_exit_attempt_at or _now()
+        order.setdefault("events", []).append({
+            "type": "exit_reopened_position_still_held",
+            "at": _now(),
+            "current_price": float(holding.get("current_price") or order.get("last_price") or 0),
+            "reason": "reservation exit was submitted but holding is still present",
+        })
+        return order
+
+    pending = _get_pending_order_map(env_dv, market, order.get("exchange"))
+    exit_order_no = str(order.get("exit_order_no") or "")
+    pending_exit = pending.get(exit_order_no)
+    exit_reason = str(order.get("exit_reason") or "stop_loss")
+    current_price = _current_order_price(order, env_dv, holding)
+
+    if pending_exit and exit_reason == "stop_loss":
+        submitted_at = _order_timestamp(order, "exit_submitted_at", "closed_at")
+        if submitted_at and datetime.now() - submitted_at < timedelta(seconds=EXIT_PENDING_REPRICE_SECONDS):
+            order["last_error"] = "exit order pending; waiting before repricing"
+            return order
+
+        if market == "us":
+            cancel_result = overseas_data_fetcher.cancel_order(
+                order_no=exit_order_no,
+                symbol=str(order["stock_code"]),
+                qty=int(order["quantity"]),
+                env_dv=env_dv,
+                exchange=order.get("exchange"),
+            )
+        else:
+            cancel_result = cancel_order(
+                order_no=exit_order_no,
+                org_no=str(order.get("exit_org_no") or ""),
+                stock_code=str(order["stock_code"]),
+                qty=int(order["quantity"]),
+                env_dv=env_dv,
+            )
+        order.setdefault("events", []).append({
+            "type": "exit_pending_cancel_for_reprice",
+            "at": _now(),
+            "order_no": exit_order_no,
+            "current_price": current_price,
+            "result": cancel_result,
+        })
+        if not cancel_result.get("success"):
+            order["last_error"] = f"exit pending cancel failed: {cancel_result.get('message')}"
+            return order
+
+    if exit_reason == "stop_loss" and current_price > 0:
+        order["status"] = "active"
+        order["exit_submit_failed_at"] = None
+        order.pop("closed_at", None)
+        order.setdefault("events", []).append({
+            "type": "exit_retry_position_still_held",
+            "at": _now(),
+            "current_price": current_price,
+            "reason": "exit submitted but holding is still present",
+        })
+        return _submit_triggered_exit(
+            order,
+            env_dv,
+            reason=(
+                f"보호주문 손절 재시도: 현재가 {current_price}, "
+                "기존 청산 주문 후에도 보유 잔량 확인"
+            ),
+            exit_reason="stop_loss",
+            order_type=str(order.get("stop_loss_order_type") or order.get("exit_order_type") or "market"),
+            price=float(order.get("stop_loss_limit_price") or order.get("stop_loss_price") or current_price),
+            current_price=current_price,
+        )
+
+    order["last_error"] = "exit submitted but holding is still present"
+    return order
 
 
 def _is_non_retryable_submit_error(error: Optional[str]) -> bool:
@@ -565,8 +763,7 @@ def _submit_triggered_exit(
         order_type = "limit"
         price = current_price
     if market == "us" and exit_reason == "stop_loss" and order_type == "limit":
-        limit_price = float(price or current_price)
-        price = min(limit_price, current_price)
+        price = _us_stop_loss_order_price(float(price or 0), current_price)
 
     order_no, org_no, ok, error = _submit_exit_order(
         env_dv=env_dv,
@@ -580,15 +777,35 @@ def _submit_triggered_exit(
         reason=reason,
     )
     if ok:
+        if market == "us" and env_dv not in ("prod", "real") and org_no == "reservation":
+            _mark_broker_us_paper_reservation(
+                order,
+                exit_reason=exit_reason,
+                order_type=order_type,
+                price=price if order_type == "limit" else None,
+                current_price=current_price,
+                order_no=order_no,
+            )
+            order.setdefault("events", []).append({
+                "type": f"{exit_reason}_reservation_submitted",
+                "at": _now(),
+                "order_no": order_no,
+                "order_type": order_type,
+                "order_price": price if order_type == "limit" else None,
+                "current_price": current_price,
+            })
+            return order
+
         order["status"] = "exit_submitted"
         order["exit_order_no"] = order_no
         order["exit_org_no"] = org_no
         order["exit_reason"] = exit_reason
         order["exit_order_type"] = order_type
-        order["closed_at"] = _now()
+        order["exit_submitted_at"] = _now()
         order.pop("last_error", None)
         order.pop("exit_submit_failed_at", None)
         order.pop("exit_submit_blocked", None)
+        order.pop("closed_at", None)
         order.pop("app_exit_reservation", None)
         order.pop("app_exit_reservation_status", None)
         order.pop("app_exit_reserved_at", None)
@@ -984,6 +1201,24 @@ async def run_monitor_cycle() -> None:
     updated_orders = []
 
     for order in state.get("orders", []):
+        if order.get("status") == "exit_submitted":
+            try:
+                before = json.dumps(order, sort_keys=True, default=str)
+                updated = await asyncio.to_thread(
+                    _reconcile_exit_submitted_sync,
+                    order,
+                    str(order.get("env_dv") or "vps"),
+                )
+                updated_orders.append(updated)
+                changed = changed or json.dumps(updated, sort_keys=True, default=str) != before
+            except Exception as exc:
+                order["last_error"] = str(exc)
+                order["last_checked_at"] = _now()
+                updated_orders.append(order)
+                changed = True
+                logger.exception("protective exit reconciliation failed")
+            continue
+
         if order.get("status") != "active":
             updated_orders.append(order)
             continue

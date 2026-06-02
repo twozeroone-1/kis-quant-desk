@@ -350,11 +350,13 @@ def list_us_reservations(
     end_date: str,
     exchange: str = "NASD",
     inquiry_division: str = "00",
+    env_dv: str = "real",
 ) -> ReservedOrderResult:
     if not _assert_trenv_ready("미국 예약주문 조회"):
         return ReservedOrderResult(pd.DataFrame(), False, error_message="KIS API 인증이 필요합니다")
 
     trenv = ka.getTREnv()
+    mode = _normalize_env(env_dv)
     params = {
         "CANO": trenv.my_acct,
         "ACNT_PRDT_CD": trenv.my_prod,
@@ -366,7 +368,8 @@ def list_us_reservations(
         "CTX_AREA_FK200": "",
         "CTX_AREA_NK200": "",
     }
-    return _fetch(api_url=OVERSEAS_RESERVE_LIST_API, tr_id="TTTT3039R", params=params)
+    tr_id = "TTTT3039R" if mode == "real" else "VTTT3039R"
+    return _fetch(api_url=OVERSEAS_RESERVE_LIST_API, tr_id=tr_id, params=params)
 
 
 def cancel_us_reservation(

@@ -57,8 +57,8 @@ For a same-day request:
    - `.codex/scripts/kr_market_calendar.py --date YYYYMMDD --check-open`
    - If closed or unknown, fail closed: no orders, no LLM trading decision, report the original calendar status/error.
 2. Confirm backend/auth:
-   - `curl -s http://127.0.0.1:8000/api/auth/status`
-   - If down, start with `KIS_LOCK_MODE=vps`.
+   - `curl -s http://127.0.0.1:8081/api/auth/status`
+   - If down, start the `builder-backend-vps` service with `KIS_LOCK_MODE=vps`.
    - Authenticate with `POST /api/auth/login {"mode":"vps"}`.
 3. Fetch and summarize Korean-market news using the script's Google News RSS queries.
 4. Run `custom:today_krx_macro_rebound` over the domestic large-cap/ETF candidate basket.
