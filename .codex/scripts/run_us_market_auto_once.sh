@@ -11,7 +11,7 @@ if [[ -f "$LOCAL_ENV" ]]; then
 fi
 API_BASE="${KIS_VPS_STRATEGY_API:-http://127.0.0.1:8081}"
 export KIS_STRATEGY_API="$API_BASE"
-export US_MARKET_LLM_MODE="${US_MARKET_LLM_MODE:-live-vps}"
+export US_MARKET_LLM_MODE="${US_MARKET_LLM_MODE:-off}"
 export KIS_CONFIG_ROOT="/home/from0to01/KIS/config"
 export KIS_TOKEN_ROOT="/home/from0to01/.local/state/kis-stack/token-vps"
 export KIS_MODE_FILE="$KIS_TOKEN_ROOT/KIS_MODE"

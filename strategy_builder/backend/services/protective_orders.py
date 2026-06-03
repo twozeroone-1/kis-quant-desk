@@ -46,15 +46,18 @@ REALTIME_FRESH_SECONDS = 30
 POSITION_MISSING_CONFIRMATIONS = 3
 EXIT_SUBMIT_RETRY_SECONDS = 60
 US_PAPER_LOCAL_RESERVATION_RETRY_SECONDS = 60
-US_PAPER_BROKER_RESERVATION_RETRY_SECONDS = 6 * 60 * 60
-US_PAPER_BROKER_RESERVATION_REGULAR_RETRY_SECONDS = 5 * 60
 EXIT_PENDING_REPRICE_SECONDS = 60
 US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT = 2.0
+US_PAPER_RATE_LIMIT_BASE_SECONDS = 1
+US_PAPER_RATE_LIMIT_MAX_SECONDS = 60
+US_PAPER_DIRECT_SELL_UNSUPPORTED_PATH = "us_paper_direct_sell"
 US_PAPER_LOCAL_RESERVATION_MARKERS = (
     "90000000",
     "40490000",
+    "EGW00201",
     "모의투자에서는 해당업무가 제공되지 않습니다",
     "모의투자 예약주문시간",
+    "초당 거래건수",
 )
 US_PAPER_LOCAL_RESERVATION_RETRY_STATUS = "waiting_retry"
 
@@ -64,6 +67,163 @@ _state_lock = asyncio.Lock()
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _is_us_paper_order(order: dict[str, Any]) -> bool:
+    return str(order.get("market") or "domestic") == "us" and order.get("env_dv") not in ("prod", "real")
+
+
+def _normalize_unsupported_paths(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return sorted({str(item) for item in value if item})
+    if isinstance(value, str) and value:
+        return [value]
+    return []
+
+
+def _normalize_runtime_order(order: dict[str, Any]) -> dict[str, Any]:
+    order["retry_count"] = max(0, int(order.get("retry_count") or 0))
+    order["last_error_code"] = order.get("last_error_code") or None
+    order["next_retry_at"] = order.get("next_retry_at") or None
+    order["unsupported_paths"] = _normalize_unsupported_paths(order.get("unsupported_paths"))
+    reservation = order.get("app_exit_reservation")
+    if isinstance(reservation, dict):
+        reservation.setdefault("retry_count", order["retry_count"])
+        reservation.setdefault("last_error_code", order["last_error_code"])
+        reservation.setdefault("next_retry_at", order["next_retry_at"])
+        reservation.setdefault("unsupported_paths", list(order["unsupported_paths"]))
+    return order
+
+
+def _error_has(error: Optional[str], *markers: str) -> bool:
+    text = str(error or "")
+    return any(marker in text for marker in markers)
+
+
+def _us_paper_error_code(error: Optional[str]) -> Optional[str]:
+    text = str(error or "")
+    if "EGW00201" in text or "초당 거래건수" in text:
+        return "EGW00201"
+    if "40490000" in text or "모의투자 예약주문시간" in text:
+        return "40490000"
+    if "90000000" in text or "모의투자에서는 해당업무가 제공되지 않습니다" in text:
+        return "90000000"
+    return None
+
+
+def _is_us_paper_direct_sell_unsupported(error: Optional[str]) -> bool:
+    return _error_has(error, "90000000", "모의투자에서는 해당업무가 제공되지 않습니다")
+
+
+def _is_us_paper_reservation_time_error(error: Optional[str]) -> bool:
+    return _error_has(error, "40490000", "모의투자 예약주문시간")
+
+
+def _is_us_paper_rate_limit_error(error: Optional[str]) -> bool:
+    return _error_has(error, "EGW00201", "초당 거래건수")
+
+
+def _next_weekday_at(now: datetime, hour: int, minute: int) -> datetime:
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    while target.weekday() >= 5:
+        target += timedelta(days=1)
+    return target
+
+
+def _us_reservation_cutoff_time(now: datetime):
+    try:
+        kst_now = now.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        ny_now = kst_now.astimezone(ZoneInfo("America/New_York"))
+        is_dst = bool(ny_now.dst())
+    except Exception:
+        is_dst = True
+    return datetime.strptime("22:20" if is_dst else "23:20", "%H:%M").time()
+
+
+def _next_us_paper_reservation_retry_at(now: Optional[datetime] = None) -> datetime:
+    now = now or datetime.now()
+    start = datetime.strptime("10:00", "%H:%M").time()
+    settle_start = datetime.strptime("16:30", "%H:%M").time()
+    settle_end = datetime.strptime("16:45", "%H:%M").time()
+    cutoff = _us_reservation_cutoff_time(now)
+    current = now.time()
+
+    if now.weekday() >= 5 or current >= cutoff:
+        return _next_weekday_at(now, 10, 0)
+    if current < start:
+        return now.replace(hour=10, minute=0, second=0, microsecond=0)
+    if settle_start <= current < settle_end:
+        return now.replace(hour=16, minute=45, second=0, microsecond=0)
+    return now + timedelta(minutes=30)
+
+
+def _rate_limit_retry_seconds(retry_count: int) -> int:
+    retry_count = max(1, int(retry_count or 1))
+    return min(US_PAPER_RATE_LIMIT_MAX_SECONDS, US_PAPER_RATE_LIMIT_BASE_SECONDS * (2 ** (retry_count - 1)))
+
+
+def _set_next_retry_at(order: dict[str, Any], next_retry_at: Optional[datetime]) -> None:
+    order["next_retry_at"] = next_retry_at.isoformat(timespec="seconds") if next_retry_at else None
+    reservation = order.get("app_exit_reservation")
+    if isinstance(reservation, dict):
+        reservation["next_retry_at"] = order["next_retry_at"]
+
+
+def _set_unsupported_path(order: dict[str, Any], path: str) -> None:
+    paths = set(_normalize_unsupported_paths(order.get("unsupported_paths")))
+    paths.add(path)
+    order["unsupported_paths"] = sorted(paths)
+    reservation = order.get("app_exit_reservation")
+    if isinstance(reservation, dict):
+        reservation["unsupported_paths"] = list(order["unsupported_paths"])
+
+
+def _clear_submit_retry_state(order: dict[str, Any]) -> None:
+    order["retry_count"] = 0
+    order["last_error_code"] = None
+    _set_next_retry_at(order, None)
+    reservation = order.get("app_exit_reservation")
+    if isinstance(reservation, dict):
+        reservation["retry_count"] = 0
+        reservation["last_error_code"] = None
+
+
+def _apply_us_paper_submit_error_policy(order: dict[str, Any], error: Optional[str]) -> None:
+    if not _is_us_paper_order(order):
+        return
+    _normalize_runtime_order(order)
+    if _is_us_paper_direct_sell_unsupported(error):
+        _set_unsupported_path(order, US_PAPER_DIRECT_SELL_UNSUPPORTED_PATH)
+
+    code = _us_paper_error_code(error)
+    order["last_error_code"] = code
+    order["retry_count"] = int(order.get("retry_count") or 0) + 1
+
+    if _is_us_paper_rate_limit_error(error):
+        delay = _rate_limit_retry_seconds(order["retry_count"])
+        next_retry = datetime.now() + timedelta(seconds=delay)
+    elif _is_us_paper_reservation_time_error(error):
+        next_retry = _next_us_paper_reservation_retry_at()
+    else:
+        next_retry = datetime.now() + timedelta(seconds=US_PAPER_LOCAL_RESERVATION_RETRY_SECONDS)
+    _set_next_retry_at(order, next_retry)
+
+    reservation = order.get("app_exit_reservation")
+    if isinstance(reservation, dict):
+        reservation["retry_count"] = order["retry_count"]
+        reservation["last_error_code"] = order["last_error_code"]
+        reservation["unsupported_paths"] = list(order["unsupported_paths"])
 
 
 def _get_tick_size(price: int) -> int:
@@ -116,6 +276,11 @@ def _load_state_sync() -> dict[str, Any]:
         if isinstance(data, dict) and isinstance(data.get("orders"), list):
             settings = data.get("settings") if isinstance(data.get("settings"), dict) else {}
             interval = settings.get("monitor_interval_seconds", DEFAULT_MONITOR_INTERVAL_SECONDS)
+            data["orders"] = [
+                _normalize_runtime_order(order)
+                for order in data.get("orders", [])
+                if isinstance(order, dict)
+            ]
             data["settings"] = {
                 **settings,
                 "monitor_interval_seconds": _normalize_monitor_interval(interval),
@@ -206,8 +371,20 @@ def _is_us_regular_session_now() -> bool:
 
 
 def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
+    _normalize_runtime_order(order)
     if order.get("exit_submit_blocked"):
         return False
+    app_reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
+    if (
+        order.get("market") == "us"
+        and order.get("env_dv") not in ("prod", "real")
+        and app_reservation.get("status") == "broker_submitted"
+        and (app_reservation.get("reservation_order_no") or order.get("exit_order_no"))
+    ):
+        return False
+    retry_at = _parse_time(order.get("next_retry_at"))
+    if retry_at:
+        return datetime.now() >= retry_at
     value = order.get("exit_submit_failed_at")
     if not value:
         return True
@@ -217,13 +394,8 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
         return True
     retry_seconds = EXIT_SUBMIT_RETRY_SECONDS
     last_error = str(order.get("last_error") or "")
-    app_reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
     if order.get("market") == "us" and order.get("env_dv") not in ("prod", "real"):
-        if app_reservation.get("status") == "broker_submitted":
-            retry_seconds = US_PAPER_BROKER_RESERVATION_RETRY_SECONDS
-            if _is_us_regular_session_now():
-                retry_seconds = US_PAPER_BROKER_RESERVATION_REGULAR_RETRY_SECONDS
-        elif (
+        if (
             app_reservation.get("status") == "waiting_retry"
             or "모의투자에서는 해당업무가 제공되지 않습니다" in last_error
             or "모의투자 예약주문시간" in last_error
@@ -249,6 +421,7 @@ def _mark_local_us_paper_reservation(
     current_price: float,
     error: str,
 ) -> None:
+    _apply_us_paper_submit_error_policy(order, error)
     existing = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
     reserved_at = existing.get("reserved_at") or _now()
     reservation = {
@@ -265,6 +438,10 @@ def _mark_local_us_paper_reservation(
         "reserved_at": reserved_at,
         "last_attempt_at": _now(),
         "last_error": error,
+        "last_error_code": order.get("last_error_code"),
+        "next_retry_at": order.get("next_retry_at"),
+        "retry_count": int(order.get("retry_count") or 0),
+        "unsupported_paths": list(order.get("unsupported_paths") or []),
         "note": "KIS paper US sell/reservation was unavailable; Strategy Builder will retry from the app monitor.",
     }
     order["status"] = "active"
@@ -286,6 +463,7 @@ def _mark_broker_us_paper_reservation(
     current_price: float,
     order_no: Optional[str],
 ) -> None:
+    _normalize_runtime_order(order)
     existing = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
     reserved_at = existing.get("reserved_at") or _now()
     reservation = {
@@ -302,6 +480,10 @@ def _mark_broker_us_paper_reservation(
         "reserved_at": reserved_at,
         "last_attempt_at": _now(),
         "reservation_order_no": str(order_no or ""),
+        "last_error_code": None,
+        "next_retry_at": None,
+        "retry_count": 0,
+        "unsupported_paths": list(order.get("unsupported_paths") or []),
         "note": "KIS paper US reservation was accepted; Strategy Builder will keep monitoring until the holding disappears.",
     }
     order["status"] = "active"
@@ -314,6 +496,7 @@ def _mark_broker_us_paper_reservation(
     order["exit_reason"] = exit_reason
     order["exit_order_type"] = order_type
     order["exit_submit_failed_at"] = _now()
+    _clear_submit_retry_state(order)
     order.pop("closed_at", None)
     order.pop("last_error", None)
     order.pop("exit_submit_blocked", None)
@@ -594,6 +777,7 @@ def _submit_exit_order(
     price: Optional[float] = None,
     market: str = "domestic",
     exchange: str | None = None,
+    skip_direct_us_sell: bool = False,
 ) -> tuple[Optional[str], Optional[str], bool, Optional[str]]:
     if market == "us":
         order_price = float(price or 0)
@@ -602,16 +786,28 @@ def _submit_exit_order(
             order_price = float(price_info.get("price") or 0)
         if order_price <= 0:
             return None, None, False, "current price unavailable"
-        result = overseas_data_fetcher.submit_order(
-            symbol=stock_code,
-            action="SELL",
-            quantity=quantity,
-            price=round(order_price, 2),
-            env_dv=env_dv,
-            exchange=exchange,
-        )
-        if not result.success or result.dataframe.empty:
-            regular_error = result.display_error()
+        direct_failed = skip_direct_us_sell
+        regular_error = "skipped unsupported direct sell path"
+        if not skip_direct_us_sell:
+            result = overseas_data_fetcher.submit_order(
+                symbol=stock_code,
+                action="SELL",
+                quantity=quantity,
+                price=round(order_price, 2),
+                env_dv=env_dv,
+                exchange=exchange,
+            )
+            if result.success and not result.dataframe.empty:
+                row = result.dataframe.iloc[0]
+                return (
+                    str(row.get("ODNO", row.get("odno", ""))),
+                    str(row.get("KRX_FWDG_ORD_ORGNO", row.get("ord_gno_brno", ""))),
+                    True,
+                    None,
+                )
+            direct_failed = True
+            regular_error = result.display_error() or "overseas sell failed"
+        if direct_failed:
             if env_dv not in ("prod", "real"):
                 reservation = reserved_orders.submit_us_reservation(
                     symbol=stock_code,
@@ -638,13 +834,6 @@ def _submit_exit_order(
                     f"reservation sell failed: {reservation.display_error()}",
                 )
             return None, None, False, regular_error
-        row = result.dataframe.iloc[0]
-        return (
-            str(row.get("ODNO", row.get("odno", ""))),
-            str(row.get("KRX_FWDG_ORD_ORGNO", row.get("ord_gno_brno", ""))),
-            True,
-            None,
-        )
 
     signal = Signal(
         stock_code=stock_code,
@@ -747,8 +936,19 @@ def _submit_triggered_exit(
     price: Optional[float],
     current_price: float,
 ) -> dict[str, Any]:
+    _normalize_runtime_order(order)
     order_type = "market" if order_type not in {"market", "limit"} else order_type
     market = str(order.get("market") or "domestic")
+    app_reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
+    if (
+        market == "us"
+        and env_dv not in ("prod", "real")
+        and app_reservation.get("status") == "broker_submitted"
+        and (app_reservation.get("reservation_order_no") or order.get("exit_order_no"))
+    ):
+        order["last_checked_at"] = _now()
+        return order
+
     last_error = str(order.get("last_error") or "")
     if (
         market == "us"
@@ -780,6 +980,11 @@ def _submit_triggered_exit(
     if market == "us" and exit_reason == "stop_loss" and order_type == "limit":
         price = _us_stop_loss_order_price(float(price or 0), current_price)
 
+    skip_direct_us_sell = (
+        market == "us"
+        and env_dv not in ("prod", "real")
+        and US_PAPER_DIRECT_SELL_UNSUPPORTED_PATH in set(order.get("unsupported_paths") or [])
+    )
     order_no, org_no, ok, error = _submit_exit_order(
         env_dv=env_dv,
         stock_code=str(order["stock_code"]),
@@ -790,6 +995,7 @@ def _submit_triggered_exit(
         market=market,
         exchange=order.get("exchange"),
         reason=reason,
+        skip_direct_us_sell=skip_direct_us_sell,
     )
     if ok:
         if market == "us" and env_dv not in ("prod", "real") and org_no == "reservation":
@@ -817,6 +1023,7 @@ def _submit_triggered_exit(
         order["exit_reason"] = exit_reason
         order["exit_order_type"] = order_type
         order["exit_submitted_at"] = _now()
+        _clear_submit_retry_state(order)
         order.pop("last_error", None)
         order.pop("exit_submit_failed_at", None)
         order.pop("exit_submit_blocked", None)
@@ -854,6 +1061,7 @@ def _submit_triggered_exit(
             })
             return order
 
+        _apply_us_paper_submit_error_policy(order, error)
         detail = f": {error}" if error else ""
         order["last_error"] = f"{exit_reason} sell submit failed{detail}"
         order["exit_submit_failed_at"] = _now()
@@ -1069,6 +1277,10 @@ async def register_after_buy(
         "stop_loss_price": _round_price(market, entry_price * (1 - (stop_loss_pct or 0) / 100), "down"),
         "stop_loss_limit_price": _round_price(market, entry_price * (1 - (stop_loss_pct or 0) / 100), "down"),
         "stop_loss_order_type": "market",
+        "next_retry_at": None,
+        "retry_count": 0,
+        "last_error_code": None,
+        "unsupported_paths": [],
         "created_at": _now(),
         "last_checked_at": None,
         "events": [{"type": "created", "at": _now()}],
@@ -1185,6 +1397,10 @@ async def upsert_existing_position_protection(
         "stop_loss_price": sl_price,
         "stop_loss_limit_price": sl_limit,
         "stop_loss_order_type": stop_loss_order_type,
+        "next_retry_at": None,
+        "retry_count": 0,
+        "last_error_code": None,
+        "unsupported_paths": [],
         "created_at": now,
         "last_checked_at": None,
         "events": [{"type": "created_from_review" if enabled else "saved_disabled_from_review", "at": now}],

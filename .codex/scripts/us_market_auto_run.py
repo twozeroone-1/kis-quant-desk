@@ -15,6 +15,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import sys
 import time
 from datetime import datetime, time as dt_time
@@ -50,6 +51,19 @@ MARKETABLE_SELL_LIMIT_BUFFER_PCT = 0.02
 MIN_SECONDS_BETWEEN_KIS_CALLS = 0.85
 US_EXCHANGES = ("NASD", "NYSE", "AMEX")
 ACTIVE_PROTECTION_STATUSES = {"active", "exit_submitted"}
+
+
+def normalize_llm_mode(mode: str | None) -> tuple[str, list[str]]:
+    raw = (mode or "off").strip().lower()
+    if raw in {"", "off"}:
+        return "off", []
+    if raw == "shadow":
+        return "shadow", []
+    if raw in {"live-vps", "live-prod"}:
+        return "shadow", [
+            f"{raw} is deprecated; treating it as shadow. LLM output is report-only and does not gate orders."
+        ]
+    raise RuntimeError(f"invalid llm mode: {mode}")
 
 
 def _json_default(value: Any) -> Any:
@@ -350,50 +364,58 @@ def apply_llm_decision(
     llm_result: dict[str, Any],
     live_mode: bool,
 ) -> list[dict[str, Any]]:
-    if not planned_orders:
-        return []
-    if not live_mode:
-        return planned_orders
-    if llm_result.get("status") != "success":
-        return []
-    decision = llm_result.get("decision", {})
-    if not decision.get("should_trade"):
-        return []
-    approvals = {
-        str(item.get("symbol")).upper(): item
-        for item in decision.get("approved_buys", [])
-    }
-    approved_orders = []
-    for order in planned_orders:
-        symbol = str(order.get("symbol")).upper()
-        approval = approvals.get(symbol)
-        if not approval:
-            continue
-        qty = min(int(order.get("quantity") or 0), int(approval.get("max_quantity") or 0))
-        if qty <= 0:
-            continue
-        adjusted = {**order}
-        if qty != int(order.get("quantity") or 0):
-            adjusted["quantity"] = qty
-            adjusted["notional"] = round(qty * float(order.get("limit_price") or order.get("price") or 0), 2)
-            adjusted["risk_amount"] = round(adjusted["notional"] * STOP_LOSS_PCT, 2)
-        adjusted["llm_confidence"] = approval.get("confidence")
-        adjusted["llm_reason"] = approval.get("reason")
-        approved_orders.append(adjusted)
-    return approved_orders
+    return planned_orders
 
 
-def annotate_llm_decisions(planned_orders: list[dict[str, Any]], executable_orders: list[dict[str, Any]], llm_mode: str) -> list[dict[str, Any]]:
+def run_llm_decision(mode: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if mode == "off":
+        return {"status": "disabled", "decision": {"should_trade": bool(payload.get("planned_buys")), "approved_buys": []}}
+    try:
+        decider = load_helper("us_market_llm_decider", "us_market_llm_decider.py")
+        return decider.call_llm(payload)
+    except Exception as exc:
+        message = str(exc)
+        message = re.sub(r"(?i)(api key:\s*)[A-Za-z0-9._-]+", r"\1<redacted>", message)
+        message = re.sub(r"Bearer\s+[A-Za-z0-9._-]+", "Bearer <redacted>", message)
+        return {
+            "status": "error",
+            "provider": "cliproxyapi",
+            "error": message[:1000],
+            "decision": {
+                "market_regime": "unknown",
+                "risk_level": "high",
+                "should_trade": True,
+                "approved_buys": [],
+                "blocked_symbols": [],
+                "notes": "LLM decision failed; automation continues without LLM gating.",
+            },
+        }
+
+
+def annotate_llm_decisions(
+    planned_orders: list[dict[str, Any]],
+    executable_orders: list[dict[str, Any]],
+    llm_mode: str,
+    llm_result: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    effective_mode, _ = normalize_llm_mode(llm_mode)
     executable = {str(order.get("symbol")).upper(): order for order in executable_orders}
+    approved_symbols = {
+        str(item.get("symbol")).upper()
+        for item in (llm_result or {}).get("decision", {}).get("approved_buys", [])
+        if item.get("symbol")
+    }
     rows = []
     for order in planned_orders:
         symbol = str(order.get("symbol")).upper()
-        if llm_mode == "off":
+        if effective_mode == "off":
             rows.append({**order, "order_decision": "주문"})
+        elif symbol in executable and symbol in approved_symbols:
+            rows.append({**executable[symbol], "order_decision": "LLM shadow 승인/주문"})
         elif symbol in executable:
-            rows.append({**executable[symbol], "order_decision": "LLM 승인/주문"})
+            rows.append({**executable[symbol], "order_decision": "주문"})
         else:
-            rows.append({**order, "order_decision": "LLM 차단/미주문"})
+            rows.append({**order, "order_decision": "주문 차단/미주문"})
     return rows
 
 
@@ -648,13 +670,16 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         f"- US session date: {payload['date']}",
         f"- Regime: {payload['news_summary']['regime']}",
         f"- LLM mode: {payload.get('llm_mode', 'off')}",
+        f"- Effective LLM mode: {payload.get('effective_llm_mode', payload.get('llm_mode', 'off'))}",
         f"- Order mode: vps only",
         f"- Equity: ${payload['account']['equity']:,.2f}",
         f"- Cash: ${payload['account']['cash']:,.2f}",
         f"- Protective orders are app-level monitoring, not KIS server OCO; backend/auth/network health matters.",
-        "",
-        "## Headlines",
     ]
+    if payload.get("llm_warnings"):
+        lines.extend(["", "## LLM Warnings"])
+        lines.extend(f"- {warning}" for warning in payload.get("llm_warnings") or [])
+    lines.extend(["", "## Headlines"])
     for item in payload["headlines"][:10]:
         lines.append(f"- {item['title']} ({item['source']})")
     candidate_selection = payload.get("candidate_selection") or {}
@@ -752,6 +777,7 @@ def write_market_closed_report(path: Path, payload: dict[str, Any]) -> None:
         f"- US session date: {payload['date']}",
         "- Regime: market_closed",
         f"- LLM mode: {payload.get('llm_mode', 'off')}",
+        f"- Effective LLM mode: {payload.get('effective_llm_mode', payload.get('llm_mode', 'off'))}",
         "- Order mode: vps only",
         "",
         "## Market Closed",
@@ -759,6 +785,9 @@ def write_market_closed_report(path: Path, payload: dict[str, Any]) -> None:
         f"- Status: {payload.get('trading_day', {}).get('status')}",
         f"- Reason: {payload.get('trading_day', {}).get('record')}",
     ]
+    if payload.get("llm_warnings"):
+        lines.extend(["", "## LLM Warnings"])
+        lines.extend(f"- {warning}" for warning in payload.get("llm_warnings") or [])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -773,8 +802,9 @@ async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--slot", required=True, choices=["open", "mid", "close", "manual"])
     parser.add_argument("--date", required=True, help="US session date key in YYYYMMDD, shared by all slots")
-    parser.add_argument("--llm-mode", choices=["off", "shadow", "live-vps"], default=os.environ.get("US_MARKET_LLM_MODE", "live-vps"))
+    parser.add_argument("--llm-mode", choices=["off", "shadow", "live-vps", "live-prod"], default=os.environ.get("US_MARKET_LLM_MODE", "off"))
     args = parser.parse_args()
+    effective_llm_mode, llm_warnings = normalize_llm_mode(args.llm_mode)
 
     now = datetime.now(ZoneInfo("Asia/Seoul"))
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -790,6 +820,8 @@ async def main() -> int:
             "date": args.date,
             "started_at": now.isoformat(timespec="seconds"),
             "llm_mode": args.llm_mode,
+            "effective_llm_mode": effective_llm_mode,
+            "llm_warnings": llm_warnings,
             "trading_day": trading_day,
             "news_summary": {"regime": "market_closed"},
             "headlines": [],
@@ -857,6 +889,8 @@ async def main() -> int:
         "headlines": headlines,
         "news_summary": news_summary,
         "llm_mode": args.llm_mode,
+        "effective_llm_mode": effective_llm_mode,
+        "llm_warnings": llm_warnings,
         "trading_day": trading_day,
         "strategy": {
             "name": "US news-aware EMA/ROC/RSI trend filter",
@@ -878,12 +912,8 @@ async def main() -> int:
         "planned_buys": planned_orders,
         "orders": [],
     }
-    llm_result = {"status": "disabled", "decision": {"should_trade": bool(planned_orders), "approved_buys": []}}
-    executable_orders = planned_orders
-    if args.llm_mode != "off":
-        decider = load_helper("us_market_llm_decider", "us_market_llm_decider.py")
-        llm_result = decider.call_llm(pre_payload) if args.llm_mode in {"shadow", "live-vps"} else llm_result
-        executable_orders = apply_llm_decision(planned_orders, llm_result, live_mode=args.llm_mode == "live-vps")
+    llm_result = run_llm_decision(effective_llm_mode, pre_payload)
+    executable_orders = apply_llm_decision(planned_orders, llm_result, live_mode=False)
 
     regular_hours = us_regular_hours_now(now)
     submitted_orders = await place_orders(
@@ -910,7 +940,7 @@ async def main() -> int:
     if catchup_protections:
         clear_balance_cache(odf)
         account_after = await account_status(odf, reserved_orders, list_protective_orders)
-    planned_display = annotate_llm_decisions(planned_orders, executable_orders, args.llm_mode)
+    planned_display = annotate_llm_decisions(planned_orders, executable_orders, effective_llm_mode, llm_result)
 
     payload = {
         **pre_payload,

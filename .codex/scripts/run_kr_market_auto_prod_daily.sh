@@ -20,7 +20,7 @@ if [[ -f "$PROD_ENV" ]]; then
 fi
 
 export KIS_TRADE_MODE="prod"
-export KR_MARKET_LLM_MODE="${KR_MARKET_LLM_MODE:-live-prod}"
+export KR_MARKET_LLM_MODE="${KR_MARKET_LLM_MODE:-off}"
 export KR_MARKET_TOTAL_BUY_PCT="${KR_MARKET_TOTAL_BUY_PCT:-100}"
 export KR_MARKET_DAILY_LOSS_PCT="${KR_MARKET_DAILY_LOSS_PCT:-3}"
 mkdir -p "$LOG_DIR"

@@ -88,7 +88,7 @@ def order_execution_enabled(trade_mode: str, prod_confirmed: bool) -> bool:
 
 
 def prod_llm_orders_enabled(trade_mode: str, llm_mode: str) -> bool:
-    return trade_mode != "prod" or llm_mode == "live-prod"
+    return True
 
 
 def strategy_sell_execution_enabled(trade_mode: str) -> bool:
@@ -97,6 +97,19 @@ def strategy_sell_execution_enabled(trade_mode: str) -> bool:
 
 def is_live_llm_mode(mode: str) -> bool:
     return mode in {"live-vps", "live-prod"}
+
+
+def normalize_llm_mode(mode: str | None) -> tuple[str, list[str]]:
+    raw = (mode or "off").strip().lower()
+    if raw in {"", "off"}:
+        return "off", []
+    if raw == "shadow":
+        return "shadow", []
+    if raw in {"live-vps", "live-prod"}:
+        return "shadow", [
+            f"{raw} is deprecated; treating it as shadow. LLM output is report-only and does not gate orders."
+        ]
+    raise RuntimeError(f"invalid llm mode: {mode}")
 
 
 def api(method: str, path: str, **kwargs) -> Any:
@@ -299,10 +312,10 @@ def run_llm_decision(mode: str, payload: dict[str, Any]) -> dict[str, Any] | Non
             "decision": {
                 "market_regime": "unknown",
                 "risk_level": "high",
-                "should_trade": False,
+                "should_trade": True,
                 "approved_buys": [],
                 "blocked_symbols": [],
-                "notes": "LLM decision failed; live-vps mode must block buys.",
+                "notes": "LLM decision failed; automation continues without LLM gating.",
             },
         }
 
@@ -312,42 +325,10 @@ def apply_llm_decision(
     llm_result: dict[str, Any] | None,
     mode: str,
 ) -> list[dict[str, Any]]:
-    if mode in {"off", "shadow"}:
+    effective_mode, _ = normalize_llm_mode(mode)
+    if effective_mode in {"off", "shadow"}:
         return planned_buys
-    if not is_live_llm_mode(mode):
-        raise RuntimeError(f"invalid llm mode: {mode}")
-    if not llm_result or llm_result.get("status") != "success":
-        return []
-
-    decision = llm_result.get("decision", {})
-    if not decision.get("should_trade"):
-        return []
-
-    approvals = {
-        str(item.get("code")): item
-        for item in decision.get("approved_buys", [])
-        if item.get("code")
-    }
-    approved_orders = []
-    for order in planned_buys:
-        code = str(order.get("code"))
-        approval = approvals.get(code)
-        if not approval:
-            continue
-        qty = min(int(order.get("quantity") or 0), int(approval.get("max_quantity") or 0))
-        if qty <= 0:
-            continue
-        adjusted = {**order}
-        if qty != int(order.get("quantity") or 0):
-            price = float(order.get("target_price") or 0)
-            adjusted["quantity"] = qty
-            adjusted["amount"] = qty * price
-            adjusted["weight"] = 0.0
-        adjusted["llm_approved"] = True
-        adjusted["llm_confidence"] = float(approval.get("confidence") or 0)
-        adjusted["llm_reason"] = approval.get("reason", "")
-        approved_orders.append(adjusted)
-    return approved_orders
+    raise RuntimeError(f"invalid llm mode: {mode}")
 
 
 def annotate_buys_for_report(
@@ -355,33 +336,10 @@ def annotate_buys_for_report(
     executable_buys: list[dict[str, Any]],
     mode: str,
 ) -> list[dict[str, Any]]:
-    if not is_live_llm_mode(mode):
+    effective_mode, _ = normalize_llm_mode(mode)
+    if effective_mode in {"off", "shadow"}:
         return planned_buys
-
-    executable_by_code = {str(order.get("code")): order for order in executable_buys}
-    reported = []
-    for order in planned_buys:
-        code = str(order.get("code"))
-        executable = executable_by_code.get(code)
-        if executable:
-            reported.append({
-                **order,
-                **{
-                    key: executable[key]
-                    for key in ("quantity", "amount", "weight", "llm_confidence", "llm_reason")
-                    if key in executable
-                },
-                "order_decision": "LLM 승인/주문",
-            })
-        else:
-            reported.append({
-                **order,
-                "quantity": 0,
-                "amount": 0,
-                "weight": 0,
-                "order_decision": "LLM 차단/미주문",
-            })
-    return reported
+    raise RuntimeError(f"invalid llm mode: {mode}")
 
 
 def holding_by_code(account: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -503,10 +461,13 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         f"- Strategy SELL execution enabled: {payload.get('strategy_sell_execution_enabled', True)}",
         f"- Regime: {payload['news_summary']['regime']}",
         f"- LLM mode: {payload.get('llm_mode', 'off')}",
+        f"- Effective LLM mode: {payload.get('effective_llm_mode', payload.get('llm_mode', 'off'))}",
         f"- Equity: {payload['account_before']['account'].get('deposit', {}).get('total_eval', 0):,}원",
-        "",
-        "## Headlines",
     ]
+    if payload.get("llm_warnings"):
+        lines.extend(["", "## LLM Warnings"])
+        lines.extend(f"- {warning}" for warning in payload.get("llm_warnings") or [])
+    lines.extend(["", "## Headlines"])
     for item in payload["headlines"][:10]:
         lines.append(f"- {item['title']} ({item['source']})")
 
@@ -637,6 +598,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     API_BASE = api_base_for(args.trade_mode)
+    effective_llm_mode, llm_warnings = normalize_llm_mode(args.llm_mode)
 
     global RUNTIME_DIR
     RUNTIME_DIR = runtime_dir_for(args.trade_mode)
@@ -644,9 +606,7 @@ def main() -> int:
     order_block_reasons = []
     if args.trade_mode == "prod" and not prod_confirmed:
         order_block_reasons.append("one_time_prod_approval_missing")
-    if not prod_llm_orders_enabled(args.trade_mode, args.llm_mode):
-        order_block_reasons.append("prod_requires_live_prod_llm")
-    can_submit_orders = order_execution_enabled(args.trade_mode, prod_confirmed) and prod_llm_orders_enabled(args.trade_mode, args.llm_mode)
+    can_submit_orders = order_execution_enabled(args.trade_mode, prod_confirmed)
     strategy_sell_enabled = strategy_sell_execution_enabled(args.trade_mode)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
@@ -672,6 +632,8 @@ def main() -> int:
             "account_before": {"account": {"deposit": {}}, "pending": {}, "reservations": {}, "protective": {}},
             "account_after": {"account": {"deposit": {}}, "pending": {}, "reservations": {}, "protective": {}},
             "llm_mode": args.llm_mode,
+            "effective_llm_mode": effective_llm_mode,
+            "llm_warnings": llm_warnings,
             "llm_result": None,
             "trade_mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
@@ -696,6 +658,7 @@ def main() -> int:
                 "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
                 "order_block_reasons": order_block_reasons,
                 "strategy_sell_execution_enabled": strategy_sell_enabled,
+                "llm_warnings": llm_warnings,
             },
         }
         state.setdefault("runs", []).append({
@@ -766,11 +729,11 @@ def main() -> int:
             "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
         },
     }
-    llm_result = run_llm_decision(args.llm_mode, llm_context)
-    executable_buys = apply_llm_decision(planned_buys, llm_result, args.llm_mode)
+    llm_result = run_llm_decision(effective_llm_mode, llm_context)
+    executable_buys = apply_llm_decision(planned_buys, llm_result, effective_llm_mode)
     if not can_submit_orders:
         executable_buys = []
-    report_buys = annotate_buys_for_report(planned_buys, executable_buys, args.llm_mode)
+    report_buys = annotate_buys_for_report(planned_buys, executable_buys, effective_llm_mode)
     if not can_submit_orders and args.trade_mode == "prod":
         report_buys = [
             {**order, "order_decision": f"실전 주문 차단({','.join(order_block_reasons)})/미주문"}
@@ -813,6 +776,8 @@ def main() -> int:
         "account_before": account_before,
         "account_after": account_after,
         "llm_mode": args.llm_mode,
+        "effective_llm_mode": effective_llm_mode,
+        "llm_warnings": llm_warnings,
         "llm_result": llm_result,
         "trade_mode": args.trade_mode,
         "prod_auto_confirmed": prod_confirmed,
@@ -826,6 +791,7 @@ def main() -> int:
             "order_execution_enabled": can_submit_orders,
             "order_block_reasons": order_block_reasons,
             "strategy_sell_execution_enabled": strategy_sell_enabled,
+            "llm_warnings": llm_warnings,
             "total_new_buy_pct": TOTAL_BUY_PCT,
             "daily_loss_pct": DAILY_LOSS_PCT,
             "take_profit_pct": TAKE_PROFIT_PCT,

@@ -11,7 +11,7 @@ if [[ -f "$LOCAL_ENV" ]]; then
   # shellcheck disable=SC1090
   source "$LOCAL_ENV"
 fi
-export US_MARKET_LLM_MODE="${US_MARKET_LLM_MODE:-live-vps}"
+export US_MARKET_LLM_MODE="${US_MARKET_LLM_MODE:-off}"
 mkdir -p "$LOG_DIR"
 
 case "$slot" in

@@ -27,7 +27,7 @@ export KIS_RUNTIME_DIR="/home/from0to01/.local/state/kis-stack/runtime-prod"
 export KIS_DEFAULT_MODE="prod"
 export KIS_LOCK_MODE="prod"
 export KIS_TRADE_MODE="prod"
-export KR_MARKET_LLM_MODE="${KR_MARKET_LLM_MODE:-live-prod}"
+export KR_MARKET_LLM_MODE="${KR_MARKET_LLM_MODE:-off}"
 export KR_MARKET_TOTAL_BUY_PCT="${KR_MARKET_TOTAL_BUY_PCT:-100}"
 export KR_MARKET_DAILY_LOSS_PCT="${KR_MARKET_DAILY_LOSS_PCT:-3}"
 unset KIS_PROD_AUTO_CONFIRM

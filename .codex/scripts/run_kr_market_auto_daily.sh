@@ -4,7 +4,7 @@ set -euo pipefail
 slot="${1:?slot required}"
 today="$(TZ=Asia/Seoul date +%Y%m%d)"
 weekday="$(TZ=Asia/Seoul date +%u)"
-export KR_MARKET_LLM_MODE="${KR_MARKET_LLM_MODE:-live-vps}"
+export KR_MARKET_LLM_MODE="${KR_MARKET_LLM_MODE:-off}"
 PROJECT_ROOT="/home/from0to01/open-trading-api"
 LOG_DIR="$PROJECT_ROOT/.codex/runtime/kr_market_auto"
 UV_BIN="/home/from0to01/.local/bin/uv"

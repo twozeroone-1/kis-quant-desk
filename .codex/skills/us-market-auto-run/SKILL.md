@@ -79,7 +79,7 @@ For "매일 하루 3번" US-market automation, install cron:
 .codex/scripts/install_us_market_auto_daily_cron.sh
 ```
 
-Daily runs default to `US_MARKET_LLM_MODE=live-vps`, so CLIProxyAPI/OpenAI-compatible LLM approval is required before BUY orders. The LLM can only approve, reduce, or block deterministic BUY candidates; hard risk gates still apply. Override with `US_MARKET_LLM_MODE=shadow` to log LLM decisions without affecting orders, or `off` to disable the LLM layer.
+Daily runs default to `US_MARKET_LLM_MODE=off`. `shadow` logs CLIProxyAPI/OpenAI-compatible LLM decisions without affecting orders. Legacy `live-vps`/`live-prod` values are accepted only as compatibility aliases for `shadow`; LLM output is never an order approval gate. Hard deterministic risk gates still apply.
 
 For local CLIProxyAPI credentials, prefer an untracked `.codex/local/kr_market_auto.env` file that exports `CLIPROXY_API_KEY_FILE`, `CLIPROXY_API_BASE`, and optionally `US_MARKET_LLM_MODEL` or `KR_MARKET_LLM_MODEL`. Do not commit API keys or user-local key file paths.
 

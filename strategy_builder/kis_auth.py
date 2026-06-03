@@ -7,6 +7,7 @@ import copy
 import json
 import logging
 import os
+import random
 import time
 from base64 import b64decode
 from collections import namedtuple
@@ -69,6 +70,10 @@ import threading
 
 _rate_lock = threading.Lock()
 _last_api_call_time = 0.0
+_rate_limit_backoff_until = 0.0
+_rate_limit_backoff_seconds = 0.0
+_RATE_LIMIT_BACKOFF_MAX_SECONDS = 60.0
+_RATE_LIMIT_RETRY_ATTEMPTS = 7
 
 # 기본 헤더값 정의
 _base_headers = {
@@ -298,6 +303,55 @@ def _is_expired_token_response(resp) -> bool:
     return msg_cd == "EGW00123" or "기간이 만료된 token" in msg1 or "EGW00123" in getattr(resp, "text", "")
 
 
+def _is_rate_limit_response(resp) -> bool:
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    msg_cd = str(body.get("msg_cd") or "")
+    msg1 = str(body.get("msg1") or "")
+    text = str(getattr(resp, "text", "") or "")
+    return msg_cd == "EGW00201" or "EGW00201" in msg1 or "EGW00201" in text or "초당 거래건수" in msg1 or "초당 거래건수" in text
+
+
+def _rate_limit_wait_before_call() -> None:
+    global _last_api_call_time
+    with _rate_lock:
+        now = time.monotonic()
+        wait_time = 0.0
+        elapsed = now - _last_api_call_time
+        if elapsed < _smartSleep:
+            wait_time = max(wait_time, _smartSleep - elapsed)
+        if now < _rate_limit_backoff_until:
+            wait_time = max(wait_time, _rate_limit_backoff_until - now)
+        if wait_time > 0:
+            if _DEBUG:
+                print(f"[RateLimit] Waiting {wait_time:.3f}s before API call")
+            time.sleep(wait_time)
+        _last_api_call_time = time.monotonic()
+
+
+def _register_rate_limit_backoff() -> float:
+    global _rate_limit_backoff_until, _rate_limit_backoff_seconds
+    with _rate_lock:
+        _rate_limit_backoff_seconds = (
+            1.0
+            if _rate_limit_backoff_seconds <= 0
+            else min(_RATE_LIMIT_BACKOFF_MAX_SECONDS, _rate_limit_backoff_seconds * 2)
+        )
+        jitter = random.uniform(0, min(1.0, _rate_limit_backoff_seconds * 0.2))
+        wait_time = min(_RATE_LIMIT_BACKOFF_MAX_SECONDS, _rate_limit_backoff_seconds + jitter)
+        _rate_limit_backoff_until = time.monotonic() + wait_time
+        return wait_time
+
+
+def _reset_rate_limit_backoff() -> None:
+    global _rate_limit_backoff_until, _rate_limit_backoff_seconds
+    with _rate_lock:
+        _rate_limit_backoff_until = 0.0
+        _rate_limit_backoff_seconds = 0.0
+
+
 def _reauth_current_env():
     try:
         trenv = getTREnv()
@@ -456,22 +510,7 @@ class APIRespError(APIResp):
 def _url_fetch(
         api_url, ptr_id, tr_cont, params, appendHeaders=None, postFlag=False, hashFlag=True
 ):
-    global _last_api_call_time
-
-    # Rate Limiting: 모의투자 0.5초, 실전 0.05초 최소 간격 보장
-    with _rate_lock:
-        now = time.monotonic()
-        elapsed = now - _last_api_call_time
-        if elapsed < _smartSleep:
-            wait_time = _smartSleep - elapsed
-            if _DEBUG:
-                print(f"[RateLimit] Waiting {wait_time:.3f}s before API call")
-            time.sleep(wait_time)
-        _last_api_call_time = time.monotonic()
-
     url = f"{getTREnv().my_url}{api_url}"
-
-    headers = _getBaseHeader()  # 기본 header 값 정리
 
     # 추가 Header 설정
     tr_id = ptr_id
@@ -479,14 +518,18 @@ def _url_fetch(
         if isPaperTrading():  # 모의투자용 TR id 식별
             tr_id = "V" + ptr_id[1:]
 
-    headers["tr_id"] = tr_id  # 트랜젝션 TR id
-    headers["custtype"] = "P"  # 일반(개인고객,법인고객) "P", 제휴사 "B"
-    headers["tr_cont"] = tr_cont  # 트랜젝션 TR id
+    def build_headers():
+        headers = _getBaseHeader()  # 기본 header 값 정리
+        headers["tr_id"] = tr_id  # 트랜젝션 TR id
+        headers["custtype"] = "P"  # 일반(개인고객,법인고객) "P", 제휴사 "B"
+        headers["tr_cont"] = tr_cont  # 트랜젝션 TR id
+        if appendHeaders is not None:
+            if len(appendHeaders) > 0:
+                for x in appendHeaders.keys():
+                    headers[x] = appendHeaders.get(x)
+        return headers
 
-    if appendHeaders is not None:
-        if len(appendHeaders) > 0:
-            for x in appendHeaders.keys():
-                headers[x] = appendHeaders.get(x)
+    headers = build_headers()
 
     if _DEBUG:
         print("< Sending Info >")
@@ -500,22 +543,33 @@ def _url_fetch(
             return requests.post(url, headers=headers, data=json.dumps(params))
         return requests.get(url, headers=headers, params=params)
 
-    res = send_request()
-    if _is_expired_token_response(res):
-        logging.warning("KIS token expired; refreshing token and retrying request once.")
-        _reauth_current_env()
-        headers = _getBaseHeader()
-        headers["tr_id"] = tr_id
-        headers["custtype"] = "P"
-        headers["tr_cont"] = tr_cont
-        if appendHeaders is not None:
-            if len(appendHeaders) > 0:
-                for x in appendHeaders.keys():
-                    headers[x] = appendHeaders.get(x)
+    res = None
+    for attempt in range(_RATE_LIMIT_RETRY_ATTEMPTS + 1):
+        _rate_limit_wait_before_call()
         res = send_request()
+        if _is_expired_token_response(res):
+            logging.warning("KIS token expired; refreshing token and retrying request once.")
+            _reauth_current_env()
+            headers = build_headers()
+            res = send_request()
+        if not _is_rate_limit_response(res):
+            break
+        if attempt >= _RATE_LIMIT_RETRY_ATTEMPTS:
+            break
+        wait_time = _register_rate_limit_backoff()
+        logging.warning(
+            "KIS rate limit EGW00201; backing off %.2fs before retry %s/%s.",
+            wait_time,
+            attempt + 1,
+            _RATE_LIMIT_RETRY_ATTEMPTS,
+        )
+    if res is None:
+        return APIRespError(599, "KIS request was not sent")
 
     if res.status_code == 200:
         ar = APIResp(res)
+        if ar.isOK():
+            _reset_rate_limit_backoff()
         if _DEBUG:
             ar.printAll()
         return ar

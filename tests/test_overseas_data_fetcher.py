@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import sys
 import unittest
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("KIS_CONFIG_ROOT", str(PROJECT_ROOT / "tests" / "fixtures" / "kis_config"))
+os.environ.setdefault("KIS_TOKEN_ROOT", "/tmp/open-trading-api-test-kis-tokens")
 sys.path.insert(0, str(PROJECT_ROOT / "strategy_builder"))
 
 try:

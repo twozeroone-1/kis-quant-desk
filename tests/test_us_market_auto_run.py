@@ -53,6 +53,20 @@ class _FakeOverseasDataFetcher:
 
 @unittest.skipIf(us_market_auto_run is None, f"us_market_auto_run unavailable: {IMPORT_ERROR}")
 class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
+    def test_live_llm_mode_is_shadow_alias_not_order_gate(self):
+        planned = [{"symbol": "AMZN", "quantity": 1, "notional": 100.0}]
+
+        effective, warnings = us_market_auto_run.normalize_llm_mode("live-vps")
+        executable = us_market_auto_run.apply_llm_decision(
+            planned,
+            {"status": "error", "decision": {"should_trade": False}},
+            live_mode=True,
+        )
+
+        self.assertEqual(effective, "shadow")
+        self.assertTrue(warnings)
+        self.assertEqual(executable, planned)
+
     def test_strategy_sell_uses_marketable_limit(self):
         odf = _FakeOverseasDataFetcher()
         signals = [{

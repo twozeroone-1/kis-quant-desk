@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import sys
 import unittest
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("KIS_CONFIG_ROOT", str(PROJECT_ROOT / "tests" / "fixtures" / "kis_config"))
+os.environ.setdefault("KIS_TOKEN_ROOT", "/tmp/open-trading-api-test-kis-tokens")
 sys.path.insert(0, str(PROJECT_ROOT / "strategy_builder"))
 
 try:
@@ -153,7 +156,7 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
             "market": "us",
             "env_dv": "vps",
             "exit_submit_failed_at": old,
-            "app_exit_reservation": {"status": "broker_submitted"},
+            "app_exit_reservation": {"status": "broker_submitted", "reservation_order_no": "258"},
         }
         waiting_retry = {
             "market": "us",
@@ -165,28 +168,96 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
             "market": "us",
             "env_dv": "vps",
             "exit_submit_failed_at": very_old,
-            "app_exit_reservation": {"status": "broker_submitted"},
+            "app_exit_reservation": {"status": "broker_submitted", "reservation_order_no": "258"},
         }
 
         with patch.object(protective_orders, "_is_us_regular_session_now", return_value=False):
             self.assertFalse(protective_orders._exit_submit_retry_due(broker_submitted))
             self.assertTrue(protective_orders._exit_submit_retry_due(waiting_retry))
-            self.assertTrue(protective_orders._exit_submit_retry_due(stale_broker_submitted))
+            self.assertFalse(protective_orders._exit_submit_retry_due(stale_broker_submitted))
 
         with patch.object(protective_orders, "_is_us_regular_session_now", return_value=True):
             self.assertFalse(protective_orders._exit_submit_retry_due(broker_submitted))
 
-    def test_broker_submitted_retries_during_us_regular_session(self):
+    def test_broker_submitted_does_not_retry_during_us_regular_session(self):
         old = (datetime.now() - timedelta(minutes=6)).isoformat(timespec="seconds")
         broker_submitted = {
             "market": "us",
             "env_dv": "vps",
             "exit_submit_failed_at": old,
-            "app_exit_reservation": {"status": "broker_submitted"},
+            "app_exit_reservation": {"status": "broker_submitted", "reservation_order_no": "258"},
         }
 
         with patch.object(protective_orders, "_is_us_regular_session_now", return_value=True):
-            self.assertTrue(protective_orders._exit_submit_retry_due(broker_submitted))
+            self.assertFalse(protective_orders._exit_submit_retry_due(broker_submitted))
+
+    def test_us_paper_error_policy_tracks_code_cooldown_and_unsupported_path(self):
+        order = {
+            "id": "order-1",
+            "status": "active",
+            "env_dv": "vps",
+            "market": "us",
+            "stock_code": "AMZN",
+        }
+        error = (
+            "regular sell failed: 90000000 모의투자에서는 해당업무가 제공되지 않습니다.; "
+            "reservation sell failed: 40490000 모의투자 예약주문시간을 확인해 주세요."
+        )
+
+        protective_orders._apply_us_paper_submit_error_policy(order, error)
+
+        self.assertEqual(order["last_error_code"], "40490000")
+        self.assertIn("us_paper_direct_sell", order["unsupported_paths"])
+        self.assertEqual(order["retry_count"], 1)
+        self.assertIsNotNone(order["next_retry_at"])
+        self.assertGreater(datetime.fromisoformat(order["next_retry_at"]), datetime.now())
+
+    def test_us_paper_rate_limit_uses_exponential_next_retry(self):
+        order = {
+            "id": "order-1",
+            "status": "active",
+            "env_dv": "vps",
+            "market": "us",
+            "stock_code": "AMZN",
+        }
+
+        protective_orders._apply_us_paper_submit_error_policy(order, "EGW00201 초당 거래건수 초과")
+        first_retry = datetime.fromisoformat(order["next_retry_at"])
+        protective_orders._apply_us_paper_submit_error_policy(order, "EGW00201 초당 거래건수 초과")
+        second_retry = datetime.fromisoformat(order["next_retry_at"])
+
+        self.assertEqual(order["last_error_code"], "EGW00201")
+        self.assertEqual(order["retry_count"], 2)
+        self.assertGreater(second_retry, first_retry)
+
+    def test_broker_submitted_realtime_trigger_does_not_submit_duplicate(self):
+        order = {
+            "id": "order-1",
+            "status": "active",
+            "env_dv": "vps",
+            "market": "us",
+            "exchange": "NASD",
+            "stock_code": "AMZN",
+            "stock_name": "Amazon.com",
+            "quantity": 1,
+            "stop_loss_enabled": True,
+            "stop_loss_price": 160.0,
+            "stop_loss_order_type": "limit",
+            "events": [],
+            "app_exit_reservation_status": "broker_submitted",
+            "app_exit_reservation": {
+                "status": "broker_submitted",
+                "reservation_order_no": "258",
+                "exit_reason": "stop_loss",
+            },
+        }
+
+        with patch.object(protective_orders, "_submit_exit_order") as submit_mock:
+            updated = protective_orders._check_realtime_trigger_sync(order, "vps", 150.0)
+
+        submit_mock.assert_not_called()
+        self.assertEqual(updated["status"], "active")
+        self.assertEqual(updated["app_exit_reservation_status"], "broker_submitted")
 
     def test_exit_submitted_retries_when_holding_still_present_without_pending(self):
         order = {

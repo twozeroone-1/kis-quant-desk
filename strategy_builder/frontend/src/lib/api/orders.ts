@@ -172,6 +172,10 @@ export interface ProtectiveOrder {
   exit_reason?: string;
   exit_order_type?: ExitOrderType;
   last_error?: string;
+  next_retry_at?: string | null;
+  retry_count?: number;
+  last_error_code?: string | null;
+  unsupported_paths?: string[];
   app_exit_reservation_status?: "waiting_retry" | string;
   app_exit_reserved_at?: string;
   app_exit_reason?: string;
@@ -189,6 +193,10 @@ export interface ProtectiveOrder {
     reserved_at?: string;
     last_attempt_at?: string;
     last_error?: string;
+    next_retry_at?: string | null;
+    retry_count?: number;
+    last_error_code?: string | null;
+    unsupported_paths?: string[];
     note?: string;
   };
 }

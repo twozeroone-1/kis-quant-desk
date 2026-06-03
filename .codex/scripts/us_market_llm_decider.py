@@ -219,7 +219,7 @@ def fail_closed(message: str) -> dict[str, Any]:
             "should_trade": False,
             "approved_buys": [],
             "blocked_symbols": [],
-            "notes": "LLM decision failed; live-vps mode must block buys.",
+            "notes": "LLM decision failed; automation continues without LLM gating.",
         },
     }
 

@@ -85,7 +85,7 @@ For "매일 하루 3번" automation, install cron:
 
 This schedules Monday-Friday KST runs. Each run checks the KIS domestic holiday API and skips closed days. It does not make investment guarantees and does not replace monitoring. The backend and protective-order monitor must remain healthy for app-level stops to work.
 
-Daily runs default to `KR_MARKET_LLM_MODE=live-vps`, so CLIProxyAPI/OpenAI-compatible LLM approval is required before BUY orders. The LLM can only approve, reduce, or block deterministic BUY candidates; hard risk gates still apply. Override with `KR_MARKET_LLM_MODE=shadow` to log LLM decisions without affecting orders, or `off` to disable the LLM layer.
+Daily runs default to `KR_MARKET_LLM_MODE=off`. `shadow` logs CLIProxyAPI/OpenAI-compatible LLM decisions without affecting orders. Legacy `live-vps`/`live-prod` values are accepted only as compatibility aliases for `shadow`; LLM output is never an order approval gate. Hard deterministic risk gates still apply.
 
 For local CLIProxyAPI credentials, prefer an untracked `.codex/local/kr_market_auto.env` file that exports `CLIPROXY_API_KEY_FILE`, `CLIPROXY_API_BASE`, and optionally `KR_MARKET_LLM_MODEL`. Do not commit API keys or user-local key file paths.
 

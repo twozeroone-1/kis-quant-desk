@@ -1,0 +1,15 @@
+my_agent: test-agent
+my_prod: "01"
+my_app: test-app
+my_sec: test-secret
+paper_app: test-paper-app
+paper_sec: test-paper-secret
+my_acct_stock: "00000000"
+my_acct_future: "00000000"
+my_paper_stock: "00000000"
+my_paper_future: "00000000"
+my_htsid: test-user
+prod: https://example.invalid
+vps: https://example.invalid
+ops: wss://example.invalid
+vops: wss://example.invalid
