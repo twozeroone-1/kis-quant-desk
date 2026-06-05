@@ -71,6 +71,90 @@ class OverseasDataFetcherTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(seen["tr_id"], "TTTS3018R")
 
+    def test_get_deposit_keeps_usd_total_eval_separate_from_krw_asset_fields(self):
+        balance_raw = {
+            "output1": [{
+                "ovrs_cblc_qty": "2",
+                "ovrs_stck_evlu_amt": "1000.25",
+                "frcr_pchs_amt1": "900.00",
+                "frcr_evlu_pfls_amt": "100.25",
+            }],
+            "output2": [{
+                "frcr_buy_amt_smtl1": "200.25",
+                "tot_evlu_pfls_amt": "999.99",
+            }],
+        }
+        present_raw = {
+            "output3": [{
+                "tot_asst_amt": "1200500.00",
+            }],
+        }
+
+        with patch.object(overseas_data_fetcher, "_get_balance_cached", return_value=balance_raw), patch.object(
+            overseas_data_fetcher, "_get_present_balance_cached", return_value=present_raw
+        ):
+            deposit = overseas_data_fetcher.get_deposit("vps")
+
+        self.assertEqual(deposit["deposit"], 200.25)
+        self.assertEqual(deposit["purchase_amount"], 900.0)
+        self.assertEqual(deposit["eval_amount"], 1000.25)
+        self.assertEqual(deposit["profit_loss"], 100.25)
+        self.assertEqual(deposit["total_eval"], 1200.5)
+        self.assertEqual(deposit["total_asset_krw"], 1200500.0)
+
+    def test_get_deposit_does_not_treat_profit_loss_as_total_eval(self):
+        balance_raw = {
+            "output1": [{
+                "ovrs_cblc_qty": "1",
+                "ovrs_stck_evlu_amt": "150.00",
+                "frcr_pchs_amt1": "120.00",
+                "frcr_evlu_pfls_amt": "30.00",
+            }],
+            "output2": [{
+                "frcr_buy_amt_smtl1": "50.00",
+                "tot_evlu_pfls_amt": "30.00",
+            }],
+        }
+
+        with patch.object(overseas_data_fetcher, "_get_balance_cached", return_value=balance_raw), patch.object(
+            overseas_data_fetcher, "_get_present_balance_cached", return_value=None
+        ):
+            deposit = overseas_data_fetcher.get_deposit("vps")
+
+        self.assertEqual(deposit["deposit"], 50.0)
+        self.assertEqual(deposit["eval_amount"], 150.0)
+        self.assertEqual(deposit["profit_loss"], 30.0)
+        self.assertEqual(deposit["total_eval"], 200.0)
+
+    def test_get_deposit_reads_usd_cash_from_present_balance_currency_rows(self):
+        present_raw = {
+            "output2": [
+                {
+                    "crcy_cd": "HKD",
+                    "frcr_dncl_amt_2": "5.00",
+                    "frcr_use_psbl_amt": "4.00",
+                },
+                {
+                    "crcy_cd": "USD",
+                    "frcr_dncl_amt_2": "105672.33",
+                    "frcr_use_psbl_amt": "105000.00",
+                },
+            ],
+            "output3": [{
+                "tot_asst_amt": "393505227.00",
+            }],
+        }
+
+        with patch.object(overseas_data_fetcher, "_get_balance_cached", return_value={"output1": [], "output2": []}), patch.object(
+            overseas_data_fetcher, "_get_present_balance_cached", return_value=present_raw
+        ):
+            deposit = overseas_data_fetcher.get_deposit("vps")
+
+        self.assertEqual(deposit["deposit"], 105672.33)
+        self.assertEqual(deposit["available_amount"], 105000.0)
+        self.assertEqual(deposit["total_eval"], 105672.33)
+        self.assertEqual(deposit["total_asset_krw"], 393505227.0)
+
 
 if __name__ == "__main__":
     unittest.main()

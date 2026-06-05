@@ -330,6 +330,17 @@ export default function ReviewPage() {
   };
 
   const currency = market === "us" ? "USD" : "KRW";
+  const usTotalEval = Number(balance?.total_eval || 0);
+  const usOrderableAmount = Number(balance?.orderable_amount || balance?.available_amount || 0);
+  const displayTotalEval = market === "us" && usTotalEval <= 0 && usOrderableAmount > 0
+    ? usOrderableAmount
+    : balance?.total_eval;
+  const totalEvalLabel = market === "us" && usTotalEval <= 0 && usOrderableAmount > 0
+    ? "미국 주문가능금액"
+    : market === "us"
+      ? "미국 평가금액"
+      : "총 평가금액";
+  const depositLabel = market === "us" ? "외화 예수금(API)" : "예수금";
   const streamLabel =
     priceStreamState === "connected"
       ? "실시간 연결"
@@ -436,8 +447,15 @@ export default function ReviewPage() {
           <strong className="block text-2xl mt-1">{activeProtectionByKey.size}개</strong>
         </div>
         <div className="card p-4">
-          <span className="text-caption text-slate-500">총 평가금액</span>
-          <strong className="block text-2xl mt-1">{formatMoney(balance?.total_eval, currency)}</strong>
+          <span className="text-caption text-slate-500">{totalEvalLabel}</span>
+          <strong className="block text-2xl mt-1">{formatMoney(displayTotalEval, currency)}</strong>
+          <span className="block mt-1 text-xs text-slate-500">{depositLabel} {formatMoney(balance?.deposit, currency)}</span>
+          {market === "us" && usTotalEval <= 0 && usOrderableAmount > 0 && (
+            <span className="block mt-1 text-xs text-slate-500">평가금액(API) {formatMoney(balance?.total_eval, "USD")}</span>
+          )}
+          {market === "us" && Number(balance?.total_asset_krw || 0) > 0 && (
+            <span className="block mt-1 text-xs text-slate-500">원화 총자산(참고) {formatMoney(balance?.total_asset_krw, "KRW")}</span>
+          )}
         </div>
         <div className="card p-4">
           <span className="text-caption text-slate-500">{streamLabel}</span>

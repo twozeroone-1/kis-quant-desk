@@ -30,9 +30,14 @@ export interface Balance {
   purchase_amount: number;
   eval_amount: number;
   profit_loss: number;
+  available_amount?: number;
+  orderable_amount?: number;
+  orderable_reference_symbol?: string;
+  total_asset_krw?: number;
   currency?: string;
   deposit_formatted?: string;
   total_eval_formatted?: string;
+  orderable_formatted?: string;
   profit_loss_formatted?: string;
 }
 

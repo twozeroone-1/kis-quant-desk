@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -15,6 +18,14 @@ from core import overseas_data_fetcher
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_ORDERABLE_BALANCE_CACHE_TTL = 30
+_orderable_balance_cache_lock = threading.Lock()
+_orderable_balance_cache: dict[str, object] = {
+    "env_dv": None,
+    "timestamp": 0.0,
+    "data": None,
+}
 
 
 class OverseasOrderRequest(OrderRequest):
@@ -31,6 +42,28 @@ class OverseasCancelRequest(BaseModel):
 def _require_auth() -> None:
     if not is_authenticated():
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
+
+
+def _get_cached_default_orderable(env_dv: str) -> dict[str, object]:
+    mode = overseas_data_fetcher.normalize_env(env_dv)
+    now = time.monotonic()
+    with _orderable_balance_cache_lock:
+        cached = _orderable_balance_cache.get("data")
+        if (
+            cached is not None
+            and _orderable_balance_cache.get("env_dv") == mode
+            and now - float(_orderable_balance_cache.get("timestamp") or 0) < _ORDERABLE_BALANCE_CACHE_TTL
+        ):
+            return dict(cached)
+
+    buyable = overseas_data_fetcher.get_buyable_amount("NVDA", 100, env_dv, "NASD")
+    data = {
+        "orderable_amount": buyable.get("amount", 0),
+        "orderable_reference_symbol": "NVDA",
+    }
+    with _orderable_balance_cache_lock:
+        _orderable_balance_cache.update({"env_dv": mode, "timestamp": time.monotonic(), "data": data})
+    return data
 
 
 @router.get("/search/{symbol}")
@@ -82,18 +115,27 @@ async def get_overseas_holdings():
 async def get_overseas_balance():
     _require_auth()
     env_dv = get_current_mode()
-    data = overseas_data_fetcher.get_deposit(env_dv)
+    data = await asyncio.to_thread(overseas_data_fetcher.get_deposit, env_dv)
     if not data:
         return {
             "status": "error",
             "message": "해외 예수금 정보를 가져올 수 없습니다",
         }
+    if (
+        float(data.get("total_eval") or 0) <= 0
+        and float(data.get("deposit") or 0) <= 0
+        and float(data.get("available_amount") or 0) <= 0
+    ):
+        data.update(await asyncio.to_thread(_get_cached_default_orderable, env_dv))
+    else:
+        data["orderable_amount"] = data.get("available_amount", 0)
     return {
         "status": "success",
         "data": {
             **data,
             "deposit_formatted": f"${data.get('deposit', 0):,.2f}",
             "total_eval_formatted": f"${data.get('total_eval', 0):,.2f}",
+            "orderable_formatted": f"${data.get('orderable_amount', 0):,.2f}",
             "profit_loss_formatted": f"${data.get('profit_loss', 0):+,.2f}",
         },
     }

@@ -36,6 +36,8 @@ _exchange_cache: dict[str, dict[str, Any]] = {}
 _exchange_cache_lock = threading.Lock()
 _balance_cache_lock = threading.Lock()
 _balance_cache: dict[str, Any] = {"data": None, "timestamp": 0.0, "env_dv": None}
+_present_balance_cache_lock = threading.Lock()
+_present_balance_cache: dict[str, Any] = {"data": None, "timestamp": 0.0, "env_dv": None}
 _BALANCE_CACHE_TTL = 10
 US_DAYTIME_START = (10, 0)
 US_DAYTIME_END = (18, 0)
@@ -143,6 +145,33 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 
 def _to_int(value: Any, default: int = 0) -> int:
     return int(_to_float(value, float(default)))
+
+
+def _first_number(data: dict[str, Any], keys: tuple[str, ...], default: float = 0.0) -> float:
+    fallback = default
+    for key in keys:
+        if key not in data:
+            continue
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        number = _to_float(value, default)
+        if number != 0:
+            return number
+        fallback = number
+    return fallback
+
+
+def _currency_row(df: pd.DataFrame, currency: str = "USD") -> dict[str, Any]:
+    if df.empty:
+        return {}
+    desired = currency.upper()
+    for _, item in df.iterrows():
+        row = item.to_dict()
+        currency_code = str(_first_value(row, ("crcy_cd", "buy_crcy_cd", "tr_crcy_cd", "crcy_cd_name"), "")).upper()
+        if currency_code == desired or desired in currency_code:
+            return row
+    return df.iloc[0].to_dict()
 
 
 def _frame_from_output(value: Any) -> pd.DataFrame:
@@ -489,6 +518,38 @@ def _fetch_balance_raw(env_dv: str = "real") -> Optional[dict[str, Any]]:
     }
 
 
+def _fetch_present_balance_raw(env_dv: str = "real", currency_division: str = "02") -> Optional[dict[str, Any]]:
+    if not _assert_trenv_ready("해외 체결기준현재잔고 조회"):
+        return None
+    trenv = ka.getTREnv()
+    mode = normalize_env(env_dv)
+    tr_id = "CTRP6504R" if mode == "real" else "VTRP6504R"
+    params = {
+        "CANO": trenv.my_acct,
+        "ACNT_PRDT_CD": trenv.my_prod,
+        "WCRC_FRCR_DVSN_CD": currency_division,
+        "NATN_CD": "000",
+        "TR_MKET_CD": "00",
+        "INQR_DVSN_CD": "00",
+    }
+    res = ka._url_fetch(
+        "/uapi/overseas-stock/v1/trading/inquire-present-balance",
+        tr_id,
+        "",
+        params,
+    )
+    if not res.isOK():
+        code, message = _response_error(res, "해외 체결기준현재잔고 조회 실패")
+        logger.warning("해외 체결기준현재잔고 조회 실패: %s %s", code, message)
+        return None
+    body = res.getBody()
+    return {
+        "output1": _body_get(body, "output1", []),
+        "output2": _body_get(body, "output2", []),
+        "output3": _body_get(body, "output3", []),
+    }
+
+
 def _get_balance_cached(env_dv: str = "real") -> Optional[dict[str, Any]]:
     global _balance_cache
     mode = normalize_env(env_dv)
@@ -506,10 +567,31 @@ def _get_balance_cached(env_dv: str = "real") -> Optional[dict[str, Any]]:
     return data
 
 
+def _get_present_balance_cached(env_dv: str = "real") -> Optional[dict[str, Any]]:
+    global _present_balance_cache
+    mode = normalize_env(env_dv)
+    with _present_balance_cache_lock:
+        now = time.monotonic()
+        if (
+            _present_balance_cache["data"] is not None
+            and _present_balance_cache["env_dv"] == mode
+            and (now - _present_balance_cache["timestamp"]) < _BALANCE_CACHE_TTL
+        ):
+            return _present_balance_cache["data"]
+    data = _fetch_present_balance_raw(mode, "02")
+    if data is not None and _frame_from_output(data.get("output3")).empty:
+        data = _fetch_present_balance_raw(mode, "01") or data
+    with _present_balance_cache_lock:
+        _present_balance_cache = {"data": data, "timestamp": time.monotonic(), "env_dv": mode}
+    return data
+
+
 def clear_balance_cache() -> None:
-    global _balance_cache
+    global _balance_cache, _present_balance_cache
     with _balance_cache_lock:
         _balance_cache = {"data": None, "timestamp": 0.0, "env_dv": None}
+    with _present_balance_cache_lock:
+        _present_balance_cache = {"data": None, "timestamp": 0.0, "env_dv": None}
 
 
 def get_holdings(env_dv: str = "real") -> pd.DataFrame:
@@ -552,21 +634,59 @@ def get_holdings(env_dv: str = "real") -> pd.DataFrame:
 def get_deposit(env_dv: str = "real") -> dict[str, Any]:
     try:
         raw = _get_balance_cached(env_dv)
-        if raw is None:
+        present_raw = _get_present_balance_cached(env_dv)
+        if raw is None and present_raw is None:
             return {}
-        df = _frame_from_output(raw.get("output2"))
-        summary = df.iloc[0].to_dict() if not df.empty else {}
-        deposit = _to_float(_first_value(summary, ("frcr_buy_amt_smtl1", "frcr_drwg_psbl_amt_1", "buy_psbl_amt"), 0))
-        total_eval = _to_float(_first_value(summary, ("tot_evlu_pfls_amt", "ovrs_tot_pfls", "evlu_amt_smtl_amt"), 0))
-        purchase_amount = _to_float(_first_value(summary, ("pchs_amt_smtl_amt", "frcr_pchs_amt1"), 0))
-        eval_amount = _to_float(_first_value(summary, ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "tot_evlu_amt"), total_eval))
-        profit_loss = _to_float(_first_value(summary, ("evlu_pfls_smtl_amt", "frcr_evlu_pfls_amt"), 0))
+        balance_df = _frame_from_output((raw or {}).get("output2"))
+        balance_summary = balance_df.iloc[0].to_dict() if not balance_df.empty else {}
+        holding_df = _frame_from_output((raw or {}).get("output1"))
+        present_holding_df = _frame_from_output((present_raw or {}).get("output1"))
+        present_currency_df = _frame_from_output((present_raw or {}).get("output2"))
+        present_currency = _currency_row(present_currency_df, "USD")
+        present_df = _frame_from_output((present_raw or {}).get("output3"))
+        present_summary = present_df.iloc[0].to_dict() if not present_df.empty else {}
+
+        deposit = _first_number(balance_summary, ("frcr_buy_amt_smtl1", "frcr_buy_amt_smtl2", "buy_psbl_amt", "ovrs_ord_psbl_amt"))
+        if deposit == 0:
+            deposit = _first_number(balance_summary, ("frcr_drwg_psbl_amt_1", "frcr_dncl_amt_2"))
+        if deposit == 0:
+            deposit = _first_number(
+                present_currency,
+                ("frcr_dncl_amt_2", "frcr_use_psbl_amt", "frcr_drwg_psbl_amt_1", "nxdy_frcr_drwg_psbl_amt"),
+            )
+        available_amount = _first_number(
+            present_currency,
+            ("frcr_use_psbl_amt", "frcr_drwg_psbl_amt_1", "frcr_dncl_amt_2", "nxdy_frcr_drwg_psbl_amt"),
+        )
+        stock_eval_amount = 0.0
+        stock_purchase_amount = 0.0
+        stock_profit_loss = 0.0
+        holding_sources = [df for df in (holding_df, present_holding_df) if not df.empty]
+        if holding_sources:
+            for _, item in holding_sources[0].iterrows():
+                row = item.to_dict()
+                quantity = _first_number(row, ("ovrs_cblc_qty", "cblc_qty13", "hldg_qty", "ord_psbl_qty"))
+                if quantity <= 0:
+                    continue
+                stock_eval_amount += _first_number(row, ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt"))
+                stock_purchase_amount += _first_number(row, ("frcr_pchs_amt1", "frcr_pchs_amt", "pchs_amt", "pchs_amt_smtl"))
+                stock_profit_loss += _first_number(row, ("frcr_evlu_pfls_amt", "evlu_pfls_amt", "evlu_pfls_amt2", "ovrs_evlu_pfls_amt"))
+        purchase_amount = stock_purchase_amount or _first_number(balance_summary, ("pchs_amt_smtl_amt", "pchs_amt_smtl", "frcr_pchs_amt1"))
+        eval_amount = stock_eval_amount or _first_number(balance_summary, ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt_smtl_amt", "evlu_amt_smtl", "tot_evlu_amt"))
+        profit_loss = stock_profit_loss or _first_number(balance_summary, ("evlu_pfls_smtl_amt", "frcr_evlu_pfls_amt", "tot_evlu_pfls_amt", "ovrs_tot_pfls"))
+        total_eval = deposit + eval_amount
+        total_asset_krw = _first_number(
+            present_summary,
+            ("tot_asst_amt", "frcr_evlu_tota", "evlu_amt_smtl_amt", "evlu_amt_smtl", "tot_dncl_amt", "wdrw_psbl_tot_amt"),
+        )
         return {
             "deposit": deposit,
-            "total_eval": total_eval or eval_amount,
+            "total_eval": total_eval,
             "purchase_amount": purchase_amount,
             "eval_amount": eval_amount,
             "profit_loss": profit_loss,
+            "total_asset_krw": total_asset_krw,
+            "available_amount": available_amount,
             "currency": "USD",
         }
     except Exception as exc:
