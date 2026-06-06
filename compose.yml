@@ -15,6 +15,7 @@ services:
       KIS_RUNTIME_DIR: /app/.runtime-vps
       KIS_DEFAULT_MODE: vps
       KIS_LOCK_MODE: vps
+      KIS_DISABLE_BACKGROUND_MONITORS: ${KIS_DISABLE_VPS_BACKGROUND_MONITORS:-1}
       AUDIT_LOG_DIR: ${AUDIT_LOG_DIR:-/var/log/kis/orders}
       AUDIT_LOG_RETENTION_DAYS: ${AUDIT_LOG_RETENTION_DAYS:-365}
       US_MARKET_REPORT_DIR: /app/us-market-reports

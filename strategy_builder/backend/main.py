@@ -4,6 +4,7 @@ KIS 전략 빌더 - FastAPI Backend
 
 import os
 import sys
+import logging
 
 # 프로젝트 루트를 path에 추가
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -15,6 +16,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.routers import strategy, auth, market, orders, account, files, symbols, overseas, screening
 from backend.services.app_reservations import start_app_reservation_monitor, stop_app_reservation_monitor
 from backend.services.protective_orders import start_monitor, stop_monitor
+
+logger = logging.getLogger(__name__)
 
 # FastAPI 앱 생성
 app = FastAPI(
@@ -63,6 +66,9 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     """Start app-level protective order monitoring."""
+    if os.environ.get("KIS_DISABLE_BACKGROUND_MONITORS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        logger.warning("background monitors disabled by KIS_DISABLE_BACKGROUND_MONITORS")
+        return
     await start_monitor()
     await start_app_reservation_monitor()
 

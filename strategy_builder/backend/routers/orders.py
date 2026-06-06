@@ -9,6 +9,7 @@ Account Information and Pending Orders API:
 """
 
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -82,12 +83,15 @@ def _get_cached_account(force_refresh: bool = False) -> dict:
         holdings = []
         if not holdings_df.empty:
             holdings = holdings_df.to_dict("records")
+
+        balance_error = data_fetcher.get_balance_cache_error(env_dv)
         
         _account_cache = {
             "deposit": deposit,
             "holdings": holdings,
             "holdings_count": len(holdings),
             "cached_at": now.isoformat(),
+            "error": "KIS 계좌 API 응답 지연으로 계좌 정보를 확인할 수 없습니다" if balance_error else None,
         }
         _account_cache_time = now
         
@@ -1460,7 +1464,7 @@ async def get_account_info():
     if not is_authenticated():
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
     
-    account = _get_cached_account()
+    account = await asyncio.to_thread(_get_cached_account)
     
     return AccountResponse(
         status="success",
@@ -1520,7 +1524,7 @@ async def get_pending_orders_api():
     env_dv = get_current_mode()
 
     try:
-        df, api_success = get_pending_orders(env_dv)
+        df, api_success = await asyncio.to_thread(get_pending_orders, env_dv)
 
         # API 실패 시 (rate limit 등) 이전 캐시 반환 + TTL 갱신
         if not api_success:
@@ -1631,7 +1635,8 @@ async def cancel_order_api(request: CancelOrderRequest, http_request: Request):
     
     try:
         logging.info(f"취소 요청 수신: order_no={request.order_no}, org_no='{request.org_no}'")
-        result = cancel_order(
+        result = await asyncio.to_thread(
+            cancel_order,
             order_no=request.order_no,
             stock_code=request.stock_code,
             qty=request.qty,

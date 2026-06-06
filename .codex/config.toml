@@ -1,6 +1,6 @@
 openai_base_url = "http://127.0.0.1:18318/v1"
 model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
+model_reasoning_effort = "high"
 model_catalog_json = "/home/from0to01/open-trading-api/.codex/model-catalog-cliproxy.json"
 
 # Approval prefix rules are read from $CODEX_HOME/rules/default.rules.
@@ -138,19 +138,19 @@ trust_level = "trusted"
 [hooks.state]
 
 [hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:post_tool_use:0:0"]
-trusted_hash = "sha256:1b8a64f14c07f7f42d9e22ba4b4907027dbd7e4dc5d4db6c34c53b9263b2620b"
+trusted_hash = "sha256:1c909f67066adc0f43d8375e40d8b199993b9e74304921bf58063df5d6a09d35"
 
 [hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:pre_compact:0:0"]
-trusted_hash = "sha256:2d124c2cc70523587a243fb166c16aa343b2fca616fd9f77bd44ab74a75bcfae"
+trusted_hash = "sha256:764209f2dfd5a5ad20a73398adc3b48b5e2d6879b7c6e088787d4c333fff1b7b"
 
 [hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:pre_tool_use:0:0"]
-trusted_hash = "sha256:72fade31ac7a95e92bef200e83eae770f6961a9f6ff9f12596c3bccc1dfc566e"
+trusted_hash = "sha256:99378e03b01eb88642926bd418e1eea4e86233978fb2cb9933c9fd2f68331c56"
 
 [hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:session_start:0:0"]
-trusted_hash = "sha256:7b09a5a4e6f0bd5f6c7441a26e91fd060c1b4481028cc26aded89331ef90a8b0"
+trusted_hash = "sha256:f24b89dbaa8df97b13fbd25b6fe99ab67d412c81a9f200901b9b95258ca885c5"
 
 [hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:stop:0:0"]
-trusted_hash = "sha256:b9dfa7fe6d1c0cb5d9c539f73f44f7239043bfc2751126c317360b1dde249a3a"
+trusted_hash = "sha256:588d4d00f704c662f353d7e04ab2b0a6766231a2334a3375e1f2111c1b35934d"
 
 [hooks.state."agentmemory@agentmemory:hooks/hooks.codex.json:user_prompt_submit:0:0"]
-trusted_hash = "sha256:8f9e09b1ebf8c8b80a16c1c50203868d851c33942ce8e7cc1b26c4e4b6de891d"
+trusted_hash = "sha256:7486f3ad7bc09f3bb8f1ef1ba532b282bae45999d4a2bde12d1f3fc643683a25"

@@ -22,6 +22,7 @@ import {
   getOverseasBuyableAmount,
   getOverseasPendingOrders,
   cancelOverseasOrder,
+  deploymentLockedMode,
   type PriceData,
   type PendingOrder,
   type CancelOrderRequest,
@@ -71,7 +72,15 @@ export default function ExecutePage() {
 
 function ExecutePanel({ market }: { market: ExecuteMarket }) {
   const { status: authStatus } = useAuth();
-  const { holdings, balance, fetchHoldings, fetchBalance, resetThrottle, isLoading: accountLoading } = useAccount(market);
+  const {
+    holdings,
+    balance,
+    fetchHoldings,
+    fetchBalance,
+    resetThrottle,
+    isLoading: accountLoading,
+    error: accountError,
+  } = useAccount(market);
   const {
     strategies,
     selectedStrategy,
@@ -107,10 +116,14 @@ function ExecutePanel({ market }: { market: ExecuteMarket }) {
 
   // Pending orders state
   const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
+  const lockedMode = deploymentLockedMode();
 
   // Fetch holdings, balance, and pending orders when authenticated
   // 순차 호출: 모의투자 모드의 초당 요청 제한 준수
   useEffect(() => {
+    if (lockedMode === "vps") {
+      return;
+    }
     const fetchSequentially = async () => {
       await fetchHoldings();
       await fetchBalance();
@@ -120,7 +133,7 @@ function ExecutePanel({ market }: { market: ExecuteMarket }) {
       fetchSequentially();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authStatus.authenticated, authStatus.mode]);
+  }, [authStatus.authenticated, authStatus.mode, lockedMode]);
 
   const fetchPendingOrders = useCallback(async () => {
     try {
@@ -345,6 +358,7 @@ function ExecutePanel({ market }: { market: ExecuteMarket }) {
               holdings={holdings}
               pendingOrders={pendingOrders}
               balance={balance}
+              error={accountError}
               onRefresh={handleRefresh}
               onCancelOrder={handleCancelOrder}
               isLoading={accountLoading}

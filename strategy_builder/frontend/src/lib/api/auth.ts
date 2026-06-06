@@ -15,7 +15,7 @@ import type { AuthStatus, AuthMode, LoginRequest, LoginResponse, SwitchModeRespo
  * 로그인 (KIS API 인증)
  */
 export async function login(mode: AuthMode = "vps"): Promise<LoginResponse> {
-  const request: LoginRequest = { mode };
+  const request: LoginRequest = { mode: deploymentLockedMode() || mode };
   return apiPost<LoginResponse>("/api/auth/login", request);
 }
 
@@ -41,6 +41,10 @@ export async function getAuthStatus(): Promise<ApiResponse<AuthStatus>> {
  * 1분 쿨다운 적용
  */
 export async function switchMode(mode: AuthMode): Promise<SwitchModeResponse> {
+  const lockedMode = deploymentLockedMode();
+  if (lockedMode) {
+    throw new Error(`${lockedMode === "vps" ? "모의투자" : "실전투자"} 전용 서버입니다.`);
+  }
   return apiPost<SwitchModeResponse>("/api/auth/switch-mode", { mode });
 }
 
@@ -49,4 +53,11 @@ export async function switchMode(mode: AuthMode): Promise<SwitchModeResponse> {
  */
 export async function logout(): Promise<{ status: string; message: string }> {
   return apiPost<{ status: string; message: string }>("/api/auth/logout");
+}
+
+export function deploymentLockedMode(): AuthMode | null {
+  if (typeof window === "undefined") return null;
+  if (window.location.port === "8081") return "vps";
+  if (window.location.port === "8083") return "prod";
+  return null;
 }

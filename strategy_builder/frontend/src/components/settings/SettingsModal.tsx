@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import { X, RefreshCw, Database, Shield, Clock } from "lucide-react";
 import { useAuth } from "@/hooks";
+import { deploymentLockedMode } from "@/lib/api";
 import { getMasterStatus, collectMasterFiles } from "@/lib/api/symbols";
 import type { MasterStatus } from "@/types/symbols";
 import type { AuthMode } from "@/types/auth";
@@ -17,6 +18,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const [masterStatus, setMasterStatus] = useState<MasterStatus | null>(null);
   const [isCollecting, setIsCollecting] = useState(false);
   const [cooldownTimer, setCooldownTimer] = useState(0);
+  const lockedMode = deploymentLockedMode();
 
   // Fetch master status on mount
   useEffect(() => {
@@ -66,10 +68,11 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   };
 
   const handleLogin = async (mode: AuthMode) => {
-    await login(mode);
+    await login(lockedMode || mode);
   };
 
   const handleSwitchMode = async () => {
+    if (lockedMode) return;
     const newMode = status.mode === "vps" ? "prod" : "vps";
     const success = await switchMode(newMode);
     if (success) {
@@ -79,7 +82,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
   if (!isOpen) return null;
 
-  const canSwitch = status.can_switch_mode !== false && cooldownTimer === 0;
+  const canSwitch = !lockedMode && status.can_switch_mode !== false && cooldownTimer === 0;
   const isVps = status.mode === "vps";
 
   return (

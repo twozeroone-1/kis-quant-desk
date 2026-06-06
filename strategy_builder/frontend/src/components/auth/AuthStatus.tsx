@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { User, LogIn, LogOut, RefreshCw } from "lucide-react";
 import { useAuth, useAccount } from "@/hooks";
+import { deploymentLockedMode } from "@/lib/api";
 import type { AuthMode } from "@/types/auth";
 
 interface AuthStatusProps {
@@ -13,6 +14,7 @@ export function AuthStatus({ compact = false }: AuthStatusProps) {
   const { status, isLoading, error, login, logout, switchMode } = useAuth();
   const { info, fetchInfo } = useAccount();
   const [showDropdown, setShowDropdown] = useState(false);
+  const lockedMode = deploymentLockedMode();
 
   const handleLogin = async (mode: AuthMode) => {
     const success = await login(mode);
@@ -55,20 +57,24 @@ export function AuthStatus({ compact = false }: AuthStatusProps) {
         {showDropdown && (
           <div className="absolute right-0 top-full mt-2 w-48 bg-white dark:bg-slate-900 rounded-lg shadow-lg border border-slate-200 dark:border-slate-700 z-50">
             <div className="p-2">
-              <button
-                onClick={() => handleLogin("vps")}
-                className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                <span className="w-2 h-2 rounded-full bg-yellow-500" />
-                모의투자로 로그인
-              </button>
-              <button
-                onClick={() => handleLogin("prod")}
-                className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-slate-100 dark:hover:bg-slate-800"
-              >
-                <span className="w-2 h-2 rounded-full bg-green-500" />
-                실전투자로 로그인
-              </button>
+              {(!lockedMode || lockedMode === "vps") && (
+                <button
+                  onClick={() => handleLogin("vps")}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  <span className="w-2 h-2 rounded-full bg-yellow-500" />
+                  모의투자로 로그인
+                </button>
+              )}
+              {(!lockedMode || lockedMode === "prod") && (
+                <button
+                  onClick={() => handleLogin("prod")}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  <span className="w-2 h-2 rounded-full bg-green-500" />
+                  실전투자로 로그인
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -125,11 +131,11 @@ export function AuthStatus({ compact = false }: AuthStatusProps) {
           <div className="p-2">
             <button
               onClick={handleSwitchMode}
-              disabled={isLoading}
+              disabled={isLoading || status.can_switch_mode === false || Boolean(lockedMode)}
               className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-slate-100 dark:hover:bg-slate-800"
             >
               <RefreshCw className={`w-4 h-4 ${isLoading ? "animate-spin" : ""}`} />
-              {isVps ? "실전투자로 전환" : "모의투자로 전환"}
+              {lockedMode ? "포트별 모드 고정" : isVps ? "실전투자로 전환" : "모의투자로 전환"}
             </button>
             <button
               onClick={handleLogout}

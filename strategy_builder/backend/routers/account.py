@@ -3,6 +3,7 @@
 """
 
 import logging
+import asyncio
 from datetime import datetime
 
 from fastapi import APIRouter
@@ -170,9 +171,17 @@ async def get_holdings():
         # 환경 확인 (trading_state에서 현재 모드 가져오기)
         env_dv = get_current_mode()
         
-        holdings_df = data_fetcher.get_holdings(env_dv)
+        holdings_df = await asyncio.to_thread(data_fetcher.get_holdings, env_dv)
 
         if holdings_df.empty:
+            if data_fetcher.get_balance_cache_error(env_dv):
+                add_log("error", "KIS 계좌 API 응답 지연으로 보유 종목을 확인할 수 없습니다")
+                return HoldingsResponse(
+                    status="error",
+                    data=[],
+                    message="KIS 계좌 API 응답 지연으로 보유 종목을 확인할 수 없습니다",
+                    logs=logs
+                )
             add_log("info", "보유 종목이 없습니다")
             return HoldingsResponse(
                 status="success",
@@ -237,7 +246,7 @@ async def get_balance():
         # 환경 확인 (trading_state에서 현재 모드 가져오기)
         env_dv = get_current_mode()
         
-        deposit_info = data_fetcher.get_deposit(env_dv)
+        deposit_info = await asyncio.to_thread(data_fetcher.get_deposit, env_dv)
 
         if not deposit_info:
             add_log("warning", "예수금 정보를 가져올 수 없습니다")
@@ -299,7 +308,7 @@ async def get_buyable(stock_code: str, price: int = 0):
 
         # 가격이 0이면 현재가 조회
         if price <= 0:
-            current = data_fetcher.get_current_price(stock_code, env_dv)
+            current = await asyncio.to_thread(data_fetcher.get_current_price, stock_code, env_dv)
             price = current.get("price", 0)
             
             if price <= 0:
@@ -308,7 +317,7 @@ async def get_buyable(stock_code: str, price: int = 0):
                     "message": "현재가를 조회할 수 없습니다"
                 }
 
-        buyable = data_fetcher.get_buyable_amount(stock_code, price, env_dv)
+        buyable = await asyncio.to_thread(data_fetcher.get_buyable_amount, stock_code, price, env_dv)
 
         return {
             "status": "success",

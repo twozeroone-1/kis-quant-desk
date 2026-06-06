@@ -74,6 +74,7 @@ _balance_cache = {
     "data": None,
     "timestamp": 0.0,
     "env_dv": None,
+    "error": None,
 }
 _BALANCE_CACHE_TTL = 10  # 10초 캐시
 
@@ -119,30 +120,48 @@ def _get_balance_cached(env_dv: str = "real"):
     with _balance_cache_lock:
         now = time.monotonic()
         if (
-            _balance_cache["data"] is not None
-            and _balance_cache["env_dv"] == env_dv
+            _balance_cache["env_dv"] == env_dv
             and (now - _balance_cache["timestamp"]) < _BALANCE_CACHE_TTL
         ):
             return _balance_cache["data"]
 
     # 캐시 미스: API 호출 (lock 밖에서 실행하여 blocking 최소화)
-    data = _fetch_balance_raw(env_dv)
+    error = None
+    try:
+        data = _fetch_balance_raw(env_dv)
+    except Exception as exc:
+        logging.error(f"잔고 원본 조회 에러: {exc}")
+        error = str(exc)
+        data = None
 
     with _balance_cache_lock:
         _balance_cache = {
             "data": data,
             "timestamp": time.monotonic(),
             "env_dv": env_dv,
+            "error": error,
         }
 
     return data
+
+
+def get_balance_cache_error(env_dv: str | None = None) -> str | None:
+    """Return the latest balance fetch error while the cache entry is fresh."""
+    with _balance_cache_lock:
+        now = time.monotonic()
+        if env_dv is not None and _balance_cache["env_dv"] != env_dv:
+            return None
+        if (now - _balance_cache["timestamp"]) >= _BALANCE_CACHE_TTL:
+            return None
+        error = _balance_cache.get("error")
+        return str(error) if error else None
 
 
 def clear_balance_cache():
     """잔고 캐시 강제 삭제 (주문 후 등)"""
     global _balance_cache
     with _balance_cache_lock:
-        _balance_cache = {"data": None, "timestamp": 0.0, "env_dv": None}
+        _balance_cache = {"data": None, "timestamp": 0.0, "env_dv": None, "error": None}
 
 
 # =============================================================================

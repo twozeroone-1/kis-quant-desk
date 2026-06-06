@@ -7,9 +7,9 @@ import {
   Briefcase,
   RefreshCw,
   Clock,
-  X,
   Wallet,
   Loader2,
+  AlertCircle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Holding, Balance } from "@/types/account";
@@ -19,6 +19,7 @@ interface HoldingsListProps {
   holdings: Holding[];
   pendingOrders?: PendingOrder[];
   balance?: Balance | null;
+  error?: string | null;
   onRefresh?: () => void;
   onCancelOrder?: (request: CancelOrderRequest) => Promise<void>;
   isLoading?: boolean;
@@ -31,6 +32,7 @@ export function HoldingsList({
   holdings,
   pendingOrders = [],
   balance,
+  error,
   onRefresh,
   onCancelOrder,
   isLoading,
@@ -165,6 +167,13 @@ export function HoldingsList({
         )}
       </div>
 
+      {error && (
+        <div className="mx-4 mt-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200">
+          <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
       {/* Holdings Tab Content */}
       {activeTab === "holdings" && (
         <>
@@ -198,7 +207,7 @@ export function HoldingsList({
           {holdings.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-slate-400">
               <Briefcase className="w-12 h-12 mb-3 opacity-30" />
-              <p>보유 종목이 없습니다</p>
+              <p>{error ? "보유 종목을 확인할 수 없습니다" : "보유 종목이 없습니다"}</p>
             </div>
           ) : (
             <div className="divide-y divide-slate-200 dark:divide-slate-700">

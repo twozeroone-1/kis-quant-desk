@@ -20,6 +20,7 @@ export {
   getAuthStatus,
   logout,
   switchMode,
+  deploymentLockedMode,
 } from "./auth";
 
 // Symbols

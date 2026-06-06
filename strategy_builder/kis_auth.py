@@ -80,6 +80,28 @@ def _rest_min_interval_for_mode(mode):
 
 _smartSleep = _rest_min_interval_for_mode(os.environ.get("KIS_LOCK_MODE"))
 
+
+def _auth_timeout_seconds() -> float:
+    configured = os.environ.get("KIS_AUTH_TIMEOUT_SECONDS")
+    if configured is None:
+        return 10.0
+    try:
+        return max(1.0, float(configured))
+    except ValueError:
+        logging.warning("Invalid KIS_AUTH_TIMEOUT_SECONDS=%r; using default", configured)
+        return 10.0
+
+
+def _rest_timeout_seconds() -> float:
+    configured = os.environ.get("KIS_REST_TIMEOUT_SECONDS")
+    if configured is None:
+        return 10.0
+    try:
+        return max(1.0, float(configured))
+    except ValueError:
+        logging.warning("Invalid KIS_REST_TIMEOUT_SECONDS=%r; using default", configured)
+        return 10.0
+
 # Rate Limiter: 모든 REST API 호출을 직렬화하여 초당 제한 준수
 import threading
 
@@ -248,7 +270,10 @@ def auth(svr="prod", product=_cfg["my_prod"], url=None):
     if saved_token is None:  # 기존 발급 토큰 확인이 안되면 발급처리
         url = f"{_cfg[svr]}/oauth2/tokenP"
         res = requests.post(
-            url, data=json.dumps(p), headers=_getBaseHeader()
+            url,
+            data=json.dumps(p),
+            headers=_getBaseHeader(),
+            timeout=_auth_timeout_seconds(),
         )  # 토큰 발급
         rescode = res.status_code
         if rescode == 200:  # 토큰 정상 발급
@@ -385,7 +410,7 @@ def _reauth_current_env():
 def set_order_hash_key(h, p):
     url = f"{getTREnv().my_url}/uapi/hashkey"  # hashkey 발급 API URL
 
-    res = requests.post(url, data=json.dumps(p), headers=h)
+    res = requests.post(url, data=json.dumps(p), headers=h, timeout=_rest_timeout_seconds())
     rescode = res.status_code
     if rescode == 200:
         h["hashkey"] = _getResultObject(res.json()).HASH
@@ -555,8 +580,8 @@ def _url_fetch(
     def send_request():
         if postFlag:
             # if (hashFlag): set_order_hash_key(headers, params)
-            return requests.post(url, headers=headers, data=json.dumps(params))
-        return requests.get(url, headers=headers, params=params)
+            return requests.post(url, headers=headers, data=json.dumps(params), timeout=_rest_timeout_seconds())
+        return requests.get(url, headers=headers, params=params, timeout=_rest_timeout_seconds())
 
     res = None
     for attempt in range(_RATE_LIMIT_RETRY_ATTEMPTS + 1):
@@ -624,7 +649,7 @@ def auth_ws(svr="prod", product=_cfg["my_prod"]):
     p["secretkey"] = _cfg[ak2]
 
     url = f"{_cfg[svr]}/oauth2/Approval"
-    res = requests.post(url, data=json.dumps(p), headers=_getBaseHeader())  # 토큰 발급
+    res = requests.post(url, data=json.dumps(p), headers=_getBaseHeader(), timeout=_auth_timeout_seconds())  # 토큰 발급
     rescode = res.status_code
     if rescode == 200:  # 토큰 정상 발급
         approval_key = _getResultObject(res.json()).approval_key
