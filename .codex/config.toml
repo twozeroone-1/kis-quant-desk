@@ -1,6 +1,6 @@
-openai_base_url = "http://127.0.0.1:18317/v1"
+openai_base_url = "http://127.0.0.1:18318/v1"
 model = "gpt-5.5"
-model_reasoning_effort = "high"
+model_reasoning_effort = "xhigh"
 model_catalog_json = "/home/from0to01/open-trading-api/.codex/model-catalog-cliproxy.json"
 
 # Approval prefix rules are read from $CODEX_HOME/rules/default.rules.
@@ -47,6 +47,12 @@ AGENTMEMORY_URL = "http://127.0.0.1:3117"
 AGENTMEMORY_TOOLS = "all"
 AGENTMEMORY_FORCE_PROXY = "1"
 AGENTMEMORY_PROBE_TIMEOUT_MS = "5000"
+
+[mcp_servers.agentmemory.tools.memory_recall]
+approval_mode = "approve"
+
+[mcp_servers.agentmemory.tools.memory_smart_search]
+approval_mode = "approve"
 
 # Skills 경로 명시 (Codex는 .agents/skills/ 자동 탐색 불가, 명시 필요)
 [[skills.config]]
@@ -99,14 +105,14 @@ multi_agent = false
 shell_tool = true
 terminal_resize_reflow = true
 network_proxy = true
-mentions_v2 = true
+mentions_v2 = false
 
 [plugins."agentmemory@agentmemory"]
 enabled = true
 
 [marketplaces.agentmemory]
-last_updated = "2026-05-31T23:33:29Z"
-last_revision = "fd9e3bd42d6208a33f0ee9de1442fdbb60eab106"
+last_updated = "2026-06-06T00:23:19Z"
+last_revision = "a323fb0b96a730df9d417b7313450c571740941b"
 source_type = "git"
 source = "https://github.com/rohitg00/agentmemory.git"
 

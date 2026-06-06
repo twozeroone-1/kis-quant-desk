@@ -17,11 +17,13 @@ services:
       KIS_LOCK_MODE: vps
       AUDIT_LOG_DIR: ${AUDIT_LOG_DIR:-/var/log/kis/orders}
       AUDIT_LOG_RETENTION_DAYS: ${AUDIT_LOG_RETENTION_DAYS:-365}
+      US_MARKET_REPORT_DIR: /app/us-market-reports
     volumes:
       - ${KIS_CONFIG_BIND_DIR:-/home/from0to01/KIS/config}:/home/kis/KIS/config
       - ${KIS_LOG_BIND_DIR:-/home/from0to01/.local/state/kis-stack/logs}:/var/log/kis
       - ${KIS_TOKEN_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/token-vps}:/home/kis/KIS/token-vps
       - ${KIS_RUNTIME_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/runtime-vps}:/app/.runtime-vps
+      - ./.codex/runtime/us_market_auto:/app/us-market-reports:ro
     expose:
       - "8000"
     healthcheck:

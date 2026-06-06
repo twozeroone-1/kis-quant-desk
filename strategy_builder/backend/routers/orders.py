@@ -21,7 +21,13 @@ from core.signal import Action, Signal
 from core.data_fetcher import get_deposit, get_holdings, get_pending_orders, cancel_order, clear_balance_cache
 from backend import is_authenticated, get_current_mode
 from backend.services.audit_log import write_order_audit
+from backend.services.app_reservations import (
+    cancel_app_reservation,
+    create_app_reservation,
+    list_app_reservations,
+)
 from backend.services.protective_orders import (
+    list_protective_app_reservations,
     list_protective_orders,
     register_after_buy,
     run_monitor_cycle,
@@ -51,6 +57,7 @@ PENDING_CACHE_TTL = 5
 _optimistic_order_nos: set[str] = set()
 _optimistic_added_at: Optional[datetime] = None
 OPTIMISTIC_GRACE_SECONDS = 15
+PROTECTIVE_API_EVENT_LIMIT = 10
 
 
 def _get_cached_account(force_refresh: bool = False) -> dict:
@@ -115,6 +122,25 @@ def _clear_account_cache():
     clear_balance_cache()
 
 
+def _compact_protective_order_for_api(order: dict) -> dict:
+    """Keep persisted audit history intact while returning a small UI payload."""
+    compacted = dict(order)
+    events = compacted.get("events")
+    if isinstance(events, list):
+        compacted["events_count"] = len(events)
+        compacted["events"] = events[-PROTECTIVE_API_EVENT_LIMIT:]
+        compacted["events_truncated"] = len(events) > PROTECTIVE_API_EVENT_LIMIT
+    return compacted
+
+
+def _compact_protective_orders_for_api(orders: list) -> list[dict]:
+    return [
+        _compact_protective_order_for_api(order)
+        for order in orders
+        if isinstance(order, dict)
+    ]
+
+
 class ProtectiveOrderRequest(BaseModel):
     """매수 후 생성할 앱 레벨 OCO 보호주문"""
     enabled: bool = False
@@ -146,6 +172,11 @@ class ProtectiveReviewRequest(BaseModel):
 class ProtectiveSettingsRequest(BaseModel):
     """전략 검토 감시 서비스 설정"""
     monitor_interval_seconds: int
+    us_stop_loss_limit_offset_pct: float | None = None
+    us_take_profit_limit_offset_pct: float | None = None
+    exit_reprice_interval_seconds: int | None = None
+    us_exit_reprice_step_pct: float | None = None
+    us_exit_max_offset_pct: float | None = None
 
 
 class OrderRequest(BaseModel):
@@ -701,7 +732,7 @@ class CancelOrderResponse(BaseModel):
 
 
 class ReservationSubmitRequest(BaseModel):
-    """브로커 예약주문 접수 요청"""
+    """브로커 또는 앱 예약주문 접수 요청"""
     market: str = "domestic"
     stock_code: str
     stock_name: str = ""
@@ -712,15 +743,19 @@ class ReservationSubmitRequest(BaseModel):
     exchange: str | None = None
     end_date: str | None = None
     confirm_prod: bool = False
+    reservation_source: str = "broker"
+    scheduled_at: str | None = None
+    expires_at: str | None = None
 
 
 class ReservationCancelRequest(BaseModel):
-    """브로커 예약주문 취소 요청"""
+    """브로커 또는 앱 예약주문 취소 요청"""
     market: str = "domestic"
     reservation_order_no: str
-    reservation_order_date: str
+    reservation_order_date: str = ""
     reservation_order_org_no: str = ""
     confirm_prod: bool = False
+    reservation_source: str = "broker"
 
 
 class ReservationModifyRequest(ReservationSubmitRequest):
@@ -800,7 +835,19 @@ def _normalize_reservation_submit_request(request: ReservationSubmitRequest) -> 
     request.stock_name = request.stock_name.strip()
     request.exchange = request.exchange.strip().upper() if request.exchange else None
     request.end_date = _compact_date(request.end_date, "") or None
+    request.reservation_source = request.reservation_source.strip().lower()
     return request
+
+
+def _validate_reservation_source(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in {"broker", "app", "all"}:
+        raise HTTPException(status_code=400, detail="예약주문 소스가 올바르지 않습니다")
+    return normalized
+
+
+def _with_broker_source(rows: list[dict]) -> list[dict]:
+    return [{**row, "reservation_source": "broker"} for row in rows]
 
 
 def _compact_date(value: str | None, default: str) -> str:
@@ -833,7 +880,7 @@ def _reservation_success_data(
 
 @router.post("/reservations")
 async def submit_reservation_order_api(request: ReservationSubmitRequest, http_request: Request):
-    """브로커 예약주문 접수."""
+    """브로커 또는 앱 예약주문 접수."""
     authenticated_user = http_request.headers.get("X-Authenticated-User", "unknown")
     request = _normalize_reservation_submit_request(request)
 
@@ -851,6 +898,49 @@ async def submit_reservation_order_api(request: ReservationSubmitRequest, http_r
             "error_message": "인증이 필요합니다",
         })
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
+
+    request.reservation_source = _validate_reservation_source(request.reservation_source)
+    if request.reservation_source == "all":
+        raise HTTPException(status_code=400, detail="예약주문 접수 소스는 broker 또는 app이어야 합니다")
+    if request.reservation_source == "app":
+        try:
+            order = await create_app_reservation(
+                market=request.market,
+                stock_code=request.stock_code,
+                stock_name=request.stock_name,
+                action=request.action,
+                quantity=request.quantity,
+                price=request.price,
+                order_type=request.order_type,
+                exchange=request.exchange,
+                scheduled_at=request.scheduled_at,
+                expires_at=request.expires_at,
+                authenticated_user=authenticated_user,
+            )
+        except ValueError as exc:
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": get_current_mode(),
+                "action": "app_reservation_create",
+                "stock_code": request.stock_code,
+                "quantity": request.quantity,
+                "price": request.price,
+                "order_type": request.order_type,
+                "result": "error",
+                "order_id": None,
+                "error_message": str(exc),
+            })
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "status": "success",
+            "message": "앱 예약주문이 저장되었습니다",
+            "data": {
+                **order,
+                "reservation_order_no": order.get("id"),
+                "reservation_order_date": str(order.get("created_at", ""))[:10].replace("-", ""),
+                "reservation_order_org_no": "app",
+            },
+        }
 
     _validate_reservation_submit(request)
     _require_prod_confirmation(request.confirm_prod)
@@ -923,14 +1013,16 @@ async def get_reservation_orders_api(
     action: str = "",
     exchange: str = "NASD",
     include_cancelled: bool = True,
+    reservation_source: str = "broker",
 ):
-    """브로커 예약주문 목록 조회."""
+    """브로커 또는 앱 예약주문 목록 조회."""
     if not is_authenticated():
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
 
     normalized_market = market.strip().lower()
     if normalized_market not in {"domestic", "us"}:
         raise HTTPException(status_code=400, detail="시장 구분이 올바르지 않습니다")
+    source = _validate_reservation_source(reservation_source)
 
     today = datetime.now().strftime("%Y%m%d")
     default_start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
@@ -939,6 +1031,37 @@ async def get_reservation_orders_api(
     normalized_action = action.strip().upper()
     if normalized_action and normalized_action not in {"BUY", "SELL"}:
         raise HTTPException(status_code=400, detail="예약주문 방향이 올바르지 않습니다")
+    normalized_stock_code = stock_code.strip().upper() if normalized_market == "us" else stock_code.strip()
+
+    app_orders: list[dict] = []
+    if source in {"app", "all"}:
+        app_orders = await list_app_reservations(
+            market=normalized_market,
+            start_date=start,
+            end_date=end,
+            include_cancelled=include_cancelled,
+        )
+        if normalized_market == "us":
+            protective_orders = await list_protective_app_reservations()
+            protective_orders = [
+                order for order in protective_orders
+                if start <= str(order.get("reservation_order_date") or "") <= end
+            ]
+            app_orders.extend(protective_orders)
+        if normalized_action:
+            app_orders = [order for order in app_orders if order.get("action") == normalized_action]
+        if normalized_stock_code:
+            app_orders = [order for order in app_orders if str(order.get("stock_code") or "") == normalized_stock_code]
+        if source == "app":
+            return {
+                "status": "success",
+                "orders": app_orders,
+                "total_count": len(app_orders),
+                "market": normalized_market,
+                "reservation_source": "app",
+                "start_date": start,
+                "end_date": end,
+            }
 
     if normalized_market == "us":
         env_dv = get_current_mode()
@@ -952,24 +1075,41 @@ async def get_reservation_orders_api(
         result = reserved_orders.list_domestic_reservations(
             start_date=start,
             end_date=end,
-            stock_code=stock_code.strip(),
+            stock_code=normalized_stock_code,
             action=normalized_action,
             include_cancelled=include_cancelled,
         )
 
     if not result.success:
+        if source == "all":
+            return {
+                "status": "success",
+                "message": f"브로커 예약조회 실패: {result.display_error()}",
+                "orders": app_orders,
+                "total_count": len(app_orders),
+                "market": normalized_market,
+                "reservation_source": "all",
+                "start_date": start,
+                "end_date": end,
+                "data": {
+                    "broker_error": _reservation_error_response(result),
+                },
+            }
         return {
             **_reservation_error_response(result),
             "orders": [],
             "total_count": 0,
         }
 
-    orders = result.records()
+    orders = _with_broker_source(result.records())
+    if source == "all":
+        orders = orders + app_orders
     return {
         "status": "success",
         "orders": orders,
         "total_count": len(orders),
         "market": normalized_market,
+        "reservation_source": source,
         "start_date": start,
         "end_date": end,
     }
@@ -977,11 +1117,13 @@ async def get_reservation_orders_api(
 
 @router.post("/reservations/cancel")
 async def cancel_reservation_order_api(request: ReservationCancelRequest, http_request: Request):
-    """브로커 예약주문 취소."""
+    """브로커 또는 앱 예약주문 취소."""
     authenticated_user = http_request.headers.get("X-Authenticated-User", "unknown")
     request.market = request.market.strip().lower()
+    request.reservation_source = _validate_reservation_source(request.reservation_source)
     request.reservation_order_no = request.reservation_order_no.strip()
-    request.reservation_order_date = _compact_date(request.reservation_order_date, "")
+    if request.reservation_source != "app":
+        request.reservation_order_date = _compact_date(request.reservation_order_date, "")
     request.reservation_order_org_no = request.reservation_order_org_no.strip()
 
     if not is_authenticated():
@@ -998,8 +1140,40 @@ async def cancel_reservation_order_api(request: ReservationCancelRequest, http_r
             "error_message": "인증이 필요합니다",
         })
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
+    if request.reservation_source == "all":
+        raise HTTPException(status_code=400, detail="예약주문 취소 소스는 broker 또는 app이어야 합니다")
     if request.market not in {"domestic", "us"}:
         raise HTTPException(status_code=400, detail="시장 구분이 올바르지 않습니다")
+    if request.reservation_source == "app":
+        if get_current_mode() != "vps":
+            raise HTTPException(status_code=400, detail="앱 예약주문 취소는 8081 모의투자(vps)에서만 사용할 수 있습니다")
+        if not request.reservation_order_no:
+            raise HTTPException(status_code=400, detail="앱 예약주문번호가 필요합니다")
+        try:
+            data = await cancel_app_reservation(
+                reservation_id=request.reservation_order_no,
+                authenticated_user=authenticated_user,
+            )
+        except ValueError as exc:
+            write_order_audit({
+                "authenticated_user": authenticated_user,
+                "mode": get_current_mode(),
+                "action": "app_reservation_cancel",
+                "stock_code": "",
+                "quantity": None,
+                "price": None,
+                "order_type": None,
+                "result": "error",
+                "order_id": request.reservation_order_no,
+                "error_message": str(exc),
+            })
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "status": "success",
+            "message": "앱 예약주문이 취소되었습니다",
+            "data": data,
+        }
+
     if not request.reservation_order_no or not request.reservation_order_date:
         raise HTTPException(status_code=400, detail="예약주문번호와 주문일자가 필요합니다")
 
@@ -1080,6 +1254,12 @@ async def modify_reservation_order_api(request: ReservationModifyRequest, http_r
         })
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
 
+    request.reservation_source = _validate_reservation_source(request.reservation_source)
+    if request.reservation_source == "app":
+        raise HTTPException(status_code=400, detail="앱 예약주문 정정은 지원하지 않습니다. 취소 후 재등록하세요")
+    if request.reservation_source == "all":
+        raise HTTPException(status_code=400, detail="예약주문 정정 소스는 broker 또는 app이어야 합니다")
+
     _validate_reservation_submit(request)
     _require_prod_confirmation(request.confirm_prod)
     if request.market != "domestic":
@@ -1142,11 +1322,13 @@ async def get_protective_orders_api():
     if not is_authenticated():
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
     state = await list_protective_orders()
+    orders = state.get("orders", [])
     return {
         "status": "success",
-        "orders": state.get("orders", []),
-        "total_count": len(state.get("orders", [])),
+        "orders": _compact_protective_orders_for_api(orders),
+        "total_count": len(orders),
         "settings": state.get("settings", {}),
+        "health": state.get("health", {}),
         "realtime": get_realtime_price_stream().status(),
     }
 
@@ -1158,6 +1340,11 @@ async def update_protective_settings_api(request: ProtectiveSettingsRequest):
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
     settings = await update_monitor_settings(
         monitor_interval_seconds=request.monitor_interval_seconds,
+        us_stop_loss_limit_offset_pct=request.us_stop_loss_limit_offset_pct,
+        us_take_profit_limit_offset_pct=request.us_take_profit_limit_offset_pct,
+        exit_reprice_interval_seconds=request.exit_reprice_interval_seconds,
+        us_exit_reprice_step_pct=request.us_exit_reprice_step_pct,
+        us_exit_max_offset_pct=request.us_exit_max_offset_pct,
     )
     return {
         "status": "success",
@@ -1219,11 +1406,13 @@ async def check_protective_orders_api():
         raise HTTPException(status_code=401, detail="인증이 필요합니다")
     await run_monitor_cycle()
     state = await list_protective_orders()
+    orders = state.get("orders", [])
     return {
         "status": "success",
-        "orders": state.get("orders", []),
-        "total_count": len(state.get("orders", [])),
+        "orders": _compact_protective_orders_for_api(orders),
+        "total_count": len(orders),
         "settings": state.get("settings", {}),
+        "health": state.get("health", {}),
         "realtime": get_realtime_price_stream().status(),
     }
 

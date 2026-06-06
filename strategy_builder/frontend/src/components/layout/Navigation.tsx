@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { CalendarClock, TrendingUp, Sparkles, Play, Settings, ShieldCheck } from "lucide-react";
+import { Activity, CalendarClock, TrendingUp, Sparkles, Play, Settings, ShieldCheck } from "lucide-react";
 import { useAuth } from "@/hooks";
 import { SettingsModal } from "@/components/settings";
 
@@ -12,6 +12,7 @@ const navItems = [
   { href: "/execute", label: "전략 실행", icon: Play },
   { href: "/review", label: "전략 검토", icon: ShieldCheck },
   { href: "/reservations", label: "예약주문", icon: CalendarClock },
+  { href: "/automation", label: "자동매매", icon: Activity, vpsOnly: true },
 ];
 
 export function Navigation() {
@@ -28,7 +29,7 @@ export function Navigation() {
   return (
     <>
       <header className="sticky top-0 z-50 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800">
-        <div className="w-full px-4">
+        <div className="w-full px-2 sm:px-4">
           <div className="flex items-center justify-between h-16">
             {/* 로고 */}
             <Link href="/" className="flex items-center gap-3 focus-ring rounded-lg" aria-label="KIS Strategy Builder 홈">
@@ -48,6 +49,7 @@ export function Navigation() {
             {/* 네비게이션 */}
             <nav className="flex items-center gap-1" aria-label="메인 네비게이션">
               {navItems.map((item) => {
+                if (item.vpsOnly && !isVps) return null;
                 const isActive = pathname === item.href;
                 const Icon = item.icon;
                 return (
@@ -56,7 +58,7 @@ export function Navigation() {
                     href={item.href}
                     aria-current={isActive ? "page" : undefined}
                     aria-label={item.label}
-                    className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors focus-ring ${
+                    className={`flex items-center gap-2 px-2.5 sm:px-4 py-2 rounded-lg text-sm font-medium transition-colors focus-ring ${
                       isActive
                         ? "bg-primary/10 text-primary"
                         : "text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800"

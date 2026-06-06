@@ -307,6 +307,7 @@ def get_current_price(symbol: str, env_dv: str = "real", exchange: Optional[str]
         change_rate = _to_float(_first_value(row, ("rate", "prdy_ctrt"), (change / prev * 100) if prev else 0))
         data = {
             "price": price,
+            "previous_close": prev,
             "change": change,
             "change_rate": change_rate,
             "high": _to_float(_first_value(row, ("high", "stck_hgpr"), 0)),

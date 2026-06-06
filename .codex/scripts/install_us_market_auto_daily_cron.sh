@@ -18,9 +18,7 @@ if ! grep -q '^CRON_TZ=Asia/Seoul$' "$tmp"; then
 fi
 
 cat >> "$tmp" <<EOF
-45 23 * * 1-5 $PROJECT_ROOT/.codex/scripts/run_us_market_auto_daily.sh open >> $LOG_DIR/cron_daily.log 2>&1 # KIS_US_MARKET_AUTO_DAILY
-45 2 * * 2-6 $PROJECT_ROOT/.codex/scripts/run_us_market_auto_daily.sh mid >> $LOG_DIR/cron_daily.log 2>&1 # KIS_US_MARKET_AUTO_DAILY
-45 4 * * 2-6 $PROJECT_ROOT/.codex/scripts/run_us_market_auto_daily.sh close >> $LOG_DIR/cron_daily.log 2>&1 # KIS_US_MARKET_AUTO_DAILY
+45 0-6,22-23 * * * $PROJECT_ROOT/.codex/scripts/run_us_market_auto_daily.sh hourly >> $LOG_DIR/cron_daily.log 2>&1 # KIS_US_MARKET_AUTO_DAILY
 EOF
 
 crontab "$tmp"

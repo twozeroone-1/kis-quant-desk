@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { CalendarClock, Loader2, RefreshCw, Send, Trash2 } from "lucide-react";
+import { Building2, CalendarClock, Loader2, RefreshCw, Send, ServerCog, Trash2 } from "lucide-react";
 import {
   cancelReservationOrder,
   getReservationOrders,
@@ -9,11 +9,13 @@ import {
   type ReservationAction,
   type ReservationMarket,
   type ReservationOrderItem,
+  type ReservationSource,
   type ReservationOrderType,
 } from "@/lib/api";
 import { useAuth } from "@/hooks";
 
 type ReservationExchange = "NASD" | "NYSE" | "AMEX";
+type VisibleReservationSource = Exclude<ReservationSource, "all">;
 type Notice = { type: "success" | "error" | "info"; message: string } | null;
 
 const ORDER_NO_KEYS = [
@@ -51,11 +53,29 @@ const STATUS_KEYS = [
   "CNCL_YN",
   "cncl_yn",
 ];
+const SOURCE_KEYS = ["reservation_source"];
+const SCHEDULED_KEYS = ["scheduled_at"];
+const EXPIRES_KEYS = ["expires_at"];
+const SUBMITTED_KEYS = ["submitted_order_no"];
+const ERROR_KEYS = ["last_error"];
 
 function today(offsetDays = 0): string {
   const date = new Date();
   date.setDate(date.getDate() + offsetDays);
   return date.toISOString().slice(0, 10);
+}
+
+function datetimeLocal(offsetMinutes = 0): string {
+  const date = new Date(Date.now() + offsetMinutes * 60000);
+  return new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date).replace(" ", "T");
 }
 
 function field(row: ReservationOrderItem, keys: string[]): string {
@@ -74,6 +94,20 @@ function formatDate(value: string): string {
   return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
 }
 
+function formatDateTime(value: string): string {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("ko-KR", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function formatNumber(value: string): string {
   const numeric = Number(value.replace(/,/g, ""));
   return Number.isFinite(numeric) && value !== "" ? numeric.toLocaleString() : value;
@@ -89,13 +123,17 @@ function extractError(error: unknown): string {
   }
 }
 
-function orderTypeOptions(market: ReservationMarket, action: ReservationAction): ReservationOrderType[] {
+function orderTypeOptions(source: VisibleReservationSource, market: ReservationMarket, action: ReservationAction): ReservationOrderType[] {
+  if (source === "app") {
+    return market === "domestic" ? ["limit", "market"] : ["limit"];
+  }
   if (market === "domestic") return ["limit", "market", "preopen"];
   return action === "SELL" ? ["limit", "moo"] : ["limit"];
 }
 
 export default function ReservationsPage() {
   const { status: authStatus } = useAuth();
+  const [reservationSource, setReservationSource] = useState<VisibleReservationSource>("app");
   const [market, setMarket] = useState<ReservationMarket>("domestic");
   const [action, setAction] = useState<ReservationAction>("BUY");
   const [orderType, setOrderType] = useState<ReservationOrderType>("limit");
@@ -105,6 +143,8 @@ export default function ReservationsPage() {
   const [quantity, setQuantity] = useState(1);
   const [price, setPrice] = useState(0);
   const [endDate, setEndDate] = useState("");
+  const [scheduledAt, setScheduledAt] = useState(datetimeLocal(10));
+  const [expiresAt, setExpiresAt] = useState(datetimeLocal(40));
   const [confirmProd, setConfirmProd] = useState(false);
   const [startDate, setStartDate] = useState(today(-30));
   const [listEndDate, setListEndDate] = useState(today());
@@ -116,8 +156,17 @@ export default function ReservationsPage() {
 
   const isProd = authStatus.mode === "prod";
   const modeLabel = authStatus.mode_display || (isProd ? "실전투자" : "모의투자");
-  const availableOrderTypes = useMemo(() => orderTypeOptions(market, action), [market, action]);
+  const availableOrderTypes = useMemo(
+    () => orderTypeOptions(reservationSource, market, action),
+    [reservationSource, market, action]
+  );
   const needsPrice = orderType === "limit";
+
+  useEffect(() => {
+    if (isProd && reservationSource === "app") {
+      setReservationSource("broker");
+    }
+  }, [isProd, reservationSource]);
 
   useEffect(() => {
     if (!availableOrderTypes.includes(orderType)) {
@@ -135,6 +184,7 @@ export default function ReservationsPage() {
         end_date: listEndDate,
         exchange,
         include_cancelled: true,
+        reservation_source: reservationSource,
       });
       if (response.status === "success") {
         setOrders(response.orders || []);
@@ -149,7 +199,7 @@ export default function ReservationsPage() {
     } finally {
       setLoading(false);
     }
-  }, [authStatus.authenticated, exchange, listEndDate, market, startDate]);
+  }, [authStatus.authenticated, exchange, listEndDate, market, reservationSource, startDate]);
 
   useEffect(() => {
     void refresh();
@@ -163,6 +213,14 @@ export default function ReservationsPage() {
     }
     if (isProd && !confirmProd) {
       setNotice({ type: "error", message: "실전 예약주문 확인이 필요합니다" });
+      return;
+    }
+    if (reservationSource === "app" && isProd) {
+      setNotice({ type: "error", message: "앱 예약주문은 모의투자에서만 사용할 수 있습니다" });
+      return;
+    }
+    if (reservationSource === "app" && !scheduledAt) {
+      setNotice({ type: "error", message: "앱 예약 실행시각이 필요합니다" });
       return;
     }
 
@@ -180,6 +238,9 @@ export default function ReservationsPage() {
         exchange: market === "us" ? exchange : undefined,
         end_date: market === "domestic" && endDate ? endDate : null,
         confirm_prod: isProd ? confirmProd : false,
+        reservation_source: reservationSource,
+        scheduled_at: reservationSource === "app" ? scheduledAt : null,
+        expires_at: reservationSource === "app" && expiresAt ? expiresAt : null,
       });
       setNotice({
         type: response.status === "success" ? "success" : "error",
@@ -200,16 +261,19 @@ export default function ReservationsPage() {
     const reservationOrderNo = field(row, ORDER_NO_KEYS);
     const reservationOrderDate = field(row, ORDER_DATE_KEYS);
     const reservationOrderOrgNo = field(row, ORDER_ORG_KEYS);
-    if (!reservationOrderNo || !reservationOrderDate) {
+    const rowSource = (field(row, SOURCE_KEYS) || reservationSource) as VisibleReservationSource;
+    if (!reservationOrderNo || (rowSource === "broker" && !reservationOrderDate)) {
       setNotice({ type: "error", message: "예약주문번호 또는 주문일자를 확인할 수 없습니다" });
       return;
     }
-    if (market === "domestic" && !reservationOrderOrgNo) {
+    if (rowSource === "broker" && market === "domestic" && !reservationOrderOrgNo) {
       setNotice({ type: "error", message: "국내 예약주문조직번호를 확인할 수 없습니다" });
       return;
     }
     const confirmed = window.confirm(
-      isProd ? "실전 예약주문을 취소합니다." : "예약주문을 취소합니다."
+      rowSource === "app"
+        ? "앱 예약주문을 취소합니다."
+        : isProd ? "실전 예약주문을 취소합니다." : "예약주문을 취소합니다."
     );
     if (!confirmed) return;
 
@@ -222,6 +286,7 @@ export default function ReservationsPage() {
         reservation_order_date: reservationOrderDate,
         reservation_order_org_no: reservationOrderOrgNo,
         confirm_prod: isProd,
+        reservation_source: rowSource,
       });
       setNotice({
         type: response.status === "success" ? "success" : "error",
@@ -289,6 +354,40 @@ export default function ReservationsPage() {
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[420px_1fr]">
         <form onSubmit={handleSubmit} className="card p-6 space-y-5">
+          <div className="space-y-2">
+            <label className="text-sm font-semibold text-slate-700 dark:text-slate-200">예약 방식</label>
+            <div className="grid grid-cols-2 gap-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 p-1">
+              {([
+                { value: "app" as const, label: "앱 예약", icon: ServerCog, disabled: isProd },
+                { value: "broker" as const, label: "브로커 예약", icon: Building2, disabled: false },
+              ]).map((item) => {
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={item.value}
+                    type="button"
+                    onClick={() => setReservationSource(item.value)}
+                    disabled={item.disabled}
+                    className={`inline-flex items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors disabled:opacity-40 ${
+                      reservationSource === item.value
+                        ? "bg-primary text-white"
+                        : "text-slate-600 hover:bg-white dark:text-slate-300 dark:hover:bg-slate-800"
+                    }`}
+                  >
+                    <Icon className="h-4 w-4" />
+                    {item.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {reservationSource === "app" && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+              앱 예약은 Strategy Builder 서버와 인증 상태에 의존하는 모의투자 전용 예약입니다.
+            </div>
+          )}
+
           <div className="space-y-2">
             <label className="text-sm font-semibold text-slate-700 dark:text-slate-200">시장</label>
             <div className="grid grid-cols-2 gap-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 p-1">
@@ -426,6 +525,30 @@ export default function ReservationsPage() {
             </label>
           )}
 
+          {reservationSource === "app" && (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <label className="space-y-2">
+                <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">실행시각(KST)</span>
+                <input
+                  type="datetime-local"
+                  value={scheduledAt}
+                  onChange={(event) => setScheduledAt(event.target.value)}
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                  required
+                />
+              </label>
+              <label className="space-y-2">
+                <span className="text-sm font-semibold text-slate-700 dark:text-slate-200">만료시각(KST)</span>
+                <input
+                  type="datetime-local"
+                  value={expiresAt}
+                  onChange={(event) => setExpiresAt(event.target.value)}
+                  className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                />
+              </label>
+            </div>
+          )}
+
           {isProd && (
             <label className="flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
               <input
@@ -444,7 +567,7 @@ export default function ReservationsPage() {
             className="btn-primary inline-flex w-full items-center justify-center gap-2 disabled:opacity-50"
           >
             {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-            접수
+            {reservationSource === "app" ? "앱 예약 저장" : "브로커 예약 접수"}
           </button>
         </form>
 
@@ -471,11 +594,12 @@ export default function ReservationsPage() {
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[780px] text-left text-sm">
+            <table className="w-full min-w-[960px] text-left text-sm">
               <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-500 dark:bg-slate-950 dark:text-slate-400">
                 <tr>
                   <th className="px-4 py-3">접수일</th>
                   <th className="px-4 py-3">예약번호</th>
+                  <th className="px-4 py-3">실행시각</th>
                   <th className="px-4 py-3">종목</th>
                   <th className="px-4 py-3">구분</th>
                   <th className="px-4 py-3 text-right">수량</th>
@@ -487,14 +611,14 @@ export default function ReservationsPage() {
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
                 {loading ? (
                   <tr>
-                    <td colSpan={8} className="px-4 py-10 text-center text-slate-500">
+                    <td colSpan={9} className="px-4 py-10 text-center text-slate-500">
                       <Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin" />
                       조회 중
                     </td>
                   </tr>
                 ) : orders.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="px-4 py-10 text-center text-slate-500">
+                    <td colSpan={9} className="px-4 py-10 text-center text-slate-500">
                       예약주문 없음
                     </td>
                   </tr>
@@ -507,14 +631,43 @@ export default function ReservationsPage() {
                     const side = field(row, ACTION_KEYS);
                     const qty = field(row, QTY_KEYS);
                     const orderPrice = field(row, PRICE_KEYS);
-                    const status = field(row, STATUS_KEYS);
+                    const rowSource = (field(row, SOURCE_KEYS) || reservationSource) as VisibleReservationSource;
+                    const rawStatus = String(row.status || "").trim();
+                    const status = rowSource === "app"
+                      ? field(row, ["RSVN_ORD_PRCS_STAT_NAME", "rsvn_ord_prcs_stat_name"]) || rawStatus
+                      : field(row, STATUS_KEYS);
                     const orgNo = field(row, ORDER_ORG_KEYS);
-                    const cancelDisabled = !orderNo || !orderDate || (market === "domestic" && !orgNo);
+                    const scheduled = field(row, SCHEDULED_KEYS);
+                    const expires = field(row, EXPIRES_KEYS);
+                    const submittedOrderNo = field(row, SUBMITTED_KEYS);
+                    const lastError = field(row, ERROR_KEYS);
+                    const appFinal = rowSource === "app" && ["submitted", "filled", "failed", "cancelled", "expired"].includes(rawStatus);
+                    const cancelDisabled = row.cancellable === false || !orderNo || appFinal || (rowSource === "broker" && (!orderDate || (market === "domestic" && !orgNo)));
 
                     return (
                       <tr key={`${orderNo || "row"}-${index}`} className="bg-white dark:bg-slate-900">
                         <td className="px-4 py-3 text-slate-600 dark:text-slate-300">{formatDate(orderDate)}</td>
-                        <td className="px-4 py-3 font-mono text-xs text-slate-700 dark:text-slate-200">{orderNo || "-"}</td>
+                        <td className="px-4 py-3">
+                          <div className="font-mono text-xs text-slate-700 dark:text-slate-200">{orderNo || "-"}</div>
+                          <div className={`mt-1 inline-flex rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                            rowSource === "app"
+                              ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-200"
+                              : "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                          }`}>
+                            {rowSource === "app" ? "앱" : "브로커"}
+                          </div>
+                          {row.reservation_kind === "protective_exit" && (
+                            <div className="mt-1 text-[11px] font-semibold text-blue-600 dark:text-blue-300">손익절 보호매도</div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-slate-600 dark:text-slate-300">
+                          {rowSource === "app" ? (
+                            <div>
+                              <div>{formatDateTime(scheduled)}</div>
+                              {expires && <div className="mt-1 text-xs text-slate-500">만료 {formatDateTime(expires)}</div>}
+                            </div>
+                          ) : "-"}
+                        </td>
                         <td className="px-4 py-3">
                           <div className="font-medium text-slate-900 dark:text-slate-100">{name || stock || "-"}</div>
                           {name && stock && <div className="text-xs text-slate-500">{stock}</div>}
@@ -522,7 +675,11 @@ export default function ReservationsPage() {
                         <td className="px-4 py-3 text-slate-700 dark:text-slate-200">{side || "-"}</td>
                         <td className="px-4 py-3 text-right text-slate-700 dark:text-slate-200">{formatNumber(qty)}</td>
                         <td className="px-4 py-3 text-right text-slate-700 dark:text-slate-200">{formatNumber(orderPrice)}</td>
-                        <td className="px-4 py-3 text-slate-600 dark:text-slate-300">{status || "-"}</td>
+                        <td className="px-4 py-3 text-slate-600 dark:text-slate-300">
+                          <div>{status || "-"}</div>
+                          {submittedOrderNo && <div className="mt-1 text-xs text-green-600 dark:text-green-300">주문 {submittedOrderNo}</div>}
+                          {lastError && <div className="mt-1 max-w-[220px] truncate text-xs text-red-600 dark:text-red-300" title={lastError}>{lastError}</div>}
+                        </td>
                         <td className="px-4 py-3 text-right">
                           <button
                             type="button"

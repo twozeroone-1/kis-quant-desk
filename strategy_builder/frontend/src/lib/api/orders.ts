@@ -87,6 +87,7 @@ export interface CancelOrderResponse {
 export type ReservationMarket = "domestic" | "us";
 export type ReservationAction = "BUY" | "SELL";
 export type ReservationOrderType = "limit" | "market" | "preopen" | "moo";
+export type ReservationSource = "broker" | "app" | "all";
 
 export interface ReservationOrderItem {
   [key: string]: unknown;
@@ -103,6 +104,9 @@ export interface ReservationSubmitRequest {
   exchange?: "NASD" | "NYSE" | "AMEX";
   end_date?: string | null;
   confirm_prod?: boolean;
+  reservation_source?: ReservationSource;
+  scheduled_at?: string | null;
+  expires_at?: string | null;
 }
 
 export interface ReservationCancelRequest {
@@ -111,6 +115,7 @@ export interface ReservationCancelRequest {
   reservation_order_date: string;
   reservation_order_org_no?: string;
   confirm_prod?: boolean;
+  reservation_source?: ReservationSource;
 }
 
 export interface ReservationModifyRequest extends ReservationSubmitRequest {
@@ -133,6 +138,7 @@ export interface ReservationListParams {
   action?: ReservationAction | "";
   exchange?: "NASD" | "NYSE" | "AMEX";
   include_cancelled?: boolean;
+  reservation_source?: ReservationSource;
 }
 
 export interface ReservationListResponse {
@@ -141,6 +147,7 @@ export interface ReservationListResponse {
   orders: ReservationOrderItem[];
   total_count: number;
   market?: ReservationMarket;
+  reservation_source?: ReservationSource;
   start_date?: string;
   end_date?: string;
   data?: Record<string, unknown>;
@@ -176,7 +183,7 @@ export interface ProtectiveOrder {
   retry_count?: number;
   last_error_code?: string | null;
   unsupported_paths?: string[];
-  app_exit_reservation_status?: "waiting_retry" | string;
+  app_exit_reservation_status?: "waiting_retry" | "submitted_unconfirmed" | "filled" | string;
   app_exit_reserved_at?: string;
   app_exit_reason?: string;
   app_exit_reservation?: {
@@ -198,6 +205,8 @@ export interface ProtectiveOrder {
     last_error_code?: string | null;
     unsupported_paths?: string[];
     note?: string;
+    submitted_order_no?: string;
+    filled_at?: string;
   };
 }
 
@@ -206,12 +215,32 @@ export interface ProtectiveOrdersResponse {
   orders: ProtectiveOrder[];
   total_count: number;
   settings?: ProtectiveSettings;
+  health?: ProtectiveMonitorHealth;
   realtime?: ProtectiveRealtimeStatus;
 }
 
 export interface ProtectiveSettings {
   monitor_interval_seconds: number;
   price_source?: "websocket" | "rest";
+  us_stop_loss_limit_offset_pct?: number;
+  us_take_profit_limit_offset_pct?: number;
+  exit_reprice_interval_seconds?: number;
+  us_exit_reprice_step_pct?: number;
+  us_exit_max_offset_pct?: number;
+}
+
+export interface ProtectiveMonitorHealth {
+  status?: "healthy" | "degraded" | "stale" | string;
+  monitor_running?: boolean;
+  stale?: boolean;
+  last_cycle_completed_at?: string | null;
+  last_cycle_duration_seconds?: number;
+  snapshot_api_calls?: number;
+  snapshot_errors?: string[];
+  processing_errors?: string[];
+  rate_limited_order_count?: number;
+  overdue_exit_count?: number;
+  alert_status?: string;
 }
 
 export interface ProtectiveRealtimeTick {

@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.routers import strategy, auth, market, orders, account, files, symbols, overseas, screening
+from backend.services.app_reservations import start_app_reservation_monitor, stop_app_reservation_monitor
 from backend.services.protective_orders import start_monitor, stop_monitor
 
 # FastAPI 앱 생성
@@ -41,6 +42,10 @@ app.include_router(overseas.router, prefix="/api/overseas", tags=["해외주식"
 app.include_router(files.router, prefix="/api/files", tags=["파일"])
 app.include_router(symbols.router, prefix="/api/symbols", tags=["종목"])
 app.include_router(screening.router, prefix="/api/screening", tags=["후보군선별"])
+if os.environ.get("KIS_LOCK_MODE") == "vps":
+    from backend.routers import automation
+
+    app.include_router(automation.router, prefix="/api/automation", tags=["자동매매"])
 
 
 @app.get("/api/health")
@@ -59,11 +64,13 @@ async def root():
 async def startup_event():
     """Start app-level protective order monitoring."""
     await start_monitor()
+    await start_app_reservation_monitor()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Stop background tasks cleanly."""
+    await stop_app_reservation_monitor()
     await stop_monitor()
 
 

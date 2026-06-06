@@ -17,8 +17,9 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
@@ -47,10 +48,53 @@ STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 MIN_BUY_STRENGTH = 0.70
 MIN_SELL_STRENGTH = 0.50
+MAX_BUY_ROC20_PCT = 25.0
+MAX_INTRADAY_BUY_DROP_PCT = 3.0
+CRASH_EXIT_DROP_PCT = 5.0
+MAX_NEW_BUY_SYMBOLS = 2
+MAX_PER_SYMBOL_BUY_PCT = 0.01
+MAX_TOTAL_HOLDINGS_EXPOSURE_PCT = 0.75
+MAX_SECTOR_EXPOSURE_PCT = 0.25
+MAX_SESSION_EQUITY_DEVIATION_PCT = 0.50
+RAW_BALANCE_ANOMALY_MULTIPLIER = 3.0
+MARKET_BENCHMARK_DROP_PCT = 2.0
+MARKET_SINGLE_CRASH_PCT = 3.0
+MARKET_BREADTH_DROP_PCT = 2.0
+MARKET_BREADTH_RISK_RATIO = 0.50
+MIN_MARKET_BREADTH_SYMBOLS = 4
 MARKETABLE_SELL_LIMIT_BUFFER_PCT = 0.02
 MIN_SECONDS_BETWEEN_KIS_CALLS = 0.85
 US_EXCHANGES = ("NASD", "NYSE", "AMEX")
 ACTIVE_PROTECTION_STATUSES = {"active", "exit_submitted"}
+ACTIVE_APP_RESERVATION_STATUSES = {"scheduled", "submitting"}
+ACTIVE_PENDING_ACTIONS = {"BUY", "SELL"}
+DETAIL_RETENTION_DAYS = 30
+US_SECTOR_BY_SYMBOL = {
+    "SPY": "broad_etf",
+    "QQQ": "broad_etf",
+    "DIA": "broad_etf",
+    "IWM": "broad_etf",
+    "NVDA": "technology",
+    "MSFT": "technology",
+    "AVGO": "technology",
+    "AMD": "technology",
+    "GOOGL": "technology",
+    "META": "technology",
+    "AAPL": "technology",
+    "ORCL": "technology",
+    "NOW": "technology",
+    "DELL": "technology",
+    "MU": "technology",
+    "MRVL": "technology",
+    "AMZN": "consumer",
+    "COST": "consumer",
+    "TSLA": "consumer",
+    "JPM": "financials",
+    "V": "financials",
+    "XOM": "energy",
+    "CVX": "energy",
+    "LLY": "healthcare",
+}
 
 
 def normalize_llm_mode(mode: str | None) -> tuple[str, list[str]]:
@@ -80,10 +124,19 @@ def _json_default(value: Any) -> Any:
 def load_modules():
     sys.path.insert(0, str(STRATEGY_BUILDER))
     import kis_auth as ka
-    from core import indicators, overseas_data_fetcher, reserved_orders
+    from core import indicators, overseas_data_fetcher
+    from backend.services.app_reservations import create_app_reservation, list_app_reservations
     from backend.services.protective_orders import list_protective_orders, upsert_existing_position_protection
 
-    return ka, indicators, overseas_data_fetcher, reserved_orders, upsert_existing_position_protection, list_protective_orders
+    return (
+        ka,
+        indicators,
+        overseas_data_fetcher,
+        create_app_reservation,
+        upsert_existing_position_protection,
+        list_protective_orders,
+        list_app_reservations,
+    )
 
 
 def load_helper(module_name: str, filename: str):
@@ -97,15 +150,32 @@ def load_helper(module_name: str, filename: str):
 
 
 def us_regular_hours_now(now: datetime | None = None) -> bool:
-    """Approximate US regular session in KST.
+    """Legacy manual-slot regular-session approximation.
 
-    The user schedule is KST-based and intentionally works in both DST and
-    standard-time seasons: 23:45 is after the regular open in either season,
-    and 04:45 is near the end during DST.
+    Hourly cron runs are resolved by exchange_calendars before this helper is
+    reached. This remains for open/mid/close/manual compatibility.
     """
     kst_now = now.astimezone(ZoneInfo("Asia/Seoul")) if now else datetime.now(ZoneInfo("Asia/Seoul"))
     current = kst_now.time()
     return current >= dt_time(22, 30) or current <= dt_time(6, 0)
+
+
+def next_us_regular_open_kst(calendar, now: datetime | None = None) -> str:
+    current = now or datetime.now(ZoneInfo("Asia/Seoul"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    current = current.astimezone(ZoneInfo("Asia/Seoul"))
+    current_et = current.astimezone(ZoneInfo("America/New_York"))
+    for offset in range(0, 10):
+        session_date = (current_et.date() + timedelta(days=offset)).strftime("%Y%m%d")
+        status = calendar.market_status(session_date)
+        open_kst = status.get("record", {}).get("open_kst")
+        if not status.get("is_open") or not open_kst:
+            continue
+        opened = datetime.fromisoformat(open_kst).astimezone(ZoneInfo("Asia/Seoul"))
+        if opened > current:
+            return opened.isoformat(timespec="seconds")
+    raise RuntimeError("next US regular session open could not be resolved")
 
 
 def fetch_headlines() -> list[dict[str, str]]:
@@ -166,6 +236,135 @@ def summarize_news(headlines: list[dict[str, str]]) -> dict[str, Any]:
     return {"regime": regime, "scores": scores}
 
 
+def infer_us_sector(symbol: Any, candidate: dict[str, Any] | None = None) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if normalized in US_SECTOR_BY_SYMBOL:
+        return US_SECTOR_BY_SYMBOL[normalized]
+    category = str((candidate or {}).get("category") or "").strip().lower()
+    if "etf" in category:
+        return "broad_etf"
+    return "other"
+
+
+def candidate_quality(candidate: dict[str, Any]) -> tuple[bool, str]:
+    sources = {str(item) for item in candidate.get("sources") or []}
+    if sources & {"static", "core_etf", "holding"}:
+        return True, "core/static/holding"
+    liquidity_sources = {"trade_value_rank", "market_cap_rank"}
+    if not sources & liquidity_sources:
+        return False, "no trade-value or market-cap liquidity source"
+    if sources == {"volume_surge_rank"} or sources == {"volume_power_rank"}:
+        return False, "single short-term volume source"
+    return True, "liquidity-ranked"
+
+
+def apply_candidate_quality_gate(selection: dict[str, Any]) -> dict[str, Any]:
+    accepted = []
+    rejected = []
+    for candidate in selection.get("selected") or []:
+        allowed, reason = candidate_quality(candidate)
+        item = {
+            **candidate,
+            "sector": infer_us_sector(candidate.get("symbol") or candidate.get("code"), candidate),
+            "quality_reason": reason,
+        }
+        if allowed:
+            accepted.append(item)
+        else:
+            rejected.append(item)
+    return {
+        **selection,
+        "selected": accepted,
+        "rejected": rejected,
+        "quality_gate": {
+            "accepted_count": len(accepted),
+            "rejected_count": len(rejected),
+            "requires_liquidity_source": True,
+        },
+    }
+
+
+def evaluate_market_risk(
+    signals: list[dict[str, Any]],
+    news_summary: dict[str, Any],
+) -> dict[str, Any]:
+    valid = [
+        signal for signal in signals
+        if signal.get("action") != "ERROR"
+        and isinstance(signal.get("intraday_change_pct"), (int, float))
+    ]
+    benchmarks = {
+        str(signal.get("symbol") or "").upper(): float(signal.get("intraday_change_pct") or 0)
+        for signal in valid
+        if str(signal.get("symbol") or "").upper() in {"SPY", "QQQ"}
+    }
+    changes = [float(signal.get("intraday_change_pct") or 0) for signal in valid]
+    breadth_drop_count = sum(change <= -MARKET_BREADTH_DROP_PCT for change in changes)
+    breadth_ratio = breadth_drop_count / len(changes) if changes else 1.0
+    reasons: list[str] = []
+    warnings: list[str] = []
+    benchmark_average = (
+        sum(benchmarks.values()) / len(benchmarks)
+        if benchmarks
+        else 0.0
+    )
+
+    if len(benchmarks) < 2:
+        reasons.append("SPY/QQQ benchmark data unavailable")
+    if benchmarks and benchmark_average <= -MARKET_BENCHMARK_DROP_PCT:
+        reasons.append(f"SPY/QQQ average drop >= {MARKET_BENCHMARK_DROP_PCT:.1f}%")
+    if any(change <= -MARKET_SINGLE_CRASH_PCT for change in benchmarks.values()):
+        reasons.append(f"SPY or QQQ drop >= {MARKET_SINGLE_CRASH_PCT:.1f}%")
+    if len(changes) >= MIN_MARKET_BREADTH_SYMBOLS and breadth_ratio >= MARKET_BREADTH_RISK_RATIO:
+        reasons.append(
+            f"market breadth drop ratio {breadth_ratio * 100:.0f}% "
+            f"({breadth_drop_count}/{len(changes)})"
+        )
+    if news_summary.get("regime") == "risk_control":
+        if len(benchmarks) == 2 and benchmark_average <= -0.5:
+            reasons.append("news risk confirmed by negative SPY/QQQ")
+        else:
+            warnings.append("news risk was not confirmed by market prices")
+
+    fallback_regime = str(news_summary.get("regime") or "broad_momentum")
+    if fallback_regime == "risk_control":
+        fallback_regime = "headline_caution"
+    return {
+        "regime": "risk_control" if reasons else fallback_regime,
+        "risk_gate_open": not reasons,
+        "reasons": reasons,
+        "warnings": warnings,
+        "benchmark_changes": benchmarks,
+        "benchmark_average_change_pct": round(benchmark_average, 2),
+        "breadth_drop_count": breadth_drop_count,
+        "breadth_total": len(changes),
+        "breadth_drop_ratio": round(breadth_ratio, 4),
+        "news_regime": news_summary.get("regime"),
+    }
+
+
+def _last_completed_close(df, price_info: dict[str, Any]) -> float:
+    previous_close = float(
+        price_info.get("previous_close")
+        or price_info.get("base")
+        or 0
+    )
+    if previous_close > 0:
+        return previous_close
+    price = float(price_info.get("price") or 0)
+    change_rate = float(price_info.get("change_rate") or 0)
+    if price > 0 and change_rate > -100:
+        derived = price / (1 + change_rate / 100)
+        if derived > 0 and change_rate != 0:
+            return derived
+    if "date" in df.columns and len(df) >= 2:
+        latest_date = str(df["date"].iloc[-1]).replace("-", "")[:8]
+        market_date = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+        if latest_date >= market_date:
+            return float(df["close"].iloc[-2])
+    return float(df["close"].iloc[-1])
+
+
 def signal_for(symbol: str, exchange: str, odf, indicators) -> dict[str, Any]:
     df = odf.get_daily_prices(symbol, days=100, env_dv="vps", exchange=exchange)
     time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
@@ -187,9 +386,25 @@ def signal_for(symbol: str, exchange: str, odf, indicators) -> dict[str, Any]:
     roc20 = float(indicators.calc_roc(df, 20).iloc[-1])
     rsi14 = float(indicators.calc_rsi(df, 14).iloc[-1])
     price = float(price_info.get("price") or df["close"].iloc[-1])
+    previous_close = _last_completed_close(df, price_info)
+    intraday_change_pct = (
+        ((price / previous_close) - 1) * 100
+        if price > 0 and previous_close > 0
+        else 0.0
+    )
+    distance_from_ema20_pct = (
+        ((price / ema20) - 1) * 100
+        if price > 0 and ema20 > 0
+        else 0.0
+    )
 
-    buy = ema20 > ema50 and roc20 > 4 and 50 < rsi14 < 72
-    sell = ema20 < ema50 or roc20 < -3 or rsi14 > 78
+    entry_trend = ema20 > ema50 and roc20 > 4 and 50 < rsi14 < 72
+    overextended = roc20 > MAX_BUY_ROC20_PCT
+    below_ema20 = price < ema20
+    intraday_drop = intraday_change_pct <= -MAX_INTRADAY_BUY_DROP_PCT
+    crash_exit = intraday_change_pct <= -CRASH_EXIT_DROP_PCT
+    buy = entry_trend and not overextended and not below_ema20 and not intraday_drop
+    sell = crash_exit or ema20 < ema50 or roc20 < -3 or rsi14 > 78
     if buy:
         strength = min(0.95, 0.55 + min(max((roc20 - 4) / 20, 0), 0.25) + min(max((rsi14 - 50) / 44, 0), 0.15))
         action = "BUY"
@@ -197,11 +412,26 @@ def signal_for(symbol: str, exchange: str, odf, indicators) -> dict[str, Any]:
     elif sell:
         strength = 0.65
         action = "SELL"
-        reason = f"Exit filter: EMA20 {ema20:.2f}, EMA50 {ema50:.2f}, ROC20 {roc20:.2f}%, RSI14 {rsi14:.2f}"
+        reason = (
+            f"Exit filter: EMA20 {ema20:.2f}, EMA50 {ema50:.2f}, "
+            f"ROC20 {roc20:.2f}%, RSI14 {rsi14:.2f}, intraday {intraday_change_pct:.2f}%"
+        )
     else:
         strength = 0.25
         action = "HOLD"
-        reason = f"No entry: EMA20 {ema20:.2f}, EMA50 {ema50:.2f}, ROC20 {roc20:.2f}%, RSI14 {rsi14:.2f}"
+        blocked = []
+        if overextended:
+            blocked.append(f"ROC20>{MAX_BUY_ROC20_PCT:.0f}%")
+        if below_ema20:
+            blocked.append("current<EMA20")
+        if intraday_drop:
+            blocked.append(f"intraday<=-{MAX_INTRADAY_BUY_DROP_PCT:.0f}%")
+        blocked_text = f", blocked={'+'.join(blocked)}" if blocked else ""
+        reason = (
+            f"No entry: EMA20 {ema20:.2f}, EMA50 {ema50:.2f}, "
+            f"ROC20 {roc20:.2f}%, RSI14 {rsi14:.2f}, intraday {intraday_change_pct:.2f}%"
+            f"{blocked_text}"
+        )
 
     return {
         "symbol": symbol,
@@ -216,6 +446,9 @@ def signal_for(symbol: str, exchange: str, odf, indicators) -> dict[str, Any]:
         "ema50": round(ema50, 2),
         "roc20": round(roc20, 2),
         "rsi14": round(rsi14, 2),
+        "previous_close": round(previous_close, 2),
+        "intraday_change_pct": round(intraday_change_pct, 2),
+        "distance_from_ema20_pct": round(distance_from_ema20_pct, 2),
     }
 
 
@@ -225,26 +458,148 @@ def session_state_path(session_date: str) -> Path:
 
 def load_today_state(path: Path) -> dict[str, Any]:
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {"runs": [], "orders": []}
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(state, dict):
+                state.setdefault("runs", [])
+                state.setdefault("orders", [])
+                state.setdefault("events", [])
+                state.setdefault("active_runs", {})
+                return state
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {"runs": [], "orders": [], "events": [], "active_runs": {}}
 
 
 def save_today_state(path: Path, state: dict[str, Any]) -> None:
+    atomic_write_json(path, state)
+
+
+def atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
-def account_equity(odf) -> tuple[float, float, list[dict[str, Any]]]:
+def atomic_write_json(path: Path, payload: Any) -> None:
+    atomic_write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default) + "\n",
+    )
+
+
+def run_already_recorded(state: dict[str, Any], run_id: str) -> bool:
+    return (
+        run_id in state.get("active_runs", {})
+        or any(run.get("run_id") == run_id for run in state.get("runs", []))
+    )
+
+
+def record_skip_event(state_path: Path, run_id: str, status: str, slot: str) -> None:
+    state = load_today_state(state_path)
+    state.setdefault("events", []).append({
+        "run_id": run_id,
+        "slot": slot,
+        "status": status,
+        "at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds"),
+    })
+    save_today_state(state_path, state)
+
+
+def account_equity_snapshot(odf) -> dict[str, Any]:
     deposit = odf.get_deposit("vps") or {}
     time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
     holdings_df = odf.get_holdings("vps")
     time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
     holdings = [] if holdings_df.empty else holdings_df.to_dict("records")
-    holdings_value = sum(float(row.get("eval_amount") or 0) for row in holdings)
-    cash = float(deposit.get("deposit") or 0)
+    holdings_value = 0.0
+    for row in holdings:
+        market_value = float(row.get("quantity") or 0) * float(row.get("current_price") or 0)
+        holdings_value += market_value if market_value > 0 else float(row.get("eval_amount") or 0)
+    deposit_cash = float(deposit.get("deposit") or 0)
+    reported_orderable_cash = float(deposit.get("available_amount") or deposit.get("orderable_amount") or 0)
+    orderable_cash = 0.0
+    orderable_source = None
+    buyable_error = None
+    try:
+        buyable = odf.get_buyable_amount("NVDA", 100, env_dv="vps", exchange="NASD") or {}
+        time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
+        orderable_cash = float(buyable.get("amount") or 0)
+        if orderable_cash > 0:
+            orderable_source = "get_buyable_amount:NVDA"
+    except Exception as exc:
+        buyable_error = str(exc)
+    cash = orderable_cash
     total_eval = float(deposit.get("total_eval") or 0)
-    equity = max(cash + holdings_value, total_eval, holdings_value)
-    return equity, cash, holdings
+    equity = cash + holdings_value
+    risk_equity_trusted = orderable_cash > 0
+    raw_balance_max = max(deposit_cash, reported_orderable_cash, total_eval)
+    balance_anomaly = bool(
+        equity > 0
+        and raw_balance_max > equity * RAW_BALANCE_ANOMALY_MULTIPLIER
+    )
+    sources = []
+    if holdings_value > 0:
+        sources.append("holdings.quantity_x_current_price")
+    if orderable_source:
+        sources.append(orderable_source)
+    return {
+        "equity": equity,
+        "cash": cash,
+        "holdings": holdings,
+        "holdings_value": holdings_value,
+        "deposit_cash": deposit_cash,
+        "reported_orderable_cash": reported_orderable_cash,
+        "orderable_cash": orderable_cash,
+        "risk_equity": equity,
+        "risk_equity_sources": sources or ["unavailable"],
+        "risk_equity_trusted": risk_equity_trusted,
+        "balance_anomaly": balance_anomaly,
+        "buyable_error": buyable_error,
+        "deposit_api": deposit,
+    }
+
+
+def apply_session_risk_baseline(
+    snapshot: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    current = float(snapshot.get("risk_equity") or 0)
+    trusted = bool(snapshot.get("risk_equity_trusted")) and current > 0
+    baseline = float(state.get("validated_risk_equity") or 0)
+    blocked_reason = None
+
+    if not trusted:
+        blocked_reason = "verified USD buyable amount unavailable"
+    elif baseline <= 0:
+        baseline = current
+        state["validated_risk_equity"] = round(current, 2)
+    else:
+        deviation = abs(current - baseline) / baseline
+        if deviation > MAX_SESSION_EQUITY_DEVIATION_PCT:
+            blocked_reason = (
+                f"risk equity changed {deviation * 100:.1f}% from session baseline "
+                f"${baseline:,.2f}"
+            )
+
+    validated = min(current, baseline) if current > 0 and baseline > 0 else 0.0
+    snapshot["validated_risk_equity"] = validated
+    snapshot["risk_gate_open"] = blocked_reason is None
+    snapshot["risk_gate_reason"] = blocked_reason
+    return snapshot
+
+
+def account_equity(odf) -> tuple[float, float, list[dict[str, Any]]]:
+    snapshot = account_equity_snapshot(odf)
+    return snapshot["equity"], snapshot["cash"], snapshot["holdings"]
 
 
 def holdings_by_symbol(holdings: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -277,50 +632,142 @@ def list_pending_by_exchange(odf) -> dict[str, Any]:
     return data
 
 
-def list_reservations_by_exchange(reserved_orders) -> dict[str, Any]:
-    today = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
-    data: dict[str, Any] = {"status": "success", "orders": [], "errors": []}
-    for exchange in US_EXCHANGES:
-        result = reserved_orders.list_us_reservations(
-            start_date=today,
-            end_date=today,
-            exchange=exchange,
-            env_dv="vps",
+def _normalized_action(value: Any) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"BUY", "매수", "02", "2"} or "BUY" in text or "매수" in text:
+        return "BUY"
+    if text in {"SELL", "매도", "01", "1"} or "SELL" in text or "매도" in text:
+        return "SELL"
+    return text
+
+
+def symbols_for_action(rows: list[dict[str, Any]], action: str) -> set[str]:
+    desired = action.upper()
+    symbols: set[str] = set()
+    for row in rows:
+        row_action = _normalized_action(
+            row.get("action")
+            or row.get("order_type")
+            or row.get("SLL_BUY_DVSN_NAME")
+            or row.get("sll_buy_dvsn_cd_name")
         )
-        time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
-        if not result.success:
-            data["errors"].append({
-                "exchange": exchange,
-                "error_code": result.error_code,
-                "message": result.display_error(),
-                "api_url": result.api_url,
-                "tr_id": result.tr_id,
-            })
+        if row_action != desired:
             continue
-        for record in result.records():
-            data["orders"].append({"exchange": exchange, **record})
-    if data["errors"]:
-        data["status"] = "partial_error" if data["orders"] else "error"
-    data["total_count"] = len(data["orders"])
-    return data
+        symbol = str(
+            row.get("stock_code")
+            or row.get("symbol")
+            or row.get("pdno")
+            or row.get("ovrs_pdno")
+            or ""
+        ).upper()
+        if symbol:
+            symbols.add(symbol)
+    return symbols
 
 
-async def account_status(odf, reserved_orders, list_protective_orders) -> dict[str, Any]:
-    equity, cash, holdings = account_equity(odf)
-    pending = list_pending_by_exchange(odf)
-    reservations = list_reservations_by_exchange(reserved_orders)
-    protective = await list_protective_orders()
+def holding_market_value(holding: dict[str, Any]) -> float:
+    quantity = float(holding.get("quantity") or 0)
+    current_price = float(holding.get("current_price") or holding.get("avg_price") or 0)
+    calculated = quantity * current_price
+    return calculated if calculated > 0 else float(holding.get("eval_amount") or 0)
+
+
+def portfolio_risk_snapshot(
+    holdings: list[dict[str, Any]],
+    equity: float,
+) -> dict[str, Any]:
+    total_value = 0.0
+    sector_values: dict[str, float] = {}
+    symbol_values: dict[str, float] = {}
+    for holding in holdings:
+        symbol = str(holding.get("stock_code") or "").upper()
+        value = holding_market_value(holding)
+        if not symbol or value <= 0:
+            continue
+        sector = infer_us_sector(symbol)
+        total_value += value
+        symbol_values[symbol] = symbol_values.get(symbol, 0.0) + value
+        sector_values[sector] = sector_values.get(sector, 0.0) + value
+    denominator = equity if equity > 0 else 1.0
     return {
-        "equity": equity,
-        "cash": cash,
-        "holdings": holdings,
+        "holdings_value": round(total_value, 2),
+        "holdings_exposure_pct": round(total_value / denominator * 100, 2),
+        "symbol_values": {key: round(value, 2) for key, value in symbol_values.items()},
+        "sector_values": {key: round(value, 2) for key, value in sector_values.items()},
+        "sector_exposure_pct": {
+            key: round(value / denominator * 100, 2)
+            for key, value in sector_values.items()
+        },
+        "total_exposure_gate_open": total_value < equity * MAX_TOTAL_HOLDINGS_EXPOSURE_PCT,
+    }
+
+
+def compact_protective_payload(payload: dict[str, Any], event_limit: int = 20) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"orders": [], "settings": {}}
+    compacted = {key: value for key, value in payload.items() if key != "orders"}
+    compacted_orders = []
+    for order in payload.get("orders", []):
+        if not isinstance(order, dict):
+            continue
+        item = dict(order)
+        events = item.get("events") if isinstance(item.get("events"), list) else []
+        item["event_count"] = len(events)
+        item["events"] = events[-event_limit:]
+        compacted_orders.append(item)
+    compacted["orders"] = compacted_orders
+    return compacted
+
+
+async def account_status(
+    odf,
+    list_protective_orders,
+    list_app_reservations=None,
+) -> dict[str, Any]:
+    equity_snapshot = account_equity_snapshot(odf)
+    pending = list_pending_by_exchange(odf)
+    reservations = {
+        "status": "not_applicable",
+        "orders": [],
+        "errors": [],
+        "total_count": 0,
+        "policy": "vps_app_reservations_only",
+    }
+    app_reservations: dict[str, Any] = {"status": "success", "orders": [], "total_count": 0}
+    if list_app_reservations is not None:
+        try:
+            app_rows = await list_app_reservations(market="us", include_cancelled=False)
+            app_reservations["orders"] = [
+                row for row in app_rows
+                if row.get("env_dv") == "vps" and row.get("status") in ACTIVE_APP_RESERVATION_STATUSES
+            ]
+            app_reservations["total_count"] = len(app_reservations["orders"])
+        except Exception as exc:
+            app_reservations = {"status": "error", "orders": [], "total_count": 0, "errors": [str(exc)]}
+    protective = compact_protective_payload(await list_protective_orders())
+    return {
+        **equity_snapshot,
         "pending": pending,
         "reservations": reservations,
+        "app_reservations": app_reservations,
         "protective": protective,
     }
 
 
-def build_orders(signals: list[dict[str, Any]], equity: float, cash: float, state: dict[str, Any]) -> list[dict[str, Any]]:
+def build_orders(
+    signals: list[dict[str, Any]],
+    equity: float,
+    cash: float,
+    state: dict[str, Any],
+    excluded_symbols: set[str] | None = None,
+    holdings: list[dict[str, Any]] | None = None,
+    *,
+    market_regime: str = "broad_momentum",
+    risk_gate_open: bool = True,
+) -> list[dict[str, Any]]:
+    if not risk_gate_open or market_regime == "risk_control":
+        return []
+    excluded_symbols = {symbol.upper() for symbol in (excluded_symbols or set())}
     bought_today = sum(float(order.get("notional") or 0) for order in state.get("orders", []))
     total_budget = max(0.0, equity * TOTAL_BUY_PCT - bought_today)
     risk_budget = max(0.0, equity * DAILY_LOSS_PCT - (bought_today * STOP_LOSS_PCT))
@@ -329,27 +776,47 @@ def build_orders(signals: list[dict[str, Any]], equity: float, cash: float, stat
     buy_signals = [
         signal for signal in signals
         if signal["action"] == "BUY"
+        and str(signal.get("symbol") or "").upper() not in excluded_symbols
         and float(signal.get("strength") or 0) >= MIN_BUY_STRENGTH
         and float(signal.get("price") or 0) > 0
     ]
     buy_signals.sort(key=lambda item: float(item["strength"]), reverse=True)
-    total_strength = sum(float(item["strength"]) for item in buy_signals) or 1
+    selected_signals = buy_signals[:MAX_NEW_BUY_SYMBOLS]
+    total_strength = sum(float(item["strength"]) for item in selected_signals) or 1
 
     orders: list[dict[str, Any]] = []
     remaining = usable_budget
-    for signal in buy_signals:
+    per_symbol_cap = max(0.0, equity * MAX_PER_SYMBOL_BUY_PCT)
+    exposure = portfolio_risk_snapshot(holdings or [], equity)
+    remaining_total_exposure = max(
+        0.0,
+        equity * MAX_TOTAL_HOLDINGS_EXPOSURE_PCT - float(exposure["holdings_value"]),
+    )
+    sector_values = dict(exposure["sector_values"])
+    for signal in selected_signals:
         price = float(signal["price"])
+        sector = str(signal.get("sector") or infer_us_sector(signal.get("symbol")))
+        remaining_sector_exposure = max(
+            0.0,
+            equity * MAX_SECTOR_EXPOSURE_PCT - float(sector_values.get(sector, 0)),
+        )
         target_notional = min(
             usable_budget * float(signal["strength"]) / total_strength,
             remaining,
+            per_symbol_cap,
+            remaining_total_exposure,
+            remaining_sector_exposure,
         )
         qty = int(target_notional // price)
         if qty <= 0:
             continue
         notional = round(qty * price, 2)
         remaining -= notional
+        remaining_total_exposure -= notional
+        sector_values[sector] = float(sector_values.get(sector, 0)) + notional
         orders.append({
             **signal,
+            "sector": sector,
             "quantity": qty,
             "notional": notional,
             "weight": round(float(signal["strength"]) / total_strength, 4),
@@ -419,13 +886,22 @@ def annotate_llm_decisions(
     return rows
 
 
-def place_sells(signals: list[dict[str, Any]], holdings: list[dict[str, Any]], odf) -> list[dict[str, Any]]:
+def place_sells(
+    signals: list[dict[str, Any]],
+    holdings: list[dict[str, Any]],
+    odf,
+    pending_sell_symbols: set[str] | None = None,
+) -> list[dict[str, Any]]:
     held = holdings_by_symbol(holdings)
+    pending_sell_symbols = {symbol.upper() for symbol in (pending_sell_symbols or set())}
     submitted = []
     for signal in signals:
         if signal.get("action") != "SELL" or float(signal.get("strength") or 0) < MIN_SELL_STRENGTH:
             continue
         symbol = str(signal.get("symbol")).upper()
+        if symbol in pending_sell_symbols:
+            submitted.append({**signal, "order_status": "skipped_pending_sell"})
+            continue
         holding = held.get(symbol)
         qty = int(float((holding or {}).get("quantity") or 0))
         if qty <= 0:
@@ -475,10 +951,11 @@ def wait_for_holding(odf, symbol: str, exchange: str, min_qty: int, attempts: in
 async def place_orders(
     orders: list[dict[str, Any]],
     odf,
-    reserved_orders,
+    create_app_reservation,
     upsert_protection,
     *,
     use_reservations: bool,
+    reservation_scheduled_at: str | None = None,
 ) -> list[dict[str, Any]]:
     submitted: list[dict[str, Any]] = []
     for order in orders:
@@ -507,26 +984,36 @@ async def place_orders(
             order["buyable_quantity"] = buyable_qty
 
         if use_reservations:
-            result = reserved_orders.submit_us_reservation(
-                symbol=symbol,
-                action="BUY",
-                quantity=qty,
-                price=price,
-                order_type="limit",
-                env_dv="vps",
-                exchange=exchange,
-            )
-            time.sleep(MIN_SECONDS_BETWEEN_KIS_CALLS)
-            order["order_status"] = "reservation_submitted" if result.success else "reservation_failed"
-            order["order_method"] = "미국 모의 예약매수 limit"
-            order["reservation_result"] = {
-                "status": "success" if result.success else "error",
-                "message": None if result.success else result.display_error(),
-                "api_url": result.api_url,
-                "tr_id": result.tr_id,
-                "error_code": result.error_code,
-                "records": result.records(),
-            }
+            try:
+                reservation = await create_app_reservation(
+                    market="us",
+                    stock_code=symbol,
+                    stock_name=str(order.get("stock_name") or symbol),
+                    action="BUY",
+                    quantity=qty,
+                    price=price,
+                    order_type="limit",
+                    exchange=exchange,
+                    scheduled_at=reservation_scheduled_at,
+                    authenticated_user="us_market_auto_run",
+                )
+                order["order_status"] = "reservation_submitted"
+                order["order_method"] = "미국 모의 앱 예약매수 limit"
+                order["reservation_result"] = {
+                    "status": "success",
+                    "reservation_source": "app",
+                    "reservation_id": reservation.get("id"),
+                    "scheduled_at": reservation.get("scheduled_at"),
+                }
+            except Exception as exc:
+                order["order_status"] = "reservation_failed"
+                order["order_method"] = "미국 모의 앱 예약매수 limit"
+                order["last_error"] = str(exc)
+                order["reservation_result"] = {
+                    "status": "error",
+                    "reservation_source": "app",
+                    "message": str(exc),
+                }
             order["protection_status"] = "not_registered_until_fill"
             submitted.append(order)
             continue
@@ -664,21 +1151,43 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
     reservation_status = payload.get("account_after", {}).get("reservations", {}).get("status", "unknown")
     catchup_protections = payload.get("catchup_protections", [])
     lines = [
-        f"# US Market Auto Run - {payload['slot']}",
+        f"# US Market Auto Run - {payload.get('run_id', payload['slot'])}",
         "",
+        f"- Status: {payload.get('status', 'completed')}",
         f"- Time: {payload['started_at']}",
+        f"- Duration: {float(payload.get('duration_seconds') or 0):.1f}s",
         f"- US session date: {payload['date']}",
-        f"- Regime: {payload['news_summary']['regime']}",
+        f"- Regime: {payload.get('market_risk', {}).get('regime', payload['news_summary']['regime'])}",
         f"- LLM mode: {payload.get('llm_mode', 'off')}",
         f"- Effective LLM mode: {payload.get('effective_llm_mode', payload.get('llm_mode', 'off'))}",
         f"- Order mode: vps only",
         f"- Equity: ${payload['account']['equity']:,.2f}",
         f"- Cash: ${payload['account']['cash']:,.2f}",
+        f"- Risk equity source: {', '.join(payload.get('account_before', {}).get('risk_equity_sources', [])) or '-'}",
         f"- Protective orders are app-level monitoring, not KIS server OCO; backend/auth/network health matters.",
     ]
     if payload.get("llm_warnings"):
         lines.extend(["", "## LLM Warnings"])
         lines.extend(f"- {warning}" for warning in payload.get("llm_warnings") or [])
+    market_risk = payload.get("market_risk") or {}
+    if market_risk:
+        lines.extend([
+            "",
+            "## Market Risk Gate",
+            f"- Gate open: {market_risk.get('risk_gate_open', False)}",
+            f"- SPY/QQQ: {market_risk.get('benchmark_changes', {})}",
+            f"- Breadth drop: {float(market_risk.get('breadth_drop_ratio') or 0) * 100:.1f}%",
+            f"- Reasons: {'; '.join(market_risk.get('reasons') or []) or '-'}",
+        ])
+    portfolio_risk = payload.get("portfolio_risk") or {}
+    if portfolio_risk:
+        lines.extend([
+            "",
+            "## Portfolio Exposure",
+            f"- Holdings exposure: {float(portfolio_risk.get('holdings_exposure_pct') or 0):.2f}%",
+            f"- Sector exposure: {portfolio_risk.get('sector_exposure_pct', {})}",
+            f"- Total exposure gate open: {portfolio_risk.get('total_exposure_gate_open', False)}",
+        ])
     lines.extend(["", "## Headlines"])
     for item in payload["headlines"][:10]:
         lines.append(f"- {item['title']} ({item['source']})")
@@ -702,6 +1211,19 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
                 f"{float(item.get('score') or 0):.2f} | {', '.join(item.get('sources') or [])} | "
                 f"{', '.join(item.get('reasons') or [])} |"
             )
+        rejected_candidates = candidate_selection.get("rejected") or []
+        if rejected_candidates:
+            lines.extend([
+                "",
+                "### Rejected Candidates",
+                "| Symbol | Sources | Reason |",
+                "|---|---|---|",
+            ])
+            for item in rejected_candidates:
+                lines.append(
+                    f"| {item.get('symbol')} | {', '.join(item.get('sources') or [])} | "
+                    f"{item.get('quality_reason', '-')} |"
+                )
     for action in ("BUY", "SELL", "HOLD", "ERROR"):
         rows = [signal for signal in payload["signals"] if signal.get("action") == action]
         if not rows:
@@ -766,7 +1288,10 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         lines.extend(["", "## Reservation API Errors"])
         for error in reservation_errors:
             lines.append(f"- {error}")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if payload.get("errors"):
+        lines.extend(["", "## Errors"])
+        lines.extend(f"- {error}" for error in payload["errors"])
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def write_market_closed_report(path: Path, payload: dict[str, Any]) -> None:
@@ -788,37 +1313,336 @@ def write_market_closed_report(path: Path, payload: dict[str, Any]) -> None:
     if payload.get("llm_warnings"):
         lines.extend(["", "## LLM Warnings"])
         lines.extend(f"- {warning}" for warning in payload.get("llm_warnings") or [])
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(path, "\n".join(lines) + "\n")
 
 
-def cleanup_cron_if_done(state: dict[str, Any], session_date: str) -> None:
-    slots = {run.get("slot") for run in state.get("runs", [])}
-    if not {"open", "mid", "close"}.issubset(slots):
-        return
-    os.system(f"(crontab -l 2>/dev/null | grep -v 'KIS_US_MARKET_AUTO_{session_date}') | crontab -")
+def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
+    errors = [str(item) for item in payload.get("errors", []) if item]
+    errors.extend(
+        f"candidate_selection: {item}"
+        for item in payload.get("candidate_selection", {}).get("errors", [])
+        if item
+    )
+    for signal in payload.get("signals", []):
+        if signal.get("action") == "ERROR" and signal.get("reason"):
+            errors.append(f"{signal.get('symbol')}: {signal.get('reason')}")
+    for order in [*payload.get("submitted_sells", []), *payload.get("orders", [])]:
+        if order.get("order_status") in {"failed", "reservation_failed"} and order.get("last_error"):
+            errors.append(f"{order.get('symbol')}: {order.get('last_error')}")
+        reservation = order.get("reservation_result") or {}
+        if reservation.get("status") == "error" and reservation.get("message"):
+            errors.append(f"{order.get('symbol')}: {reservation.get('message')}")
+    for section in ("pending", "reservations", "app_reservations"):
+        for item in payload.get("account_after", {}).get(section, {}).get("errors", []):
+            errors.append(f"{section}: {item}")
+    protective_health = payload.get("account_after", {}).get("protective", {}).get("health", {})
+    if protective_health.get("status") in {"degraded", "stale"}:
+        errors.append(
+            "protective monitor: "
+            f"{protective_health.get('status')}, "
+            f"rate limits={protective_health.get('rate_limited_order_count', 0)}, "
+            f"overdue exits={protective_health.get('overdue_exit_count', 0)}"
+        )
+    return list(dict.fromkeys(errors))
+
+
+def compact_account(account: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "equity": round(float(account.get("equity") or 0), 2),
+        "risk_equity": round(float(account.get("risk_equity") or account.get("equity") or 0), 2),
+        "cash": round(float(account.get("cash") or 0), 2),
+        "holdings_value": round(float(account.get("holdings_value") or 0), 2),
+        "holdings_count": len(account.get("holdings") or []),
+        "risk_equity_sources": account.get("risk_equity_sources") or [],
+    }
+
+
+def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    signals = payload.get("signals") or []
+    orders = [*payload.get("submitted_sells", []), *payload.get("orders", [])]
+    submitted_statuses = {"submitted", "reservation_submitted"}
+    failed_statuses = {"failed", "reservation_failed"}
+    return {
+        "run_id": payload.get("run_id"),
+        "slot": payload.get("slot"),
+        "scheduled_at_et": payload.get("scheduled_at_et"),
+        "started_at": payload.get("started_at"),
+        "finished_at": payload.get("finished_at"),
+        "duration_seconds": round(float(payload.get("duration_seconds") or 0), 2),
+        "status": payload.get("status", "completed"),
+        "report_only": bool(payload.get("report_only")),
+        "signal_counts": {
+            action: sum(1 for signal in signals if signal.get("action") == action)
+            for action in ("BUY", "SELL", "HOLD", "ERROR")
+        },
+        "order_counts": {
+            "submitted": sum(1 for order in orders if order.get("order_status") in submitted_statuses),
+            "filled": sum(1 for order in orders if float(order.get("filled_quantity") or 0) > 0),
+            "failed": sum(1 for order in orders if order.get("order_status") in failed_statuses),
+            "skipped": sum(
+                1 for order in orders
+                if str(order.get("order_status") or "").startswith("skipped")
+            ),
+        },
+        "buy_notional": round(sum(
+            float(order.get("notional") or 0)
+            for order in payload.get("orders", [])
+            if order.get("order_status") in submitted_statuses
+        ), 2),
+        "account_before": compact_account(payload.get("account_before", {})),
+        "account_after": compact_account(payload.get("account_after", {})),
+        "pending_count": int(payload.get("account_after", {}).get("pending", {}).get("total_count") or 0),
+        "app_reservation_count": int(payload.get("account_after", {}).get("app_reservations", {}).get("total_count") or 0),
+        "protective_count": len(payload.get("account_after", {}).get("protective", {}).get("orders") or []),
+        "errors": collect_payload_errors(payload),
+        "json_report": f"{payload.get('run_id')}.json",
+        "markdown_report": f"{payload.get('run_id')}.md",
+    }
+
+
+def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str, Any]:
+    runs = [normalize_summary_run(run) for run in state.get("runs", []) if isinstance(run, dict)]
+    cumulative_buy = round(sum(float(run.get("buy_notional") or 0) for run in runs), 2)
+    latest_account = next(
+        (run.get("account_after") for run in reversed(runs) if run.get("account_after")),
+        {},
+    )
+    risk_equity = float((latest_account or {}).get("risk_equity") or 0)
+    summary = {
+        "session_date": session_date,
+        "mode": "vps",
+        "updated_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds"),
+        "run_count": len(runs),
+        "runs": runs,
+        "events": state.get("events", []),
+        "cumulative_buy_notional": cumulative_buy,
+        "session_buy_limit": round(risk_equity * TOTAL_BUY_PCT, 2),
+        "remaining_buy_budget": round(max(0.0, risk_equity * TOTAL_BUY_PCT - cumulative_buy), 2),
+        "session_loss_limit": round(risk_equity * DAILY_LOSS_PCT, 2),
+        "remaining_loss_budget": round(max(0.0, risk_equity * DAILY_LOSS_PCT - cumulative_buy * STOP_LOSS_PCT), 2),
+        "latest_account": latest_account,
+        "totals": {
+            "submitted": sum(int(run.get("order_counts", {}).get("submitted") or 0) for run in runs),
+            "filled": sum(int(run.get("order_counts", {}).get("filled") or 0) for run in runs),
+            "failed": sum(int(run.get("order_counts", {}).get("failed") or 0) for run in runs),
+            "errors": sum(len(run.get("errors") or []) for run in runs),
+        },
+    }
+    atomic_write_json(RUNTIME_DIR / f"{session_date}_summary.json", summary)
+
+    lines = [
+        f"# US Automation Session - {session_date}",
+        "",
+        "- Mode: vps only",
+        f"- Updated: {summary['updated_at']}",
+        f"- Runs: {summary['run_count']}",
+        f"- Cumulative buys: ${cumulative_buy:,.2f}",
+        f"- Remaining buy budget: ${summary['remaining_buy_budget']:,.2f}",
+        f"- Remaining loss budget: ${summary['remaining_loss_budget']:,.2f}",
+        "",
+        "## Timeline",
+        "| ET Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Errors |",
+        "|---|---|---|---:|---|---|---:|",
+    ]
+    for run in runs:
+        counts = run.get("signal_counts", {})
+        order_counts = run.get("order_counts", {})
+        lines.append(
+            f"| {run.get('scheduled_at_et') or '-'} | {run.get('run_id')} | {run.get('status')} | "
+            f"{float(run.get('duration_seconds') or 0):.1f}s | "
+            f"{counts.get('BUY', 0)}/{counts.get('SELL', 0)}/{counts.get('HOLD', 0)} | "
+            f"{order_counts.get('submitted', 0)}/{order_counts.get('filled', 0)}/{order_counts.get('failed', 0)} | "
+            f"{len(run.get('errors') or [])} |"
+        )
+    atomic_write_text(RUNTIME_DIR / f"{session_date}_summary.md", "\n".join(lines) + "\n")
+    return summary
+
+
+def normalize_summary_run(run: dict[str, Any]) -> dict[str, Any]:
+    if run.get("run_id") and run.get("signal_counts") and run.get("order_counts"):
+        return run
+    report = str(run.get("report") or "")
+    report_id = Path(report).stem if report else ""
+    legacy_orders = run.get("orders") if isinstance(run.get("orders"), list) else []
+    status = "market_closed" if run.get("market_closed") else "legacy"
+    return {
+        "run_id": report_id or f"legacy_{run.get('started_at', 'unknown')}",
+        "slot": run.get("slot", "legacy"),
+        "scheduled_at_et": None,
+        "started_at": run.get("started_at"),
+        "finished_at": None,
+        "duration_seconds": 0.0,
+        "status": status,
+        "report_only": False,
+        "signal_counts": {"BUY": 0, "SELL": 0, "HOLD": 0, "ERROR": 0},
+        "order_counts": {
+            "submitted": sum(
+                1 for order in legacy_orders
+                if order.get("order_status") in {"submitted", "reservation_submitted"}
+            ),
+            "filled": sum(1 for order in legacy_orders if float(order.get("filled_quantity") or 0) > 0),
+            "failed": sum(
+                1 for order in legacy_orders
+                if order.get("order_status") in {"failed", "reservation_failed"}
+            ),
+            "skipped": sum(
+                1 for order in legacy_orders
+                if str(order.get("order_status") or "").startswith("skipped")
+            ),
+        },
+        "buy_notional": round(sum(
+            float(order.get("notional") or 0)
+            for order in legacy_orders
+            if order.get("order_status") in {"submitted", "reservation_submitted"}
+        ), 2),
+        "account_before": {},
+        "account_after": {},
+        "pending_count": 0,
+        "app_reservation_count": 0,
+        "protective_count": 0,
+        "errors": [],
+        "json_report": f"{report_id}.json" if report_id else None,
+        "markdown_report": f"{report_id}.md" if report_id else None,
+    }
+
+
+def telegram_message(payload: dict[str, Any], summary: dict[str, Any] | None = None) -> str:
+    if payload.get("status") == "market_closed":
+        return f"US paper automation {payload.get('date')}: market closed. No orders."
+    run = run_summary(payload)
+    counts = run["signal_counts"]
+    order_counts = run["order_counts"]
+    report_url = os.environ.get("US_MARKET_REPORT_URL", "").rstrip("/")
+    link = f"\n{report_url}/automation" if report_url else ""
+    text = (
+        f"US paper {run.get('run_id')} {run.get('status')}\n"
+        f"Signals B/S/H {counts['BUY']}/{counts['SELL']}/{counts['HOLD']}\n"
+        f"Orders submitted/filled/failed "
+        f"{order_counts['submitted']}/{order_counts['filled']}/{order_counts['failed']}\n"
+        f"Buy ${run['buy_notional']:,.2f}, errors {len(run['errors'])}{link}"
+    )
+    market_risk = payload.get("market_risk") or {}
+    if market_risk.get("reasons"):
+        text += f"\nRisk gate: {'; '.join(market_risk['reasons'])}"
+    if summary is not None:
+        text += (
+            f"\nSession total: {summary['run_count']} runs, "
+            f"buys ${summary['cumulative_buy_notional']:,.2f}, "
+            f"remaining risk ${summary['remaining_loss_budget']:,.2f}"
+        )
+    return text
+
+
+def session_telegram_message(summary: dict[str, Any]) -> str:
+    report_url = os.environ.get("US_MARKET_REPORT_URL", "").rstrip("/")
+    link = f"\n{report_url}/automation" if report_url else ""
+    totals = summary.get("totals", {})
+    return (
+        f"US paper session {summary.get('session_date')} complete\n"
+        f"Runs {summary.get('run_count', 0)}, submitted/filled/failed "
+        f"{totals.get('submitted', 0)}/{totals.get('filled', 0)}/{totals.get('failed', 0)}\n"
+        f"Buys ${float(summary.get('cumulative_buy_notional') or 0):,.2f}, "
+        f"remaining loss budget ${float(summary.get('remaining_loss_budget') or 0):,.2f}, "
+        f"errors {totals.get('errors', 0)}{link}"
+    )
+
+
+def send_telegram(text: str) -> dict[str, Any]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_ALLOWED_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return {"status": "disabled"}
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=12,
+        )
+        body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.ok and body.get("ok"):
+            return {"status": "sent"}
+        return {
+            "status": "error",
+            "http_status": response.status_code,
+            "message": str(body.get("description") or "telegram send failed")[:500],
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"[:500]}
+
+
+def cleanup_old_detail_reports(now: datetime | None = None) -> list[str]:
+    cutoff = (now or datetime.now(ZoneInfo("Asia/Seoul"))) - timedelta(days=DETAIL_RETENTION_DAYS)
+    removed: list[str] = []
+    pattern = re.compile(r"^\d{8}_(?:\d{4}_ET|closed)\.(?:json|md)$")
+    for path in RUNTIME_DIR.iterdir() if RUNTIME_DIR.exists() else []:
+        if not path.is_file() or not pattern.match(path.name):
+            continue
+        modified = datetime.fromtimestamp(path.stat().st_mtime, tz=ZoneInfo("Asia/Seoul"))
+        if modified < cutoff:
+            path.unlink()
+            removed.append(path.name)
+    return removed
 
 
 async def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--slot", required=True, choices=["open", "mid", "close", "manual"])
+    parser.add_argument("--slot", required=True, choices=["hourly", "open", "mid", "close", "manual"])
     parser.add_argument("--date", required=True, help="US session date key in YYYYMMDD, shared by all slots")
+    parser.add_argument("--run-id", help="Stable run identifier, normally YYYYMMDD_HHMM_ET.")
+    parser.add_argument("--report-only", action="store_true", help="Generate reports without submitting orders.")
+    parser.add_argument("--market-closed", action="store_true", help="Record the first closed-market slot.")
+    parser.add_argument("--record-skip", choices=["skipped_overlap", "skipped_duplicate"])
     parser.add_argument("--llm-mode", choices=["off", "shadow", "live-vps", "live-prod"], default=os.environ.get("US_MARKET_LLM_MODE", "off"))
     args = parser.parse_args()
     effective_llm_mode, llm_warnings = normalize_llm_mode(args.llm_mode)
 
     now = datetime.now(ZoneInfo("Asia/Seoul"))
+    monotonic_started = time.monotonic()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    report_base = RUNTIME_DIR / f"{now.strftime('%Y%m%d_%H%M%S')}_{args.slot}"
+    run_id = args.run_id or f"{now.strftime('%Y%m%d_%H%M%S')}_{args.slot}"
+    report_base = RUNTIME_DIR / run_id
     state_path = session_state_path(args.date)
     state = load_today_state(state_path)
 
+    if args.record_skip:
+        record_skip_event(state_path, run_id, args.record_skip, args.slot)
+        write_session_summary(args.date, load_today_state(state_path))
+        return 0
+
+    if run_already_recorded(state, run_id):
+        record_skip_event(state_path, run_id, "skipped_duplicate", args.slot)
+        write_session_summary(args.date, load_today_state(state_path))
+        return 0
+
     calendar = load_helper("us_market_calendar", "us_market_calendar.py")
     trading_day = calendar.market_status(args.date)
-    if not trading_day.get("is_open"):
+    schedule_entry = next(
+        (item for item in trading_day.get("scheduled_runs", []) if item.get("run_id") == run_id),
+        {},
+    )
+    if args.slot == "hourly" and trading_day.get("is_open") and not schedule_entry:
+        record_skip_event(state_path, run_id, "skipped_not_scheduled", args.slot)
+        write_session_summary(args.date, load_today_state(state_path))
+        return 0
+
+    state.setdefault("active_runs", {})[run_id] = {
+        "slot": args.slot,
+        "status": "running",
+        "started_at": now.isoformat(timespec="seconds"),
+    }
+    save_today_state(state_path, state)
+
+    if args.market_closed or not trading_day.get("is_open"):
+        finished = datetime.now(ZoneInfo("Asia/Seoul"))
         payload = {
+            "run_id": run_id,
             "slot": args.slot,
             "date": args.date,
             "started_at": now.isoformat(timespec="seconds"),
+            "finished_at": finished.isoformat(timespec="seconds"),
+            "duration_seconds": round(time.monotonic() - monotonic_started, 2),
+            "status": "market_closed",
+            "report_only": True,
             "llm_mode": args.llm_mode,
             "effective_llm_mode": effective_llm_mode,
             "llm_warnings": llm_warnings,
@@ -828,6 +1652,9 @@ async def main() -> int:
             "signals": [],
             "planned_buys": [],
             "orders": [],
+            "account": {"equity": 0.0, "cash": 0.0, "holdings": []},
+            "account_before": {},
+            "account_after": {},
             "candidate_selection": {
                 "mode": os.environ.get("US_MARKET_CANDIDATE_MODE", "dynamic"),
                 "selected": [],
@@ -836,136 +1663,269 @@ async def main() -> int:
                 "generated_at": now.isoformat(timespec="seconds"),
             },
         }
-        state.setdefault("runs", []).append({
-            "slot": args.slot,
-            "started_at": payload["started_at"],
-            "report": str(report_base.with_suffix(".md")),
-            "market_closed": True,
-            "trading_day": trading_day,
-        })
+        summary_row = run_summary(payload)
+        state.get("active_runs", {}).pop(run_id, None)
+        state.setdefault("runs", []).append(summary_row)
         save_today_state(state_path, state)
-        report_base.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+        summary = write_session_summary(args.date, state)
+        payload["telegram"] = send_telegram(telegram_message(payload, summary))
+        atomic_write_json(report_base.with_suffix(".json"), payload)
         write_market_closed_report(report_base.with_suffix(".md"), payload)
-        cleanup_cron_if_done(state, args.date)
+        cleanup_old_detail_reports(now)
         return 0
 
-    ka, indicators, odf, reserved_orders, upsert_protection, list_protective_orders = load_modules()
-    ka.auth(svr="vps")
-
-    headlines = fetch_headlines()
-    news_summary = summarize_news(headlines)
-    account_before = await account_status(odf, reserved_orders, list_protective_orders)
-    equity = float(account_before["equity"])
-    cash = float(account_before["cash"])
-    holdings = account_before["holdings"]
-    before_symbols = set(holdings_by_symbol(holdings).keys())
-    candidate_selection = select_us_candidates(
-        ranking_fetcher=odf,
-        holdings=holdings,
-        static_candidates=STATIC_CANDIDATES,
-    )
-    signals = []
-    for candidate in candidate_selection.get("selected", []):
-        symbol = str(candidate.get("symbol") or candidate.get("code")).upper()
-        exchange = str(candidate.get("exchange") or "NASD")
-        try:
-            signals.append(signal_for(symbol, exchange, odf, indicators))
-        except Exception as exc:
-            signals.append({
-                "symbol": symbol,
-                "exchange": exchange,
-                "action": "ERROR",
-                "strength": 0.0,
-                "reason": str(exc),
-                "price": 0.0,
-            })
-    submitted_sells = place_sells(signals, holdings, odf)
-    planned_orders = build_orders(signals, equity, cash, state)
-
-    pre_payload = {
+    payload: dict[str, Any] = {
+        "run_id": run_id,
         "slot": args.slot,
         "date": args.date,
         "started_at": now.isoformat(timespec="seconds"),
-        "headlines": headlines,
-        "news_summary": news_summary,
+        "scheduled_at_et": schedule_entry.get("scheduled_at_et"),
+        "scheduled_at_kst": schedule_entry.get("scheduled_at_kst"),
+        "status": "running",
+        "report_only": args.report_only,
+        "headlines": [],
+        "news_summary": {"regime": "unknown"},
         "llm_mode": args.llm_mode,
         "effective_llm_mode": effective_llm_mode,
         "llm_warnings": llm_warnings,
         "trading_day": trading_day,
+        "signals": [],
+        "submitted_sells": [],
+        "planned_buys": [],
+        "orders": [],
+        "catchup_protections": [],
+        "account": {"equity": 0.0, "cash": 0.0, "holdings": []},
+        "account_before": {},
+        "account_after": {},
+        "errors": [],
         "strategy": {
             "name": "US news-aware EMA/ROC/RSI trend filter",
-            "entry": "EMA20 > EMA50 and ROC20 > 4 and 50 < RSI14 < 72",
-            "exit": "EMA20 < EMA50 or ROC20 < -3 or RSI14 > 78",
+            "entry": (
+                "EMA20 > EMA50, 4 < ROC20 <= 25, 50 < RSI14 < 72, "
+                "current >= EMA20, intraday drop < 3%"
+            ),
+            "exit": "EMA20 < EMA50 or ROC20 < -3 or RSI14 > 78 or intraday drop >= 5%",
             "risk": {
                 "total_new_buy_pct": round(TOTAL_BUY_PCT * 100, 2),
                 "daily_loss_pct": round(DAILY_LOSS_PCT * 100, 2),
                 "take_profit_pct": round(TAKE_PROFIT_PCT * 100, 2),
                 "stop_loss_pct": round(STOP_LOSS_PCT * 100, 2),
-                "per_symbol_cap": None,
+                "per_symbol_cap_pct": round(MAX_PER_SYMBOL_BUY_PCT * 100, 2),
+                "max_total_holdings_exposure_pct": round(MAX_TOTAL_HOLDINGS_EXPOSURE_PCT * 100, 2),
+                "max_sector_exposure_pct": round(MAX_SECTOR_EXPOSURE_PCT * 100, 2),
+                "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
+                "risk_control_blocks_new_buys": True,
             },
         },
-        "account": {"equity": equity, "cash": cash, "holdings": holdings},
-        "account_before": account_before,
-        "candidate_selection": candidate_selection,
-        "signals": signals,
-        "submitted_sells": submitted_sells,
-        "planned_buys": planned_orders,
-        "orders": [],
+        "candidate_selection": {
+            "mode": os.environ.get("US_MARKET_CANDIDATE_MODE", "dynamic"),
+            "selected": [],
+            "fallback_used": False,
+            "errors": [],
+            "generated_at": now.isoformat(timespec="seconds"),
+        },
     }
-    llm_result = run_llm_decision(effective_llm_mode, pre_payload)
-    executable_orders = apply_llm_decision(planned_orders, llm_result, live_mode=False)
+    exit_code = 0
+    try:
+        (
+            ka,
+            indicators,
+            odf,
+            create_app_reservation,
+            upsert_protection,
+            list_protective_orders,
+            list_app_reservations,
+        ) = load_modules()
+        ka.auth(svr="vps")
 
-    regular_hours = us_regular_hours_now(now)
-    submitted_orders = await place_orders(
-        executable_orders,
-        odf,
-        reserved_orders,
-        upsert_protection,
-        use_reservations=not regular_hours,
-    )
-    clear_balance_cache(odf)
-    account_after = await account_status(odf, reserved_orders, list_protective_orders)
-    eligible_protection_symbols = (
-        before_symbols
-        | {str(item.get("symbol") or item.get("code")).upper() for item in candidate_selection.get("selected", [])}
-        | state_order_symbols(state)
-        | {str(order.get("symbol")).upper() for order in submitted_orders if order.get("symbol")}
-    )
-    catchup_protections = await register_missing_protection_for_holdings(
-        account_after["holdings"],
-        account_after.get("protective", {}),
-        upsert_protection,
-        eligible_protection_symbols,
-    )
-    if catchup_protections:
+        headlines = fetch_headlines()
+        news_summary = summarize_news(headlines)
+        account_before = await account_status(
+            odf,
+            list_protective_orders,
+            list_app_reservations,
+        )
+        account_before = apply_session_risk_baseline(account_before, state)
+        save_today_state(state_path, state)
+        equity = float(account_before["validated_risk_equity"])
+        cash = float(account_before["cash"])
+        holdings = account_before["holdings"]
+        held_symbols = set(holdings_by_symbol(holdings).keys())
+        pending_buy_symbols = symbols_for_action(account_before["pending"].get("orders", []), "BUY")
+        pending_sell_symbols = symbols_for_action(account_before["pending"].get("orders", []), "SELL")
+        reservation_buy_symbols = symbols_for_action(account_before["reservations"].get("orders", []), "BUY")
+        app_reservation_buy_symbols = symbols_for_action(account_before["app_reservations"].get("orders", []), "BUY")
+        submitted_today_symbols = state_order_symbols(state)
+        excluded_buy_symbols = (
+            held_symbols
+            | pending_buy_symbols
+            | reservation_buy_symbols
+            | app_reservation_buy_symbols
+            | submitted_today_symbols
+        )
+
+        candidate_selection = apply_candidate_quality_gate(
+            select_us_candidates(
+                ranking_fetcher=odf,
+                holdings=holdings,
+                static_candidates=STATIC_CANDIDATES,
+            )
+        )
+        signals = []
+        for candidate in candidate_selection.get("selected", []):
+            symbol = str(candidate.get("symbol") or candidate.get("code")).upper()
+            exchange = str(candidate.get("exchange") or "NASD")
+            try:
+                signals.append({
+                    **signal_for(symbol, exchange, odf, indicators),
+                    "sector": candidate.get("sector") or infer_us_sector(symbol, candidate),
+                    "candidate_score": candidate.get("score"),
+                    "candidate_sources": candidate.get("sources") or [],
+                })
+            except Exception as exc:
+                signals.append({
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "action": "ERROR",
+                    "strength": 0.0,
+                    "reason": str(exc),
+                    "price": 0.0,
+                    "sector": candidate.get("sector") or infer_us_sector(symbol, candidate),
+                })
+
+        market_risk = evaluate_market_risk(signals, news_summary)
+        portfolio_risk = portfolio_risk_snapshot(holdings, equity)
+        combined_risk_gate_open = bool(
+            account_before.get("risk_gate_open")
+            and market_risk.get("risk_gate_open")
+            and portfolio_risk.get("total_exposure_gate_open")
+        )
+        submitted_sells = [] if args.report_only else place_sells(
+            signals,
+            holdings,
+            odf,
+            pending_sell_symbols,
+        )
+        planned_orders = build_orders(
+            signals,
+            equity,
+            cash,
+            state,
+            excluded_buy_symbols,
+            holdings,
+            market_regime=str(market_risk.get("regime") or "risk_control"),
+            risk_gate_open=combined_risk_gate_open,
+        )
+        payload.update({
+            "headlines": headlines,
+            "news_summary": news_summary,
+            "market_risk": market_risk,
+            "portfolio_risk": portfolio_risk,
+            "account": {"equity": equity, "cash": cash, "holdings": holdings},
+            "account_before": account_before,
+            "candidate_selection": candidate_selection,
+            "signals": signals,
+            "submitted_sells": submitted_sells,
+            "planned_buys": planned_orders,
+            "duplicate_guards": {
+                "held_symbols": sorted(held_symbols),
+                "pending_buy_symbols": sorted(pending_buy_symbols),
+                "pending_sell_symbols": sorted(pending_sell_symbols),
+                "reservation_buy_symbols": sorted(reservation_buy_symbols),
+                "app_reservation_buy_symbols": sorted(app_reservation_buy_symbols),
+                "submitted_today_symbols": sorted(submitted_today_symbols),
+                "excluded_buy_symbols": sorted(excluded_buy_symbols),
+            },
+        })
+
+        llm_result = run_llm_decision(effective_llm_mode, payload)
+        executable_orders = apply_llm_decision(planned_orders, llm_result, live_mode=False)
+        regular_hours = args.slot == "hourly" or us_regular_hours_now(now)
+        reservation_scheduled_at = (
+            None if regular_hours else next_us_regular_open_kst(calendar, now)
+        )
+        submitted_orders = [] if args.report_only else await place_orders(
+            executable_orders,
+            odf,
+            create_app_reservation,
+            upsert_protection,
+            use_reservations=not regular_hours,
+            reservation_scheduled_at=reservation_scheduled_at,
+        )
         clear_balance_cache(odf)
-        account_after = await account_status(odf, reserved_orders, list_protective_orders)
-    planned_display = annotate_llm_decisions(planned_orders, executable_orders, effective_llm_mode, llm_result)
+        account_after = await account_status(
+            odf,
+            list_protective_orders,
+            list_app_reservations,
+        )
+        eligible_protection_symbols = (
+            held_symbols
+            | {str(item.get("symbol") or item.get("code")).upper() for item in candidate_selection.get("selected", [])}
+            | submitted_today_symbols
+            | {str(order.get("symbol")).upper() for order in submitted_orders if order.get("symbol")}
+        )
+        catchup_protections = [] if args.report_only else await register_missing_protection_for_holdings(
+            account_after["holdings"],
+            account_after.get("protective", {}),
+            upsert_protection,
+            eligible_protection_symbols,
+        )
+        if catchup_protections:
+            clear_balance_cache(odf)
+            account_after = await account_status(
+                odf,
+                list_protective_orders,
+                list_app_reservations,
+            )
+        planned_display = annotate_llm_decisions(
+            planned_orders,
+            executable_orders,
+            effective_llm_mode,
+            llm_result,
+        )
+        if args.report_only:
+            planned_display = [
+                {**order, "order_decision": "report-only/미주문"}
+                for order in planned_display
+            ]
+        payload.update({
+            "llm": llm_result,
+            "planned_order_method": "미국 모의 일반 지정가" if regular_hours else "미국 모의 예약매수 limit",
+            "planned_buys_display": planned_display,
+            "orders": submitted_orders,
+            "catchup_protections": catchup_protections,
+            "account_after": account_after,
+            "status": "report_only" if args.report_only else "completed",
+        })
+    except Exception as exc:
+        payload["status"] = "failed"
+        payload.setdefault("errors", []).append(f"{type(exc).__name__}: {exc}")
+        payload["account_after"] = payload.get("account_after") or payload.get("account_before") or {}
+        exit_code = 1
 
-    payload = {
-        **pre_payload,
-        "llm": llm_result,
-        "planned_order_method": "미국 모의 일반 지정가" if regular_hours else "미국 모의 예약매수 limit",
-        "planned_buys_display": planned_display,
-        "orders": submitted_orders,
-        "catchup_protections": catchup_protections,
-        "account_after": account_after,
-    }
-
-    state.setdefault("runs", []).append({
-        "slot": args.slot,
-        "started_at": payload["started_at"],
-        "report": str(report_base.with_suffix(".md")),
-        "orders": submitted_orders,
-    })
+    finished = datetime.now(ZoneInfo("Asia/Seoul"))
+    payload["finished_at"] = finished.isoformat(timespec="seconds")
+    payload["duration_seconds"] = round(time.monotonic() - monotonic_started, 2)
+    payload["errors"] = collect_payload_errors(payload)
+    summary_row = run_summary(payload)
+    state.get("active_runs", {}).pop(run_id, None)
+    state.setdefault("runs", []).append(summary_row)
     state.setdefault("orders", []).extend(
-        order for order in submitted_orders if order.get("order_status") in {"submitted", "reservation_submitted"}
+        order for order in payload.get("orders", [])
+        if order.get("order_status") in {"submitted", "reservation_submitted"}
     )
     save_today_state(state_path, state)
-    report_base.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
+    summary = write_session_summary(args.date, state)
+    is_last_run = bool(schedule_entry) and schedule_entry == trading_day.get("scheduled_runs", [])[-1]
+    payload["telegram"] = {
+        "run": send_telegram(telegram_message(payload)),
+    }
+    if is_last_run:
+        payload["telegram"]["session"] = send_telegram(session_telegram_message(summary))
+    atomic_write_json(report_base.with_suffix(".json"), payload)
     write_report(report_base.with_suffix(".md"), payload)
-    cleanup_cron_if_done(state, args.date)
-    return 0
+    cleanup_old_detail_reports(now)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -49,6 +49,8 @@ if [[ -f "$approval_file" ]] && grep -qx "$APPROVAL_VALUE" "$approval_file"; the
   export KIS_PROD_AUTO_CONFIRM="$APPROVAL_VALUE"
   rm -f "$approval_file"
   echo "prod approval consumed: session=$session_date slot=$slot"
+elif [[ "${KIS_PROD_TELEGRAM_APPROVAL:-}" =~ ^(1|true|TRUE|yes|YES|on|ON|allow|ALLOW)$ ]]; then
+  echo "prod telegram approval enabled: each order candidate will request Telegram approval"
 else
   echo "warning: one-time prod approval not found; prod run will generate a report but submit no orders"
   echo "approval file required: $approval_file"

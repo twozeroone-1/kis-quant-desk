@@ -63,7 +63,22 @@ _last_auth_time = datetime.now()
 _autoReAuth = False
 _DEBUG = False
 _isPaper = False
-_smartSleep = 0.1
+
+
+def _rest_min_interval_for_mode(mode):
+    configured = os.environ.get("KIS_REST_MIN_INTERVAL_SECONDS")
+    if configured is not None:
+        try:
+            return max(0.0, float(configured))
+        except ValueError:
+            logging.warning(
+                "Invalid KIS_REST_MIN_INTERVAL_SECONDS=%r; using mode default",
+                configured,
+            )
+    return 0.85 if str(mode).strip().lower() == "vps" else 0.1
+
+
+_smartSleep = _rest_min_interval_for_mode(os.environ.get("KIS_LOCK_MODE"))
 
 # Rate Limiter: 모든 REST API 호출을 직렬화하여 초당 제한 준수
 import threading
@@ -157,17 +172,17 @@ def isPaperTrading():  # 모의투자 매매
 def changeTREnv(token_key, svr="prod", product=_cfg["my_prod"]):
     cfg = dict()
 
-    global _isPaper
+    global _isPaper, _smartSleep
     if svr == "prod":  # 실전투자
         ak1 = "my_app"  # 실전투자용 앱키
         ak2 = "my_sec"  # 실전투자용 앱시크리트
         _isPaper = False
-        _smartSleep = 0.05
+        _smartSleep = _rest_min_interval_for_mode("prod")
     elif svr == "vps":  # 모의투자
         ak1 = "paper_app"  # 모의투자용 앱키
         ak2 = "paper_sec"  # 모의투자용 앱시크리트
         _isPaper = True
-        _smartSleep = 0.5
+        _smartSleep = _rest_min_interval_for_mode("vps")
 
     cfg["my_app"] = _cfg[ak1]
     cfg["my_sec"] = _cfg[ak2]

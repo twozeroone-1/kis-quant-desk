@@ -79,6 +79,7 @@ export {
   type ReservationMarket,
   type ReservationAction,
   type ReservationOrderType,
+  type ReservationSource,
   type ReservationOrderItem,
   type ReservationSubmitRequest,
   type ReservationCancelRequest,
@@ -90,6 +91,7 @@ export {
   type ProtectiveOrder,
   type ProtectiveOrdersResponse,
   type ProtectiveSettings,
+  type ProtectiveMonitorHealth,
   type ProtectiveRealtimeStatus,
   type ProtectiveRealtimeTick,
   type ProtectiveOrderUpsertRequest,
@@ -145,3 +147,13 @@ export {
   type OverseasExchange,
   type OverseasSymbolInfo,
 } from "./overseas";
+
+// Automation
+export {
+  getUsAutomationSessions,
+  getUsAutomationSession,
+  getUsAutomationRun,
+  type AutomationRunSummary,
+  type AutomationSession,
+  type AutomationRunDetail,
+} from "./automation";

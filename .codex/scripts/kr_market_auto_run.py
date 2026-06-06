@@ -24,6 +24,7 @@ from xml.etree import ElementTree
 import requests
 
 from market_candidate_selector import select_kr_candidates
+import prod_telegram_approval
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -83,8 +84,12 @@ def prod_auto_confirmed(args_confirmed: bool) -> bool:
     return args_confirmed or os.environ.get("KIS_PROD_AUTO_CONFIRM") == PROD_AUTO_CONFIRM_VALUE
 
 
-def order_execution_enabled(trade_mode: str, prod_confirmed: bool) -> bool:
-    return trade_mode != "prod" or prod_confirmed
+def prod_telegram_approval_enabled() -> bool:
+    return prod_telegram_approval.telegram_approval_enabled()
+
+
+def order_execution_enabled(trade_mode: str, prod_confirmed: bool, telegram_approval: bool = False) -> bool:
+    return trade_mode != "prod" or prod_confirmed or telegram_approval
 
 
 def prod_llm_orders_enabled(trade_mode: str, llm_mode: str) -> bool:
@@ -240,17 +245,11 @@ def build_buy_orders(results: list[dict[str, Any]], account: dict[str, Any], sta
         and float(row.get("target_price") or 0) > 0
     ]
     candidates.sort(key=lambda row: float(row.get("strength") or 0), reverse=True)
-    remaining = usable_budget
-    orders: list[dict[str, Any]] = []
 
-    for row in candidates:
+    def make_order(row: dict[str, Any], qty: int) -> dict[str, Any]:
         price = float(row["target_price"])
-        qty = int(remaining // price)
-        if qty <= 0:
-            continue
         amount = qty * price
-        remaining -= amount
-        orders.append({
+        return {
             **row,
             "quantity": qty,
             "amount": amount,
@@ -259,8 +258,53 @@ def build_buy_orders(results: list[dict[str, Any]], account: dict[str, Any], sta
             "stop_loss": math.floor(price * (1 - STOP_LOSS_PCT)),
             "order_type": "market",
             "order_decision": "주문",
-        })
-    return orders
+        }
+
+    if not candidates or usable_budget <= 0:
+        return []
+
+    one_share_cost = sum(float(row["target_price"]) for row in candidates)
+    if one_share_cost > usable_budget:
+        remaining = usable_budget
+        orders: list[dict[str, Any]] = []
+        for row in candidates:
+            price = float(row["target_price"])
+            if price > remaining:
+                continue
+            orders.append(make_order(row, 1))
+            remaining -= price
+        return orders
+
+    quantities = {str(row["code"]): 1 for row in candidates}
+    remaining = usable_budget - one_share_cost
+    target_amount = usable_budget / len(candidates)
+
+    while remaining >= min(float(row["target_price"]) for row in candidates):
+        eligible = []
+        for row in candidates:
+            code = str(row["code"])
+            price = float(row["target_price"])
+            current_amount = quantities[code] * price
+            if price <= remaining and current_amount + price <= target_amount:
+                eligible.append(row)
+        if not eligible:
+            break
+        selected = min(
+            eligible,
+            key=lambda row: (
+                quantities[str(row["code"])] * float(row["target_price"]),
+                -float(row.get("strength") or 0),
+            ),
+        )
+        selected_code = str(selected["code"])
+        quantities[selected_code] += 1
+        remaining -= float(selected["target_price"])
+
+    return [
+        make_order(row, quantities[str(row["code"])])
+        for row in candidates
+        if quantities[str(row["code"])] > 0
+    ]
 
 
 def load_llm_decider():
@@ -346,11 +390,65 @@ def holding_by_code(account: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(row.get("stock_code")): row for row in account.get("holdings", [])}
 
 
+def telegram_skip_status(approval: dict[str, Any] | None) -> str:
+    status = (approval or {}).get("status") or "error"
+    if status in {"rejected", "timeout", "hash_mismatch", "error"}:
+        return f"telegram_{status}"
+    return f"telegram_{status}"
+
+
+def prod_order_payload_after_approval(
+    payload: dict[str, Any],
+    approval_details: dict[str, Any],
+    trade_mode: str,
+    prod_confirmed: bool,
+    telegram_enabled: bool,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if trade_mode != "prod":
+        return {**payload, "confirm_prod": False}, None
+
+    if telegram_enabled:
+        try:
+            approval = prod_telegram_approval.request_approval(
+                {**payload, "confirm_prod": False},
+                approval_details,
+                store_dir=RUNTIME_DIR / "telegram_approvals",
+            )
+        except Exception as exc:
+            approval = {"status": "error", "message": str(exc)[:1000]}
+        if approval.get("status") != "approved":
+            return None, approval
+        expected_hash = approval.get("payload_hash")
+        actual_hash = prod_telegram_approval.payload_hash({**payload, "confirm_prod": False})
+        if expected_hash != actual_hash:
+            approval = {
+                **approval,
+                "status": "hash_mismatch",
+                "expected_payload_hash": expected_hash,
+                "actual_payload_hash": actual_hash,
+            }
+            return None, approval
+        return {**payload, "confirm_prod": True}, approval
+
+    if not prod_confirmed:
+        return None, {"status": "blocked", "message": "one_time_prod_approval_missing"}
+    return {**payload, "confirm_prod": True}, None
+
+
+def buy_protection_summary(order: dict[str, Any]) -> str:
+    return (
+        "매수 후 앱 레벨 감시 설정 예정: "
+        f"익절 {float(order.get('take_profit') or 0):,.0f}원 지정가, "
+        f"손절 {float(order.get('stop_loss') or 0):,.0f}원 시장가"
+    )
+
+
 def place_sells(
     results: list[dict[str, Any]],
     holdings: dict[str, dict[str, Any]],
     trade_mode: str,
     prod_confirmed: bool,
+    telegram_enabled: bool = False,
 ) -> list[dict[str, Any]]:
     submitted = []
     for signal in results:
@@ -371,9 +469,34 @@ def place_sells(
             "quantity": qty,
             "signal_reason": signal.get("reason") or "SELL signal",
             "market": "domestic",
-            "confirm_prod": trade_mode == "prod" and prod_confirmed,
         }
-        result = api("POST", "/api/orders/execute", json=payload)
+        approval_details = {
+            "market_label": "국내",
+            "action": "SELL",
+            "stock_code": payload["stock_code"],
+            "stock_name": payload["stock_name"],
+            "quantity": payload["quantity"],
+            "order_type": payload["order_type"],
+            "price": payload["price"],
+            "estimated_amount": float(payload["price"] or 0) * qty if payload["price"] else None,
+            "signal_strength": f"{float(signal.get('strength') or 0):.2f}",
+            "reason": payload["signal_reason"],
+            "protection_summary": "해당 없음",
+        }
+        approved_payload, approval = prod_order_payload_after_approval(
+            payload,
+            approval_details,
+            trade_mode,
+            prod_confirmed,
+            telegram_enabled,
+        )
+        if approval:
+            signal["telegram_approval"] = approval
+        if approved_payload is None:
+            signal["order_status"] = telegram_skip_status(approval)
+            submitted.append(signal)
+            continue
+        result = api("POST", "/api/orders/execute", json=approved_payload)
         signal["order_status"] = result.get("status")
         signal["order_result"] = result
         submitted.append(signal)
@@ -385,6 +508,7 @@ def place_buys(
     orders: list[dict[str, Any]],
     trade_mode: str,
     prod_confirmed: bool,
+    telegram_enabled: bool = False,
 ) -> list[dict[str, Any]]:
     submitted = []
     for order in orders:
@@ -397,11 +521,39 @@ def place_buys(
             "quantity": int(order["quantity"]),
             "signal_reason": order.get("reason") or "BUY signal",
             "market": "domestic",
-            "confirm_prod": trade_mode == "prod" and prod_confirmed,
         }
-        result = api("POST", "/api/orders/execute", json=payload)
+        approval_details = {
+            "market_label": "국내",
+            "action": "BUY",
+            "stock_code": payload["stock_code"],
+            "stock_name": payload["stock_name"],
+            "quantity": payload["quantity"],
+            "order_type": payload["order_type"],
+            "price": payload["price"],
+            "estimated_amount": order.get("amount"),
+            "signal_strength": f"{float(order.get('strength') or 0):.2f}",
+            "reason": payload["signal_reason"],
+            "protection_summary": buy_protection_summary(order),
+        }
+        approved_payload, approval = prod_order_payload_after_approval(
+            payload,
+            approval_details,
+            trade_mode,
+            prod_confirmed,
+            telegram_enabled,
+        )
+        if approval:
+            order["telegram_approval"] = approval
+        if approved_payload is None:
+            order["order_status"] = telegram_skip_status(approval)
+            order["order_decision"] = f"{order['order_status']}/미주문"
+            submitted.append(order)
+            continue
+        result = api("POST", "/api/orders/execute", json=approved_payload)
         order["order_status"] = result.get("status")
         order["order_result"] = result
+        if approval and approval.get("status") == "approved":
+            order["order_decision"] = "telegram_approved/주문제출"
         submitted.append(order)
         time.sleep(1.0)
     return submitted
@@ -413,8 +565,11 @@ def register_protection_for_holdings(
     trade_mode: str,
     prod_confirmed: bool,
     candidate_codes: set[str],
+    telegram_enabled: bool = False,
+    buy_approved_codes: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     protections = []
+    buy_approved_codes = buy_approved_codes or set()
     for row in after_account.get("holdings", []):
         code = str(row.get("stock_code"))
         if before_codes and code not in before_codes and code not in candidate_codes:
@@ -440,12 +595,61 @@ def register_protection_for_holdings(
             "market": "domestic",
             "exchange": None,
             "currency": "KRW",
-            "confirm_prod": trade_mode == "prod" and prod_confirmed,
         }
+        reuses_buy_approval = trade_mode == "prod" and telegram_enabled and code in buy_approved_codes
+        approval = None
+        approved_payload = {**payload, "confirm_prod": trade_mode == "prod" and prod_confirmed}
+        if reuses_buy_approval:
+            approval = {
+                "status": "approved_reused_buy_approval",
+                "message": "BUY approval covered immediate post-buy protection setup.",
+                "stock_code": code,
+            }
+            approved_payload = {**payload, "confirm_prod": True}
+        else:
+            approval_details = {
+                "market_label": "국내",
+                "action": "PROTECTIVE_SELL",
+                "stock_code": payload["stock_code"],
+                "stock_name": payload["stock_name"],
+                "quantity": payload["quantity"],
+                "order_type": "앱 레벨 손익절 감시",
+                "price": payload["entry_price"],
+                "estimated_amount": payload["entry_price"] * qty,
+                "signal_strength": "-",
+                "reason": "보유종목 손익절 감시 설정",
+                "protection_summary": (
+                    f"익절 {payload['take_profit_trigger_price']:,.0f}원 지정가, "
+                    f"손절 {payload['stop_loss_trigger_price']:,.0f}원 시장가"
+                ),
+            }
+            approved_payload, approval = prod_order_payload_after_approval(
+                payload,
+                approval_details,
+                trade_mode,
+                prod_confirmed,
+                telegram_enabled,
+            )
+        if approved_payload is None:
+            protections.append({
+                "status": telegram_skip_status(approval),
+                "stock_code": code,
+                "stock_name": payload["stock_name"],
+                "telegram_approval": approval,
+            })
+            continue
         try:
-            protections.append(api("POST", "/api/orders/protective", json=payload))
+            result = api("POST", "/api/orders/protective", json=approved_payload)
+            if approval:
+                result["telegram_approval"] = approval
+            protections.append(result)
         except Exception as exc:
-            protections.append({"status": "error", "stock_code": code, "message": str(exc)})
+            protections.append({
+                "status": "error",
+                "stock_code": code,
+                "message": str(exc),
+                "telegram_approval": approval,
+            })
         time.sleep(1.0)
     return protections
 
@@ -554,6 +758,37 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
             f"일반 {payload.get('trade_mode', 'vps')} 시장가 | {order['order_decision']} |"
         )
 
+    telegram_rows = []
+    for section, items in (
+        ("SELL", payload.get("submitted_sells") or []),
+        ("BUY", payload.get("submitted_buys") or []),
+        ("PROTECTION", payload.get("protections") or []),
+    ):
+        for item in items:
+            approval = item.get("telegram_approval")
+            if not approval:
+                continue
+            code = item.get("code") or item.get("stock_code") or approval.get("stock_code") or "-"
+            name = item.get("name") or item.get("stock_name") or code
+            telegram_rows.append(
+                (
+                    section,
+                    f"{name}({code})",
+                    approval.get("approval_id", "-"),
+                    approval.get("status", "-"),
+                    item.get("order_status") or item.get("status") or "-",
+                )
+            )
+    if telegram_rows:
+        lines.extend([
+            "",
+            "## Prod Telegram Approvals",
+            "| 구분 | 종목 | 승인 ID | 승인 상태 | 주문/설정 상태 |",
+            "|---|---|---|---|---|",
+        ])
+        for section, stock, approval_id, approval_status, order_status in telegram_rows:
+            lines.append(f"| {section} | {stock} | {approval_id} | {approval_status} | {order_status} |")
+
     lines.extend([
         "",
         "## Post Fill Status",
@@ -603,10 +838,11 @@ def main() -> int:
     global RUNTIME_DIR
     RUNTIME_DIR = runtime_dir_for(args.trade_mode)
     prod_confirmed = prod_auto_confirmed(args.prod_auto_confirm)
+    prod_telegram_enabled = prod_telegram_approval_enabled()
     order_block_reasons = []
-    if args.trade_mode == "prod" and not prod_confirmed:
+    if args.trade_mode == "prod" and not prod_confirmed and not prod_telegram_enabled:
         order_block_reasons.append("one_time_prod_approval_missing")
-    can_submit_orders = order_execution_enabled(args.trade_mode, prod_confirmed)
+    can_submit_orders = order_execution_enabled(args.trade_mode, prod_confirmed, prod_telegram_enabled)
     strategy_sell_enabled = strategy_sell_execution_enabled(args.trade_mode)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
@@ -637,6 +873,7 @@ def main() -> int:
             "llm_result": None,
             "trade_mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
+            "prod_telegram_approval_enabled": prod_telegram_enabled,
             "order_execution_enabled": can_submit_orders,
             "order_block_reasons": order_block_reasons,
             "strategy_sell_execution_enabled": strategy_sell_enabled,
@@ -657,6 +894,7 @@ def main() -> int:
                 "min_buy_strength": MIN_BUY_STRENGTH,
                 "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
                 "order_block_reasons": order_block_reasons,
+                "prod_telegram_approval_enabled": prod_telegram_enabled,
                 "strategy_sell_execution_enabled": strategy_sell_enabled,
                 "llm_warnings": llm_warnings,
             },
@@ -702,6 +940,7 @@ def main() -> int:
             holding_by_code(account_before["account"]),
             args.trade_mode,
             prod_confirmed,
+            prod_telegram_enabled,
         )
     planned_buys = build_buy_orders(signals, account_before["account"], state)
     llm_context = {
@@ -718,6 +957,7 @@ def main() -> int:
         "safety": {
             "mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
+            "prod_telegram_approval_enabled": prod_telegram_enabled,
             "order_execution_enabled": can_submit_orders,
             "order_block_reasons": order_block_reasons,
             "strategy_sell_execution_enabled": strategy_sell_enabled,
@@ -739,11 +979,25 @@ def main() -> int:
             {**order, "order_decision": f"실전 주문 차단({','.join(order_block_reasons)})/미주문"}
             for order in report_buys
         ]
-    buys = place_buys(executable_buys, args.trade_mode, prod_confirmed) if can_submit_orders else []
+    buys = place_buys(
+        executable_buys,
+        args.trade_mode,
+        prod_confirmed,
+        prod_telegram_enabled,
+    ) if can_submit_orders else []
 
     api("POST", "/api/orders/account/clear-cache")
     time.sleep(3.0)
     account_mid = account_snapshot()
+    buy_approved_codes = {
+        str(order.get("code"))
+        for order in buys
+        if order.get("order_status") == "success"
+        and (order.get("telegram_approval") or {}).get("status") == "approved"
+    }
+    should_register_protection = can_submit_orders
+    if args.trade_mode == "prod" and prod_telegram_enabled:
+        should_register_protection = bool(buy_approved_codes)
     protections = (
         register_protection_for_holdings(
             before_holding_codes,
@@ -751,8 +1005,10 @@ def main() -> int:
             args.trade_mode,
             prod_confirmed,
             set(stock_codes),
+            prod_telegram_enabled,
+            buy_approved_codes,
         )
-        if can_submit_orders
+        if should_register_protection
         else []
     )
     time.sleep(1.0)
@@ -781,6 +1037,7 @@ def main() -> int:
         "llm_result": llm_result,
         "trade_mode": args.trade_mode,
         "prod_auto_confirmed": prod_confirmed,
+        "prod_telegram_approval_enabled": prod_telegram_enabled,
         "order_execution_enabled": can_submit_orders,
         "order_block_reasons": order_block_reasons,
         "strategy_sell_execution_enabled": strategy_sell_enabled,
@@ -788,6 +1045,7 @@ def main() -> int:
         "safety": {
             "mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
+            "prod_telegram_approval_enabled": prod_telegram_enabled,
             "order_execution_enabled": can_submit_orders,
             "order_block_reasons": order_block_reasons,
             "strategy_sell_execution_enabled": strategy_sell_enabled,

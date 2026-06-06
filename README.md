@@ -289,16 +289,19 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 **미국 모의투자(vps) 일일 실행**
 
 ```bash
-# 미국장 23:45 / 02:45 / 04:45 KST 크론 설치
+# XNYS 정규장 09:45~15:45 ET 시간당 크론 설치
+# KST cron은 45 0-6,22-23 * * * 이며 DST, 휴일, 조기폐장은 캘린더가 판정
 .codex/scripts/install_us_market_auto_daily_cron.sh
 
-# 특정 슬롯 수동 실행
+# 과거 open/mid/close 수동 입력은 호환용으로 유지
 .codex/scripts/run_us_market_auto_once.sh open 20260602
 .codex/scripts/run_us_market_auto_once.sh mid 20260603 20260602
 .codex/scripts/run_us_market_auto_once.sh close 20260603 20260602
 ```
 
-미국장 모의 자동화도 `8081`의 `builder-backend-vps`만 사용합니다. 기본 `US_MARKET_CANDIDATE_MODE=dynamic`으로 거래대금, 시가총액, 매수체결강도, 거래량 급증 랭킹에서 NASDAQ/NYSE/AMEX 유동성 후보를 선별하며, `SPY`, `QQQ`, `DIA`, `IWM`은 core ETF로 유지합니다. 랭킹 API 실패 또는 후보 부족 시 기존 고정 후보군으로 fallback합니다. 실행 결과는 `.codex/runtime/us_market_auto/`에 저장되며, 장중 신규 매수와 보호주문 점검은 실전 `8083`과 분리됩니다.
+미국장 모의 자동화도 `8081`의 `builder-backend-vps`만 사용합니다. `exchange_calendars`의 `XNYS` 일정으로 정규장 09:45부터 폐장 15분 전까지 매시간 실행하며, 조기폐장은 실행 횟수를 자동 축소합니다. 기본 `US_MARKET_CANDIDATE_MODE=dynamic`으로 거래대금, 시가총액, 매수체결강도, 거래량 급증 랭킹에서 NASDAQ/NYSE/AMEX 유동성 후보를 선별하며, `SPY`, `QQQ`, `DIA`, `IWM`은 core ETF로 유지합니다. 랭킹 API 실패 또는 후보 부족 시 기존 고정 후보군으로 fallback합니다.
+
+실행별 JSON/Markdown과 세션 누적 요약은 `.codex/runtime/us_market_auto/`에 저장됩니다. 8081의 `/automation` 화면과 `/api/automation/us/*` API에서 타임라인, 주문 결과, 오류와 다운로드를 확인할 수 있으며, 해당 API는 8083에서 제공하지 않습니다. 텔레그램 설정은 로컬 전용 `.codex/local/us_market_auto.env`의 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID`, `US_MARKET_REPORT_URL`을 사용합니다.
 
 **국내 실전투자(prod) 일일 실행**
 

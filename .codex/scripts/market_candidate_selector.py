@@ -16,6 +16,11 @@ US_CORE_ETFS = {
     "DIA": ("DIA", "NYSE"),
     "IWM": ("IWM", "NYSE"),
 }
+US_LEVERAGED_OR_INVERSE_ETFS = {
+    "BOIL", "DRIP", "FAS", "FAZ", "LABD", "LABU", "NUGT", "SDS", "SOXL",
+    "SOXS", "SPXU", "SSO", "SQQQ", "TECL", "TECS", "TNA", "TQQQ", "TZA",
+    "UDOW", "UPRO", "UVXY", "VIXY", "YANG", "YINN",
+}
 
 KR_SOURCE_WEIGHTS = {
     "volume_rank": 40.0,
@@ -160,6 +165,10 @@ def normalize_us_exchange(exchange: Any) -> str | None:
     if exchange in (None, ""):
         return None
     return US_EXCHANGE_ALIASES.get(str(exchange).strip().upper())
+
+
+def is_disallowed_us_new_buy_symbol(symbol: Any) -> bool:
+    return str(symbol or "").strip().upper() in US_LEVERAGED_OR_INVERSE_ETFS
 
 
 def us_price_exchange(exchange: Any) -> str | None:
@@ -414,6 +423,8 @@ def select_us_candidates(
                 for index, row in enumerate(result.records()):
                     normalized = normalize_us_candidate_row(row, source=source, fallback_exchange=trading_exchange)
                     if not normalized:
+                        continue
+                    if is_disallowed_us_new_buy_symbol(normalized["symbol"]):
                         continue
                     ranked_symbols.add(normalized["symbol"])
                     _merge_candidate(accumulator, normalized, source, US_SOURCE_WEIGHTS[source], row, index)

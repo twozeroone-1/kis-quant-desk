@@ -235,6 +235,21 @@ class MarketCandidateSelectorTest(unittest.TestCase):
         for symbol in ("SPY", "QQQ", "DIA", "IWM", "AAPL"):
             self.assertIn(symbol, symbols)
 
+    def test_us_selection_excludes_leveraged_etf_from_ranked_candidates(self):
+        ranked = [
+            {"symb": symbol, "excd": "NAS", "rank": str(index)}
+            for index, symbol in enumerate(("SOXL", "NVDA", "MSFT", "AVGO", "AMD", "AMZN"), start=1)
+        ]
+
+        report = selector.select_us_candidates(
+            ranking_fetcher=FakeUSFetcher({"trade": ranked, "power": [], "cap": [], "surge": []}),
+            holdings=[],
+            static_candidates=US_STATIC,
+            limit=20,
+        )
+
+        self.assertNotIn("SOXL", [item["symbol"] for item in report["selected"]])
+
 
 if __name__ == "__main__":
     unittest.main()

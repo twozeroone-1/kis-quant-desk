@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { RefreshCw, Save, Settings2, ShieldCheck } from "lucide-react";
+import { AlertTriangle, RefreshCw, Save, Settings2, ShieldCheck } from "lucide-react";
 import { useAccount, useAuth } from "@/hooks";
 import {
   checkProtectiveOrders,
@@ -9,6 +9,7 @@ import {
   saveProtectiveOrder,
   saveProtectiveSettings,
   type ExitOrderType,
+  type ProtectiveMonitorHealth,
   type ProtectiveOrder,
   type ProtectiveRealtimeStatus,
   type ProtectiveRealtimeTick,
@@ -52,12 +53,41 @@ const parseNumber = (value: string): number | null => {
 
 const orderTypeLabel = (value?: string) => (value === "market" ? "시장가" : "지정가");
 const exitReasonLabel = (value?: string) => (value === "take_profit" ? "익절" : value === "stop_loss" ? "손절" : "매도");
+const protectionStatusLabel = (value?: string) => {
+  if (value === "active") return "감시 중";
+  if (value === "disabled") return "감시 꺼짐";
+  if (value === "exit_submitted") return "매도 제출";
+  if (value === "submit_failed") return "제출 실패";
+  if (value === "closed") return "종료";
+  return value || "-";
+};
+const reservationStatusLabel = (value?: string) => {
+  if (value === "waiting_retry") return "예약 재시도 대기";
+  if (value === "submitted_unconfirmed") return "매도 제출, 체결 확인 중";
+  if (value === "filled") return "체결 완료";
+  if (value === "submitted") return "제출 완료";
+  return value || "-";
+};
+const formatDateTime = (value?: string | null) => {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("ko-KR", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+};
 
 const holdingKey = (market: ReviewMarket, holding: Pick<Holding, "stock_code" | "exchange">) =>
   `${market}:${holding.stock_code}:${holding.exchange || ""}`;
 
 const orderKey = (order: ProtectiveOrder) =>
   `${order.market || "domestic"}:${order.stock_code}:${order.exchange || ""}`;
+
+const detachedProtectionStatuses = new Set(["active", "disabled", "exit_submitted", "submit_failed"]);
 
 function defaultDraft(holding: Holding, protection: ProtectiveOrder | undefined, market: ReviewMarket): ReviewDraft {
   const hasSavedProtection = Boolean(protection);
@@ -87,6 +117,12 @@ export default function ReviewPage() {
   const [protectiveOrders, setProtectiveOrders] = useState<ProtectiveOrder[]>([]);
   const [drafts, setDrafts] = useState<Record<string, ReviewDraft>>({});
   const [monitorInterval, setMonitorInterval] = useState("15");
+  const [stopLossOffset, setStopLossOffset] = useState("2");
+  const [takeProfitOffset, setTakeProfitOffset] = useState("0.3");
+  const [repriceInterval, setRepriceInterval] = useState("60");
+  const [repriceStep, setRepriceStep] = useState("0.75");
+  const [maxExitOffset, setMaxExitOffset] = useState("5");
+  const [monitorHealth, setMonitorHealth] = useState<ProtectiveMonitorHealth | null>(null);
   const [livePrices, setLivePrices] = useState<Record<string, ProtectiveRealtimeTick>>({});
   const [realtimeStatus, setRealtimeStatus] = useState<ProtectiveRealtimeStatus | null>(null);
   const [priceStreamState, setPriceStreamState] = useState<"idle" | "connecting" | "connected" | "closed">("idle");
@@ -105,6 +141,11 @@ export default function ReviewPage() {
     return map;
   }, [market, protectiveOrders]);
 
+  const activeProtectionCount = useMemo(
+    () => protectiveOrders.filter((order) => order.status === "active" && (order.market || "domestic") === market).length,
+    [market, protectiveOrders]
+  );
+
   const savedProtectionByKey = useMemo(() => {
     const map = new Map<string, ProtectiveOrder>();
     for (const order of protectiveOrders) {
@@ -115,12 +156,42 @@ export default function ReviewPage() {
     return map;
   }, [market, protectiveOrders]);
 
+  const holdingKeys = useMemo(
+    () => new Set(holdings.map((holding) => holdingKey(market, holding))),
+    [holdings, market]
+  );
+
+  const detachedProtections = useMemo(
+    () =>
+      protectiveOrders.filter(
+        (order) =>
+          (order.market || "domestic") === market &&
+          detachedProtectionStatuses.has(order.status) &&
+          !holdingKeys.has(orderKey(order))
+      ),
+    [holdingKeys, market, protectiveOrders]
+  );
+
+  const realtimeInterestKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const holding of holdings) {
+      keys.add(holdingKey(market, holding));
+    }
+    for (const order of protectiveOrders) {
+      if (order.status === "active" && (order.market || "domestic") === market) {
+        keys.add(orderKey(order));
+      }
+    }
+    return keys;
+  }, [holdings, market, protectiveOrders]);
+
   const refresh = useCallback(async () => {
     resetThrottle();
     await fetchHoldings();
     await fetchBalance();
     const response = await getProtectiveOrders();
     setProtectiveOrders(response.orders || []);
+    setMonitorHealth(response.health || null);
     if (response.realtime) {
       setRealtimeStatus(response.realtime);
     }
@@ -133,6 +204,21 @@ export default function ReviewPage() {
     }
     if (response.settings?.monitor_interval_seconds) {
       setMonitorInterval(String(response.settings.monitor_interval_seconds));
+    }
+    if (response.settings?.us_stop_loss_limit_offset_pct !== undefined) {
+      setStopLossOffset(String(response.settings.us_stop_loss_limit_offset_pct));
+    }
+    if (response.settings?.us_take_profit_limit_offset_pct !== undefined) {
+      setTakeProfitOffset(String(response.settings.us_take_profit_limit_offset_pct));
+    }
+    if (response.settings?.exit_reprice_interval_seconds) {
+      setRepriceInterval(String(response.settings.exit_reprice_interval_seconds));
+    }
+    if (response.settings?.us_exit_reprice_step_pct !== undefined) {
+      setRepriceStep(String(response.settings.us_exit_reprice_step_pct));
+    }
+    if (response.settings?.us_exit_max_offset_pct !== undefined) {
+      setMaxExitOffset(String(response.settings.us_exit_max_offset_pct));
     }
   }, [fetchBalance, fetchHoldings, resetThrottle]);
 
@@ -240,17 +326,55 @@ export default function ReviewPage() {
 
   const saveSettings = async () => {
     const interval = parseNumber(monitorInterval);
+    const parsedStopLossOffset = parseNumber(stopLossOffset);
+    const parsedTakeProfitOffset = parseNumber(takeProfitOffset);
+    const parsedRepriceInterval = parseNumber(repriceInterval);
+    const parsedRepriceStep = parseNumber(repriceStep);
+    const parsedMaxExitOffset = parseNumber(maxExitOffset);
     if (!interval || interval < 5 || interval > 300) {
       setMessage("감시 주기는 5초에서 300초 사이로 설정하세요.");
+      return;
+    }
+    if (
+      parsedStopLossOffset === null
+      || parsedStopLossOffset < 0
+      || parsedStopLossOffset > 10
+      || parsedTakeProfitOffset === null
+      || parsedTakeProfitOffset < 0
+      || parsedTakeProfitOffset > 10
+      || parsedRepriceStep === null
+      || parsedRepriceStep < 0
+      || parsedRepriceStep > 10
+      || parsedMaxExitOffset === null
+      || parsedMaxExitOffset < Math.max(parsedStopLossOffset, parsedTakeProfitOffset)
+      || parsedMaxExitOffset > 10
+    ) {
+      setMessage("미국 매도 오프셋은 0%에서 10% 사이이며, 최대 오프셋은 기본 오프셋보다 커야 합니다.");
+      return;
+    }
+    if (!parsedRepriceInterval || parsedRepriceInterval < 5 || parsedRepriceInterval > 300) {
+      setMessage("재가격 주기는 5초에서 300초 사이로 설정하세요.");
       return;
     }
 
     setSavingSettings(true);
     setMessage("");
     try {
-      const response = await saveProtectiveSettings({ monitor_interval_seconds: Math.round(interval) });
+      const response = await saveProtectiveSettings({
+        monitor_interval_seconds: Math.round(interval),
+        us_stop_loss_limit_offset_pct: parsedStopLossOffset,
+        us_take_profit_limit_offset_pct: parsedTakeProfitOffset,
+        exit_reprice_interval_seconds: Math.round(parsedRepriceInterval),
+        us_exit_reprice_step_pct: parsedRepriceStep,
+        us_exit_max_offset_pct: parsedMaxExitOffset,
+      });
       setMonitorInterval(String(response.settings.monitor_interval_seconds));
-      setMessage(`감시 주기를 ${response.settings.monitor_interval_seconds}초로 저장했습니다.`);
+      setStopLossOffset(String(response.settings.us_stop_loss_limit_offset_pct ?? parsedStopLossOffset));
+      setTakeProfitOffset(String(response.settings.us_take_profit_limit_offset_pct ?? parsedTakeProfitOffset));
+      setRepriceInterval(String(response.settings.exit_reprice_interval_seconds ?? parsedRepriceInterval));
+      setRepriceStep(String(response.settings.us_exit_reprice_step_pct ?? parsedRepriceStep));
+      setMaxExitOffset(String(response.settings.us_exit_max_offset_pct ?? parsedMaxExitOffset));
+      setMessage("보호주문 실행 설정을 저장했습니다.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "감시 주기 저장 실패");
     } finally {
@@ -341,12 +465,13 @@ export default function ReviewPage() {
       ? "미국 평가금액"
       : "총 평가금액";
   const depositLabel = market === "us" ? "외화 예수금(API)" : "예수금";
+  const realtimeError = realtimeInterestKeys.size > 0 ? realtimeStatus?.last_error : null;
   const streamLabel =
     priceStreamState === "connected"
       ? "실시간 연결"
       : priceStreamState === "connecting"
         ? "실시간 연결 중"
-        : realtimeStatus?.last_error
+        : realtimeError
           ? "실시간 오류"
           : "실시간 대기";
 
@@ -412,6 +537,70 @@ export default function ReviewPage() {
               <span className="text-sm text-slate-500">초</span>
             </div>
           </label>
+          {market === "us" && (
+            <>
+              <label className="block">
+                <span className="text-caption text-slate-500">손절 지정가 하향</span>
+                <div className="mt-1 flex items-center gap-2">
+                  <input
+                    value={stopLossOffset}
+                    onChange={(event) => setStopLossOffset(event.target.value)}
+                    inputMode="decimal"
+                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                  />
+                  <span className="text-sm text-slate-500">%</span>
+                </div>
+              </label>
+              <label className="block">
+                <span className="text-caption text-slate-500">익절 지정가 하향</span>
+                <div className="mt-1 flex items-center gap-2">
+                  <input
+                    value={takeProfitOffset}
+                    onChange={(event) => setTakeProfitOffset(event.target.value)}
+                    inputMode="decimal"
+                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                  />
+                  <span className="text-sm text-slate-500">%</span>
+                </div>
+              </label>
+              <label className="block">
+                <span className="text-caption text-slate-500">미체결 재가격</span>
+                <div className="mt-1 flex items-center gap-2">
+                  <input
+                    value={repriceInterval}
+                    onChange={(event) => setRepriceInterval(event.target.value)}
+                    inputMode="numeric"
+                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                  />
+                  <span className="text-sm text-slate-500">초</span>
+                </div>
+              </label>
+              <label className="block">
+                <span className="text-caption text-slate-500">재시도 추가 하향</span>
+                <div className="mt-1 flex items-center gap-2">
+                  <input
+                    value={repriceStep}
+                    onChange={(event) => setRepriceStep(event.target.value)}
+                    inputMode="decimal"
+                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                  />
+                  <span className="text-sm text-slate-500">%</span>
+                </div>
+              </label>
+              <label className="block">
+                <span className="text-caption text-slate-500">최대 하향 폭</span>
+                <div className="mt-1 flex items-center gap-2">
+                  <input
+                    value={maxExitOffset}
+                    onChange={(event) => setMaxExitOffset(event.target.value)}
+                    inputMode="decimal"
+                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+                  />
+                  <span className="text-sm text-slate-500">%</span>
+                </div>
+              </label>
+            </>
+          )}
           <button
             onClick={saveSettings}
             disabled={!authStatus.authenticated || savingSettings}
@@ -437,6 +626,19 @@ export default function ReviewPage() {
         </div>
       )}
 
+      {monitorHealth && (monitorHealth.status !== "healthy" || monitorHealth.stale) && (
+        <div className="mb-6 flex items-start gap-3 border border-red-200 bg-red-50 p-4 text-red-900 dark:border-red-900 dark:bg-red-950/30 dark:text-red-100" role="alert">
+          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
+          <div>
+            <strong className="block text-sm">보호주문 감시 상태를 확인하세요</strong>
+            <p className="mt-1 text-sm">
+              상태 {monitorHealth.status || "-"} · 호출 제한 {monitorHealth.rate_limited_order_count || 0}건 ·
+              장기 미체결 {monitorHealth.overdue_exit_count || 0}건 · 마지막 완료 {formatDateTime(monitorHealth.last_cycle_completed_at)}
+            </p>
+          </div>
+        </div>
+      )}
+
       <section className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
         <div className="card p-4">
           <span className="text-caption text-slate-500">보유 종목</span>
@@ -444,7 +646,7 @@ export default function ReviewPage() {
         </div>
         <div className="card p-4">
           <span className="text-caption text-slate-500">감시 중</span>
-          <strong className="block text-2xl mt-1">{activeProtectionByKey.size}개</strong>
+          <strong className="block text-2xl mt-1">{activeProtectionCount}개</strong>
         </div>
         <div className="card p-4">
           <span className="text-caption text-slate-500">{totalEvalLabel}</span>
@@ -459,20 +661,21 @@ export default function ReviewPage() {
         </div>
         <div className="card p-4">
           <span className="text-caption text-slate-500">{streamLabel}</span>
-          <strong className="block text-2xl mt-1">{realtimeStatus?.subscription_count || 0}개</strong>
-          {realtimeStatus?.last_error && (
-            <span className="block mt-1 text-xs text-red-600">{realtimeStatus.last_error}</span>
+          <strong className="block text-2xl mt-1">{realtimeInterestKeys.size}개</strong>
+          {realtimeError && (
+            <span className="block mt-1 text-xs text-red-600">{realtimeError}</span>
           )}
         </div>
       </section>
 
       <section className="space-y-4">
-        {holdings.length === 0 ? (
+        {holdings.length === 0 && detachedProtections.length === 0 ? (
           <div className="card p-12 text-center text-slate-500">
             {market === "us" ? "미국 보유 종목이 없습니다" : "한국 보유 종목이 없습니다"}
           </div>
         ) : (
-          holdings.map((holding) => {
+          <>
+          {holdings.map((holding) => {
             const key = holdingKey(market, holding);
             const savedProtection = savedProtectionByKey.get(key);
             const activeProtection = activeProtectionByKey.get(key);
@@ -669,7 +872,84 @@ export default function ReviewPage() {
                 )}
               </article>
             );
-          })
+          })}
+
+          {detachedProtections.length > 0 && (
+            <div className="space-y-3">
+              <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100">보유 없는 보호주문</h2>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">
+                    보유종목 조회에는 없지만 보호주문 상태 파일에 남아 있는 감시 항목입니다.
+                  </p>
+                </div>
+                <span className="text-sm font-medium text-amber-700 dark:text-amber-300">
+                  {detachedProtections.length}개 확인 필요
+                </span>
+              </div>
+
+              {detachedProtections.map((order, index) => {
+                const appReservation = order.app_exit_reservation;
+                const reservationStatus = appReservation?.status || order.app_exit_reservation_status;
+                const nextRetryAt = appReservation?.next_retry_at || order.next_retry_at;
+                const lastErrorCode = appReservation?.last_error_code || order.last_error_code;
+                const unsupportedPaths = appReservation?.unsupported_paths || order.unsupported_paths || [];
+                const lastError = appReservation?.last_error || order.last_error;
+                const key = order.id || `${orderKey(order)}:${index}`;
+
+                return (
+                  <article
+                    key={key}
+                    className="card p-5 border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-900/10"
+                  >
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                      <div>
+                        <div className="flex flex-wrap items-center gap-3">
+                          <h3 className="text-xl font-bold text-slate-900 dark:text-slate-100">{order.stock_name}</h3>
+                          <span className="px-2 py-1 rounded bg-white dark:bg-slate-800 text-xs font-mono">
+                            {order.stock_code}
+                          </span>
+                          {order.exchange && (
+                            <span className="px-2 py-1 rounded bg-white dark:bg-slate-800 text-xs">
+                              {order.exchange}
+                            </span>
+                          )}
+                          <span className="px-2 py-1 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 text-xs font-bold">
+                            보유 없음
+                          </span>
+                          <span className="px-2 py-1 rounded bg-primary/10 text-primary text-xs font-bold">
+                            {protectionStatusLabel(order.status)}
+                          </span>
+                        </div>
+                        <div className="mt-3 grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3 text-sm">
+                          <span>감시 수량 <strong>{Number(order.quantity || 0).toLocaleString()}주</strong></span>
+                          <span>진입 <strong>{formatMoney(order.entry_price, currency)}</strong></span>
+                          <span>익절 <strong>{formatMoney(order.take_profit_trigger_price, currency)}</strong></span>
+                          <span>손절 <strong>{formatMoney(order.stop_loss_price, currency)}</strong></span>
+                          <span>마지막 점검 <strong>{formatDateTime(order.last_checked_at)}</strong></span>
+                          <span>예약 상태 <strong>{reservationStatusLabel(reservationStatus)}</strong></span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 text-xs text-slate-600 dark:text-slate-300 flex flex-wrap gap-x-4 gap-y-1">
+                      <span>익절 주문: {orderTypeLabel(order.take_profit_order_type)}</span>
+                      <span>손절 주문: {orderTypeLabel(order.stop_loss_order_type)}</span>
+                      {nextRetryAt && <span className="text-amber-700 dark:text-amber-300">다음 재시도: {formatDateTime(nextRetryAt)}</span>}
+                      {lastErrorCode && <span>오류코드: {lastErrorCode}</span>}
+                      {unsupportedPaths.length > 0 && <span>미지원 경로: {unsupportedPaths.join(", ")}</span>}
+                    </div>
+                    {lastError && (
+                      <p className="mt-2 text-xs text-slate-600 dark:text-slate-300 break-words">
+                        최근 KIS 응답: {lastError}
+                      </p>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          )}
+          </>
         )}
       </section>
     </div>

@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -24,13 +25,17 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import exchange_calendars as xcals
+import requests
 
-from core import data_fetcher, overseas_data_fetcher, reserved_orders
+from core import data_fetcher, overseas_data_fetcher
 from core.data_fetcher import cancel_order, get_holdings, get_pending_orders
 from core.order_executor import OrderExecutor
 from core.signal import Action, Signal
 
 logger = logging.getLogger(__name__)
+US_EXCHANGE_CALENDAR = xcals.get_calendar("XNYS")
+KR_EXCHANGE_CALENDAR = xcals.get_calendar("XKRX")
 
 RUNTIME_DIR = Path(
     os.environ.get(
@@ -48,6 +53,20 @@ EXIT_SUBMIT_RETRY_SECONDS = 60
 US_PAPER_LOCAL_RESERVATION_RETRY_SECONDS = 60
 EXIT_PENDING_REPRICE_SECONDS = 60
 US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT = 2.0
+US_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT = 0.3
+US_EXIT_REPRICE_STEP_PCT = 0.75
+US_EXIT_MAX_OFFSET_PCT = 5.0
+MIN_US_EXIT_LIMIT_BUFFER_PCT = 0.0
+MAX_US_EXIT_LIMIT_BUFFER_PCT = 10.0
+PROTECTIVE_KIS_CALL_INTERVAL_SECONDS = float(
+    os.environ.get("KIS_PROTECTIVE_CALL_INTERVAL_SECONDS", "0.85")
+)
+PROTECTIVE_EXIT_ALERT_AFTER_SECONDS = int(
+    os.environ.get("KIS_PROTECTIVE_EXIT_ALERT_AFTER_SECONDS", "180")
+)
+PROTECTIVE_ALERT_COOLDOWN_SECONDS = int(
+    os.environ.get("KIS_PROTECTIVE_ALERT_COOLDOWN_SECONDS", "900")
+)
 US_PAPER_RATE_LIMIT_BASE_SECONDS = 1
 US_PAPER_RATE_LIMIT_MAX_SECONDS = 60
 US_PAPER_DIRECT_SELL_UNSUPPORTED_PATH = "us_paper_direct_sell"
@@ -92,11 +111,24 @@ def _normalize_unsupported_paths(value: Any) -> list[str]:
 
 def _normalize_runtime_order(order: dict[str, Any]) -> dict[str, Any]:
     order["retry_count"] = max(0, int(order.get("retry_count") or 0))
+    order["exit_reprice_count"] = max(0, int(order.get("exit_reprice_count") or 0))
     order["last_error_code"] = order.get("last_error_code") or None
     order["next_retry_at"] = order.get("next_retry_at") or None
     order["unsupported_paths"] = _normalize_unsupported_paths(order.get("unsupported_paths"))
     reservation = order.get("app_exit_reservation")
     if isinstance(reservation, dict):
+        if _is_us_paper_order(order) and reservation.get("status") == "broker_submitted":
+            reservation["status"] = "waiting_retry"
+            reservation["last_error"] = (
+                "Legacy paper broker reservation is no longer treated as an exit; "
+                "the app will retry a normal limit sell during US regular hours."
+            )
+            reservation.pop("reservation_order_no", None)
+            order["status"] = "active"
+            order["app_exit_reservation_status"] = "waiting_retry"
+            order["exit_org_no"] = None
+            order["next_retry_at"] = _next_us_regular_session_retry_at().isoformat(timespec="seconds")
+            reservation["next_retry_at"] = order["next_retry_at"]
         reservation.setdefault("retry_count", order["retry_count"])
         reservation.setdefault("last_error_code", order["last_error_code"])
         reservation.setdefault("next_retry_at", order["next_retry_at"])
@@ -199,6 +231,18 @@ def _clear_submit_retry_state(order: dict[str, Any]) -> None:
         reservation["last_error_code"] = None
 
 
+def _default_settings() -> dict[str, Any]:
+    return {
+        "monitor_interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS,
+        "price_source": "websocket",
+        "us_stop_loss_limit_offset_pct": US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT,
+        "us_take_profit_limit_offset_pct": US_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT,
+        "exit_reprice_interval_seconds": EXIT_PENDING_REPRICE_SECONDS,
+        "us_exit_reprice_step_pct": US_EXIT_REPRICE_STEP_PCT,
+        "us_exit_max_offset_pct": US_EXIT_MAX_OFFSET_PCT,
+    }
+
+
 def _apply_us_paper_submit_error_policy(order: dict[str, Any], error: Optional[str]) -> None:
     if not _is_us_paper_order(order):
         return
@@ -266,10 +310,8 @@ def _load_state_sync() -> dict[str, Any]:
     if not STATE_FILE.exists():
         return {
             "orders": [],
-            "settings": {
-                "monitor_interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS,
-                "price_source": "websocket",
-            },
+            "settings": _default_settings(),
+            "health": {},
         }
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -285,16 +327,34 @@ def _load_state_sync() -> dict[str, Any]:
                 **settings,
                 "monitor_interval_seconds": _normalize_monitor_interval(interval),
                 "price_source": settings.get("price_source") or "websocket",
+                "us_stop_loss_limit_offset_pct": _normalize_us_exit_offset(
+                    settings.get("us_stop_loss_limit_offset_pct"),
+                    US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT,
+                ),
+                "us_take_profit_limit_offset_pct": _normalize_us_exit_offset(
+                    settings.get("us_take_profit_limit_offset_pct"),
+                    US_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT,
+                ),
+                "exit_reprice_interval_seconds": _normalize_monitor_interval(
+                    settings.get("exit_reprice_interval_seconds", EXIT_PENDING_REPRICE_SECONDS)
+                ),
+                "us_exit_reprice_step_pct": _normalize_us_exit_offset(
+                    settings.get("us_exit_reprice_step_pct"),
+                    US_EXIT_REPRICE_STEP_PCT,
+                ),
+                "us_exit_max_offset_pct": _normalize_us_exit_offset(
+                    settings.get("us_exit_max_offset_pct"),
+                    US_EXIT_MAX_OFFSET_PCT,
+                ),
             }
+            data["health"] = data.get("health") if isinstance(data.get("health"), dict) else {}
             return data
     except Exception as exc:
         logger.warning("protective order state load failed: %s", exc)
     return {
         "orders": [],
-        "settings": {
-            "monitor_interval_seconds": DEFAULT_MONITOR_INTERVAL_SECONDS,
-            "price_source": "websocket",
-        },
+        "settings": _default_settings(),
+        "health": {},
     }
 
 
@@ -313,7 +373,10 @@ async def _save_state(state: dict[str, Any]) -> None:
         await asyncio.to_thread(_save_state_sync, state)
 
 
-async def _merge_updated_orders(updated_orders: list[dict[str, Any]]) -> dict[str, Any]:
+async def _merge_updated_orders(
+    updated_orders: list[dict[str, Any]],
+    state_patch: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Save monitor updates without dropping orders added by concurrent UI/API saves."""
     async with _state_lock:
         latest = await asyncio.to_thread(_load_state_sync)
@@ -330,6 +393,8 @@ async def _merge_updated_orders(updated_orders: list[dict[str, Any]]) -> dict[st
             merged_orders.append(updated_by_id.get(order_id, order))
 
         latest["orders"] = merged_orders
+        if state_patch:
+            latest.update(state_patch)
         await asyncio.to_thread(_save_state_sync, latest)
         return latest
 
@@ -340,6 +405,19 @@ def _normalize_monitor_interval(value: Any) -> int:
     except (TypeError, ValueError):
         interval = DEFAULT_MONITOR_INTERVAL_SECONDS
     return max(MIN_MONITOR_INTERVAL_SECONDS, min(MAX_MONITOR_INTERVAL_SECONDS, interval))
+
+
+def _normalize_us_exit_offset(value: Any, default: float) -> float:
+    try:
+        offset = float(value)
+    except (TypeError, ValueError):
+        offset = default
+    return round(max(MIN_US_EXIT_LIMIT_BUFFER_PCT, min(MAX_US_EXIT_LIMIT_BUFFER_PCT, offset)), 2)
+
+
+def _settings_sync() -> dict[str, Any]:
+    state = _load_state_sync()
+    return state.get("settings") if isinstance(state.get("settings"), dict) else {}
 
 
 async def _get_monitor_interval_seconds() -> int:
@@ -359,15 +437,65 @@ def _is_recent_realtime(order: dict[str, Any]) -> bool:
     return (datetime.now() - checked_at).total_seconds() <= REALTIME_FRESH_SECONDS
 
 
-def _is_us_regular_session_now() -> bool:
-    kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
-    current = kst_now.time()
-    weekday = kst_now.weekday()
-    if current >= datetime.strptime("22:30", "%H:%M").time():
-        return weekday <= 4
-    if current <= datetime.strptime("06:00", "%H:%M").time():
-        return 1 <= weekday <= 5
-    return False
+def _aware_kst(value: Optional[datetime] = None) -> datetime:
+    if value is None:
+        return datetime.now(ZoneInfo("Asia/Seoul"))
+    if value.tzinfo is None:
+        return value.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    return value.astimezone(ZoneInfo("Asia/Seoul"))
+
+
+def _is_us_regular_session_now(now: Optional[datetime] = None) -> bool:
+    current = _aware_kst(now)
+    session_label = pd.Timestamp(current.astimezone(ZoneInfo("America/New_York")).date())
+    if not US_EXCHANGE_CALENDAR.is_session(session_label):
+        return False
+    opened = pd.Timestamp(US_EXCHANGE_CALENDAR.session_open(session_label)).to_pydatetime()
+    closed = pd.Timestamp(US_EXCHANGE_CALENDAR.session_close(session_label)).to_pydatetime()
+    current_utc = current.astimezone(ZoneInfo("UTC"))
+    return opened <= current_utc <= closed
+
+
+def _is_domestic_regular_session_now(now: Optional[datetime] = None) -> bool:
+    current = _aware_kst(now)
+    session_label = pd.Timestamp(current.date())
+    if not KR_EXCHANGE_CALENDAR.is_session(session_label):
+        return False
+    opened = pd.Timestamp(KR_EXCHANGE_CALENDAR.session_open(session_label)).to_pydatetime()
+    closed = pd.Timestamp(KR_EXCHANGE_CALENDAR.session_close(session_label)).to_pydatetime()
+    current_utc = current.astimezone(ZoneInfo("UTC"))
+    return opened <= current_utc <= closed
+
+
+def _is_order_market_open(order: dict[str, Any], now: Optional[datetime] = None) -> bool:
+    if str(order.get("market") or "domestic") == "us":
+        return _is_us_regular_session_now(now)
+    return _is_domestic_regular_session_now(now)
+
+
+def _next_us_regular_session_retry_at(now: Optional[datetime] = None) -> datetime:
+    current = _aware_kst(now)
+    current_utc = current.astimezone(ZoneInfo("UTC"))
+    session_label = pd.Timestamp(current.astimezone(ZoneInfo("America/New_York")).date())
+
+    if US_EXCHANGE_CALENDAR.is_session(session_label):
+        opened = pd.Timestamp(US_EXCHANGE_CALENDAR.session_open(session_label)).to_pydatetime()
+        closed = pd.Timestamp(US_EXCHANGE_CALENDAR.session_close(session_label)).to_pydatetime()
+        if opened <= current_utc <= closed:
+            return current.replace(tzinfo=None)
+        if current_utc < opened:
+            target = opened
+        else:
+            target = pd.Timestamp(
+                US_EXCHANGE_CALENDAR.session_open(
+                    US_EXCHANGE_CALENDAR.next_session(session_label)
+                )
+            ).to_pydatetime()
+    else:
+        next_session = US_EXCHANGE_CALENDAR.date_to_session(session_label, direction="next")
+        target = pd.Timestamp(US_EXCHANGE_CALENDAR.session_open(next_session)).to_pydatetime()
+
+    return target.astimezone(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
 
 
 def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
@@ -375,13 +503,6 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
     if order.get("exit_submit_blocked"):
         return False
     app_reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
-    if (
-        order.get("market") == "us"
-        and order.get("env_dv") not in ("prod", "real")
-        and app_reservation.get("status") == "broker_submitted"
-        and (app_reservation.get("reservation_order_no") or order.get("exit_order_no"))
-    ):
-        return False
     retry_at = _parse_time(order.get("next_retry_at"))
     if retry_at:
         return datetime.now() >= retry_at
@@ -407,9 +528,7 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
 
 
 def _should_create_local_us_paper_reservation(env_dv: str, market: str, error: Optional[str]) -> bool:
-    if market != "us" or env_dv in ("prod", "real") or not error:
-        return False
-    return any(marker in error for marker in US_PAPER_LOCAL_RESERVATION_MARKERS)
+    return market == "us" and env_dv not in ("prod", "real") and bool(error)
 
 
 def _mark_local_us_paper_reservation(
@@ -442,7 +561,7 @@ def _mark_local_us_paper_reservation(
         "next_retry_at": order.get("next_retry_at"),
         "retry_count": int(order.get("retry_count") or 0),
         "unsupported_paths": list(order.get("unsupported_paths") or []),
-        "note": "KIS paper US sell/reservation was unavailable; Strategy Builder will retry from the app monitor.",
+        "note": "The normal paper sell was not accepted; Strategy Builder will retry with a refreshed marketable limit.",
     }
     order["status"] = "active"
     order["app_exit_reservation"] = reservation
@@ -454,7 +573,7 @@ def _mark_local_us_paper_reservation(
     order.pop("exit_submit_blocked", None)
 
 
-def _mark_broker_us_paper_reservation(
+def _mark_us_paper_exit_submitted(
     order: dict[str, Any],
     *,
     exit_reason: str,
@@ -467,7 +586,7 @@ def _mark_broker_us_paper_reservation(
     existing = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
     reserved_at = existing.get("reserved_at") or _now()
     reservation = {
-        "status": "broker_submitted",
+        "status": "submitted_unconfirmed",
         "market": "us",
         "env_dv": order.get("env_dv") or "vps",
         "stock_code": order.get("stock_code"),
@@ -479,23 +598,20 @@ def _mark_broker_us_paper_reservation(
         "current_price": current_price,
         "reserved_at": reserved_at,
         "last_attempt_at": _now(),
-        "reservation_order_no": str(order_no or ""),
+        "submitted_order_no": str(order_no or ""),
         "last_error_code": None,
         "next_retry_at": None,
         "retry_count": 0,
         "unsupported_paths": list(order.get("unsupported_paths") or []),
-        "note": "KIS paper US reservation was accepted; Strategy Builder will keep monitoring until the holding disappears.",
+        "note": "The app submitted a normal paper sell and will verify holdings, cancel stale pending orders, and reprice until filled.",
     }
-    order["status"] = "active"
     order["app_exit_reservation"] = reservation
-    order["app_exit_reservation_status"] = "broker_submitted"
+    order["app_exit_reservation_status"] = "submitted_unconfirmed"
     order["app_exit_reserved_at"] = reserved_at
     order["app_exit_reason"] = exit_reason
     order["exit_order_no"] = str(order_no or "")
-    order["exit_org_no"] = "reservation"
     order["exit_reason"] = exit_reason
     order["exit_order_type"] = order_type
-    order["exit_submit_failed_at"] = _now()
     _clear_submit_retry_state(order)
     order.pop("closed_at", None)
     order.pop("last_error", None)
@@ -539,98 +655,322 @@ def _order_timestamp(order: dict[str, Any], *keys: str) -> Optional[datetime]:
     return None
 
 
-def _current_order_price(order: dict[str, Any], env_dv: str, holding: dict[str, Any]) -> float:
+def _snapshot_key(
+    env_dv: str,
+    market: str,
+    exchange: Optional[str] = None,
+    stock_code: Optional[str] = None,
+) -> str:
+    return "|".join((
+        str(env_dv or "vps"),
+        str(market or "domestic"),
+        str(exchange or ""),
+        str(stock_code or ""),
+    ))
+
+
+def _paced_monitor_call(snapshot: dict[str, Any], callback):
+    last_call_at = float(snapshot.get("last_call_at") or 0)
+    elapsed = time.monotonic() - last_call_at
+    if last_call_at and elapsed < PROTECTIVE_KIS_CALL_INTERVAL_SECONDS:
+        time.sleep(PROTECTIVE_KIS_CALL_INTERVAL_SECONDS - elapsed)
+    result = callback()
+    snapshot["last_call_at"] = time.monotonic()
+    snapshot["api_calls"] = int(snapshot.get("api_calls") or 0) + 1
+    return result
+
+
+def _build_monitor_snapshot_sync(orders: list[dict[str, Any]]) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "holdings": {},
+        "pending": {},
+        "prices": {},
+        "api_calls": 0,
+        "last_call_at": 0.0,
+        "errors": [],
+    }
+    holding_keys = {
+        _snapshot_key(
+            str(order.get("env_dv") or "vps"),
+            str(order.get("market") or "domestic"),
+        )
+        for order in orders
+    }
+    pending_keys = {
+        _snapshot_key(
+            str(order.get("env_dv") or "vps"),
+            str(order.get("market") or "domestic"),
+            order.get("exchange"),
+        )
+        for order in orders
+    }
+    price_keys = {
+        _snapshot_key(
+            str(order.get("env_dv") or "vps"),
+            str(order.get("market") or "domestic"),
+            order.get("exchange"),
+            str(order.get("stock_code") or ""),
+        )
+        for order in orders
+        if order.get("stock_code") and _is_order_market_open(order)
+    }
+
+    for key in sorted(holding_keys):
+        env_dv, market, _, _ = key.split("|", 3)
+        try:
+            snapshot["holdings"][key] = _paced_monitor_call(
+                snapshot,
+                lambda env_dv=env_dv, market=market: _get_holding_map(env_dv, market),
+            )
+        except Exception as exc:
+            snapshot["holdings"][key] = None
+            snapshot["errors"].append(f"holdings {env_dv}/{market}: {exc}")
+
+    for key in sorted(pending_keys):
+        env_dv, market, exchange, _ = key.split("|", 3)
+        try:
+            pending, ok = _paced_monitor_call(
+                snapshot,
+                lambda env_dv=env_dv, market=market, exchange=exchange: _get_pending_order_state(
+                    env_dv,
+                    market,
+                    exchange or None,
+                ),
+            )
+            snapshot["pending"][key] = {"orders": pending, "ok": ok}
+            if not ok:
+                snapshot["errors"].append(f"pending {env_dv}/{market}/{exchange or '-'}: query failed")
+        except Exception as exc:
+            snapshot["pending"][key] = {"orders": {}, "ok": False}
+            snapshot["errors"].append(f"pending {env_dv}/{market}/{exchange or '-'}: {exc}")
+
+    for key in sorted(price_keys):
+        env_dv, market, exchange, stock_code = key.split("|", 3)
+        try:
+            if market == "us":
+                price_info = _paced_monitor_call(
+                    snapshot,
+                    lambda env_dv=env_dv, exchange=exchange, stock_code=stock_code:
+                        overseas_data_fetcher.get_current_price(
+                            stock_code,
+                            env_dv,
+                            exchange or None,
+                        ),
+                )
+            else:
+                price_info = _paced_monitor_call(
+                    snapshot,
+                    lambda env_dv=env_dv, stock_code=stock_code:
+                        data_fetcher.get_current_price(stock_code, env_dv),
+                )
+            snapshot["prices"][key] = float(price_info.get("price") or 0)
+        except Exception as exc:
+            snapshot["prices"][key] = 0.0
+            snapshot["errors"].append(f"price {stock_code}: {exc}")
+
+    snapshot.pop("last_call_at", None)
+    return snapshot
+
+
+def _snapshot_holdings(
+    snapshot: Optional[dict[str, Any]],
+    env_dv: str,
+    market: str,
+) -> Optional[dict[str, dict[str, Any]]]:
+    if snapshot is None:
+        return _get_holding_map(env_dv, market)
+    return snapshot.get("holdings", {}).get(_snapshot_key(env_dv, market))
+
+
+def _snapshot_pending(
+    snapshot: Optional[dict[str, Any]],
+    env_dv: str,
+    market: str,
+    exchange: Optional[str],
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    if snapshot is None:
+        return _get_pending_order_state(env_dv, market, exchange)
+    value = snapshot.get("pending", {}).get(_snapshot_key(env_dv, market, exchange))
+    if not isinstance(value, dict):
+        return {}, False
+    return value.get("orders", {}), bool(value.get("ok"))
+
+
+def _current_order_price(
+    order: dict[str, Any],
+    env_dv: str,
+    holding: dict[str, Any],
+    snapshot: Optional[dict[str, Any]] = None,
+) -> float:
     market = str(order.get("market") or "domestic")
-    if market == "us":
+    if snapshot is not None:
+        current_price = float(
+            snapshot.get("prices", {}).get(
+                _snapshot_key(
+                    env_dv,
+                    market,
+                    order.get("exchange"),
+                    str(order["stock_code"]),
+                ),
+                0,
+            )
+            or holding.get("current_price")
+            or order.get("last_price")
+            or 0
+        )
+    elif market == "us":
         price_info = overseas_data_fetcher.get_current_price(
             str(order["stock_code"]),
             env_dv,
             order.get("exchange"),
         )
+        current_price = float(
+            price_info.get("price")
+            or holding.get("current_price")
+            or order.get("last_price")
+            or 0
+        )
     else:
         price_info = data_fetcher.get_current_price(str(order["stock_code"]), env_dv)
-    current_price = float(price_info.get("price") or holding.get("current_price") or order.get("last_price") or 0)
+        current_price = float(
+            price_info.get("price")
+            or holding.get("current_price")
+            or order.get("last_price")
+            or 0
+        )
     if current_price > 0:
         order["last_price"] = current_price
         order["last_checked_at"] = _now()
     return current_price
 
 
-def _us_stop_loss_order_price(configured_price: Optional[float], current_price: float) -> float:
+def _us_stop_loss_order_price(
+    configured_price: Optional[float],
+    current_price: float,
+    offset_pct: float = US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT,
+) -> float:
     if current_price <= 0:
         return float(configured_price or 0)
-    marketable_price = current_price * (1 - US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT / 100)
+    marketable_price = current_price * (1 - _normalize_us_exit_offset(
+        offset_pct,
+        US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT,
+    ) / 100)
     if configured_price and configured_price > 0:
         marketable_price = min(float(configured_price), marketable_price)
     return _round_price("us", marketable_price, "down")
 
 
-def _reconcile_exit_submitted_sync(order: dict[str, Any], env_dv: str) -> dict[str, Any]:
+def _us_triggered_exit_order_price(
+    configured_price: Optional[float],
+    current_price: float,
+    exit_reason: str,
+    settings: Optional[dict[str, Any]] = None,
+    reprice_count: int = 0,
+) -> float:
+    settings = settings or _settings_sync()
+    setting_key = (
+        "us_stop_loss_limit_offset_pct"
+        if exit_reason == "stop_loss"
+        else "us_take_profit_limit_offset_pct"
+    )
+    default = (
+        US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT
+        if exit_reason == "stop_loss"
+        else US_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT
+    )
+    base_offset = _normalize_us_exit_offset(settings.get(setting_key), default)
+    step_offset = _normalize_us_exit_offset(
+        settings.get("us_exit_reprice_step_pct"),
+        US_EXIT_REPRICE_STEP_PCT,
+    )
+    max_offset = _normalize_us_exit_offset(
+        settings.get("us_exit_max_offset_pct"),
+        US_EXIT_MAX_OFFSET_PCT,
+    )
+    adaptive_offset = min(
+        max(max_offset, base_offset),
+        base_offset + max(0, int(reprice_count or 0)) * step_offset,
+    )
+    return _us_stop_loss_order_price(
+        configured_price,
+        current_price,
+        adaptive_offset,
+    )
+
+
+def _reconcile_exit_submitted_sync(
+    order: dict[str, Any],
+    env_dv: str,
+    snapshot: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     if order.get("status") != "exit_submitted":
         return order
 
     market = str(order.get("market") or "domestic")
-    holdings = _get_holding_map(env_dv, market)
-    if not holdings:
-        order["last_checked_at"] = _now()
-        order["last_error"] = "holdings unavailable or empty; submitted exit preserved"
-        return order
+    holdings = _snapshot_holdings(snapshot, env_dv, market)
+    if holdings is None:
+        return _mark_submitted_exit_missing_position(order, "holdings unavailable or empty")
 
     holding = holdings.get(str(order.get("stock_code")))
     if not holding or int(holding.get("quantity") or 0) <= 0:
-        order["status"] = "closed"
-        order["closed_at"] = _now()
-        order["last_checked_at"] = _now()
-        order.pop("last_error", None)
-        order.setdefault("events", []).append({"type": "position_closed_after_exit_submit", "at": _now()})
-        return order
+        return _mark_submitted_exit_missing_position(order, "position not found in holdings")
 
     order["quantity"] = min(int(order.get("quantity") or 0), int(holding.get("quantity") or 0))
     order["last_checked_at"] = _now()
-    if market == "us" and env_dv not in ("prod", "real") and order.get("exit_org_no") == "reservation":
-        previous_exit_attempt_at = (
-            order.get("exit_submitted_at")
-            or order.get("closed_at")
-            or order.get("exit_submit_failed_at")
-        )
-        _mark_broker_us_paper_reservation(
-            order,
-            exit_reason=str(order.get("exit_reason") or "stop_loss"),
-            order_type=str(order.get("exit_order_type") or order.get("stop_loss_order_type") or "limit"),
-            price=(
-                float(order.get("stop_loss_limit_price") or order.get("stop_loss_price") or 0)
-                if order.get("exit_order_type", order.get("stop_loss_order_type")) == "limit"
-                else None
-            ),
-            current_price=float(holding.get("current_price") or order.get("last_price") or 0),
-            order_no=str(order.get("exit_order_no") or ""),
-        )
-        order["exit_submit_failed_at"] = previous_exit_attempt_at or _now()
-        order.setdefault("events", []).append({
-            "type": "exit_reopened_position_still_held",
-            "at": _now(),
-            "current_price": float(holding.get("current_price") or order.get("last_price") or 0),
-            "reason": "reservation exit was submitted but holding is still present",
-        })
+    pending, pending_query_ok = _snapshot_pending(
+        snapshot,
+        env_dv,
+        market,
+        order.get("exchange"),
+    )
+    if not pending_query_ok:
+        order["last_error"] = "pending order query failed; exit reconciliation deferred"
         return order
-
-    pending = _get_pending_order_map(env_dv, market, order.get("exchange"))
     exit_order_no = str(order.get("exit_order_no") or "")
     pending_exit = pending.get(exit_order_no)
     exit_reason = str(order.get("exit_reason") or "stop_loss")
-    current_price = _current_order_price(order, env_dv, holding)
+    if not _is_order_market_open(order):
+        order["last_error"] = "exit submitted; waiting for regular market session before repricing"
+        return order
 
-    if pending_exit and exit_reason == "stop_loss":
-        submitted_at = _order_timestamp(order, "exit_submitted_at", "closed_at")
-        if submitted_at and datetime.now() - submitted_at < timedelta(seconds=EXIT_PENDING_REPRICE_SECONDS):
+    current_price = (
+        _current_order_price(order, env_dv, holding)
+        if snapshot is None
+        else _current_order_price(order, env_dv, holding, snapshot)
+    )
+
+    is_us_paper = market == "us" and env_dv not in ("prod", "real")
+    settings = _settings_sync()
+    reprice_seconds = _normalize_monitor_interval(
+        settings.get("exit_reprice_interval_seconds", EXIT_PENDING_REPRICE_SECONDS)
+    )
+    submitted_at = _order_timestamp(order, "exit_submitted_at", "closed_at")
+    if (
+        is_us_paper
+        and submitted_at
+        and datetime.now() - submitted_at < timedelta(seconds=reprice_seconds)
+    ):
+        order["last_error"] = "exit submitted; waiting for fill reconciliation before repricing"
+        return order
+
+    if pending_exit and (exit_reason == "stop_loss" or is_us_paper):
+        if submitted_at and datetime.now() - submitted_at < timedelta(seconds=reprice_seconds):
             order["last_error"] = "exit order pending; waiting before repricing"
             return order
 
+        cancel_quantity = max(
+            1,
+            int(
+                pending_exit.get("unfilled_qty")
+                or pending_exit.get("order_qty")
+                or order["quantity"]
+            ),
+        )
         if market == "us":
             cancel_result = overseas_data_fetcher.cancel_order(
                 order_no=exit_order_no,
                 symbol=str(order["stock_code"]),
-                qty=int(order["quantity"]),
+                qty=cancel_quantity,
                 env_dv=env_dv,
                 exchange=order.get("exchange"),
             )
@@ -639,21 +979,25 @@ def _reconcile_exit_submitted_sync(order: dict[str, Any], env_dv: str) -> dict[s
                 order_no=exit_order_no,
                 org_no=str(order.get("exit_org_no") or ""),
                 stock_code=str(order["stock_code"]),
-                qty=int(order["quantity"]),
+                qty=cancel_quantity,
                 env_dv=env_dv,
             )
         order.setdefault("events", []).append({
             "type": "exit_pending_cancel_for_reprice",
             "at": _now(),
             "order_no": exit_order_no,
+            "cancel_quantity": cancel_quantity,
             "current_price": current_price,
             "result": cancel_result,
         })
         if not cancel_result.get("success"):
             order["last_error"] = f"exit pending cancel failed: {cancel_result.get('message')}"
             return order
+        order["exit_reprice_count"] = int(order.get("exit_reprice_count") or 0) + 1
 
-    if exit_reason == "stop_loss" and current_price > 0:
+    if (exit_reason == "stop_loss" or is_us_paper) and current_price > 0:
+        if not pending_exit:
+            order["exit_reprice_count"] = int(order.get("exit_reprice_count") or 0) + 1
         order["status"] = "active"
         order["exit_submit_failed_at"] = None
         order.pop("closed_at", None)
@@ -666,17 +1010,47 @@ def _reconcile_exit_submitted_sync(order: dict[str, Any], env_dv: str) -> dict[s
         return _submit_triggered_exit(
             order,
             env_dv,
-            reason=(
-                f"보호주문 손절 재시도: 현재가 {current_price}, "
-                "기존 청산 주문 후에도 보유 잔량 확인"
+            reason=f"보호주문 {exit_reason} 재시도: 현재가 {current_price}, 기존 청산 주문 후에도 보유 잔량 확인",
+            exit_reason=exit_reason,
+            order_type=str(
+                order.get(f"{exit_reason}_order_type")
+                or order.get("exit_order_type")
+                or "limit"
             ),
-            exit_reason="stop_loss",
-            order_type=str(order.get("stop_loss_order_type") or order.get("exit_order_type") or "market"),
-            price=float(order.get("stop_loss_limit_price") or order.get("stop_loss_price") or current_price),
+            price=float(
+                order.get(f"{exit_reason}_limit_price")
+                or order.get(f"{exit_reason}_price")
+                or current_price
+            ),
             current_price=current_price,
         )
 
     order["last_error"] = "exit submitted but holding is still present"
+    return order
+
+
+def _mark_submitted_exit_missing_position(order: dict[str, Any], reason: str) -> dict[str, Any]:
+    missing_count = int(order.get("position_missing_count") or 0) + 1
+    now = _now()
+    order["position_missing_count"] = missing_count
+    order["last_checked_at"] = now
+    order["last_error"] = f"{reason}; submitted exit close confirmation ({missing_count}/{POSITION_MISSING_CONFIRMATIONS})"
+    if missing_count < POSITION_MISSING_CONFIRMATIONS:
+        return order
+
+    order["status"] = "closed"
+    order["closed_at"] = now
+    order.pop("last_error", None)
+    reservation = order.get("app_exit_reservation")
+    if isinstance(reservation, dict):
+        reservation["status"] = "filled"
+        reservation["filled_at"] = now
+        order["app_exit_reservation_status"] = "filled"
+    order.setdefault("events", []).append({
+        "type": "position_closed_after_exit_submit",
+        "at": now,
+        "reason": reason,
+    })
     return order
 
 
@@ -755,16 +1129,25 @@ def _get_holding_map(env_dv: str, market: str = "domestic") -> dict[str, dict[st
 
 
 def _get_pending_order_map(env_dv: str, market: str = "domestic", exchange: str | None = None) -> dict[str, dict[str, Any]]:
+    pending, _ = _get_pending_order_state(env_dv, market, exchange)
+    return pending
+
+
+def _get_pending_order_state(
+    env_dv: str,
+    market: str = "domestic",
+    exchange: str | None = None,
+) -> tuple[dict[str, dict[str, Any]], bool]:
     if market == "us":
         df, ok = overseas_data_fetcher.get_pending_orders(env_dv, exchange or "NASD")
     else:
         df, ok = get_pending_orders(env_dv)
     if not ok or df.empty:
-        return {}
-    return {
+        return {}, bool(ok)
+    return ({
         str(row.get("order_no")): row.to_dict()
         for _, row in df.iterrows()
-    }
+    }, True)
 
 
 def _submit_exit_order(
@@ -786,54 +1169,23 @@ def _submit_exit_order(
             order_price = float(price_info.get("price") or 0)
         if order_price <= 0:
             return None, None, False, "current price unavailable"
-        direct_failed = skip_direct_us_sell
-        regular_error = "skipped unsupported direct sell path"
-        if not skip_direct_us_sell:
-            result = overseas_data_fetcher.submit_order(
-                symbol=stock_code,
-                action="SELL",
-                quantity=quantity,
-                price=round(order_price, 2),
-                env_dv=env_dv,
-                exchange=exchange,
+        result = overseas_data_fetcher.submit_order(
+            symbol=stock_code,
+            action="SELL",
+            quantity=quantity,
+            price=round(order_price, 2),
+            env_dv=env_dv,
+            exchange=exchange,
+        )
+        if result.success and not result.dataframe.empty:
+            row = result.dataframe.iloc[0]
+            return (
+                str(row.get("ODNO", row.get("odno", ""))),
+                str(row.get("KRX_FWDG_ORD_ORGNO", row.get("ord_gno_brno", ""))),
+                True,
+                None,
             )
-            if result.success and not result.dataframe.empty:
-                row = result.dataframe.iloc[0]
-                return (
-                    str(row.get("ODNO", row.get("odno", ""))),
-                    str(row.get("KRX_FWDG_ORD_ORGNO", row.get("ord_gno_brno", ""))),
-                    True,
-                    None,
-                )
-            direct_failed = True
-            regular_error = result.display_error() or "overseas sell failed"
-        if direct_failed:
-            if env_dv not in ("prod", "real"):
-                reservation = reserved_orders.submit_us_reservation(
-                    symbol=stock_code,
-                    action="SELL",
-                    quantity=quantity,
-                    price=round(order_price, 2),
-                    order_type="limit",
-                    env_dv=env_dv,
-                    exchange=exchange,
-                )
-                if reservation.success and not reservation.dataframe.empty:
-                    data = reserved_orders.first_normalized_record(reservation)
-                    return (
-                        str(data.get("reservation_order_no") or ""),
-                        "reservation",
-                        True,
-                        None,
-                    )
-                return (
-                    None,
-                    None,
-                    False,
-                    f"regular sell failed: {regular_error}; "
-                    f"reservation sell failed: {reservation.display_error()}",
-                )
-            return None, None, False, regular_error
+        return None, None, False, result.display_error() or "overseas sell failed"
 
     signal = Signal(
         stock_code=stock_code,
@@ -939,16 +1291,6 @@ def _submit_triggered_exit(
     _normalize_runtime_order(order)
     order_type = "market" if order_type not in {"market", "limit"} else order_type
     market = str(order.get("market") or "domestic")
-    app_reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
-    if (
-        market == "us"
-        and env_dv not in ("prod", "real")
-        and app_reservation.get("status") == "broker_submitted"
-        and (app_reservation.get("reservation_order_no") or order.get("exit_order_no"))
-    ):
-        order["last_checked_at"] = _now()
-        return order
-
     last_error = str(order.get("last_error") or "")
     if (
         market == "us"
@@ -977,14 +1319,35 @@ def _submit_triggered_exit(
     if market == "us" and order_type == "market":
         order_type = "limit"
         price = current_price
-    if market == "us" and exit_reason == "stop_loss" and order_type == "limit":
-        price = _us_stop_loss_order_price(float(price or 0), current_price)
+    if market == "us" and order_type == "limit":
+        price = _us_triggered_exit_order_price(
+            float(price or 0),
+            current_price,
+            exit_reason,
+            reprice_count=int(order.get("exit_reprice_count") or 0),
+        )
+    if market == "us" and env_dv not in ("prod", "real") and not _is_us_regular_session_now():
+        detail = "미국 정규장 외 시간이라 앱 보호매도를 다음 정규장까지 대기합니다"
+        _mark_local_us_paper_reservation(
+            order,
+            exit_reason=exit_reason,
+            order_type=order_type,
+            price=price if order_type == "limit" else None,
+            current_price=current_price,
+            error=detail,
+        )
+        _set_next_retry_at(order, _next_us_regular_session_retry_at())
+        order["app_exit_reservation"]["last_error"] = detail
+        order.setdefault("events", []).append({
+            "type": f"{exit_reason}_app_waiting_regular_session",
+            "at": _now(),
+            "order_type": order_type,
+            "order_price": price if order_type == "limit" else None,
+            "current_price": current_price,
+            "next_retry_at": order.get("next_retry_at"),
+        })
+        return order
 
-    skip_direct_us_sell = (
-        market == "us"
-        and env_dv not in ("prod", "real")
-        and US_PAPER_DIRECT_SELL_UNSUPPORTED_PATH in set(order.get("unsupported_paths") or [])
-    )
     order_no, org_no, ok, error = _submit_exit_order(
         env_dv=env_dv,
         stock_code=str(order["stock_code"]),
@@ -995,11 +1358,23 @@ def _submit_triggered_exit(
         market=market,
         exchange=order.get("exchange"),
         reason=reason,
-        skip_direct_us_sell=skip_direct_us_sell,
+        skip_direct_us_sell=False,
     )
     if ok:
-        if market == "us" and env_dv not in ("prod", "real") and org_no == "reservation":
-            _mark_broker_us_paper_reservation(
+        order["status"] = "exit_submitted"
+        order["exit_order_no"] = order_no
+        order["exit_org_no"] = org_no
+        order["exit_reason"] = exit_reason
+        order["exit_order_type"] = order_type
+        order["exit_submitted_at"] = _now()
+        order["exit_order_price"] = price if order_type == "limit" else None
+        _clear_submit_retry_state(order)
+        order.pop("last_error", None)
+        order.pop("exit_submit_failed_at", None)
+        order.pop("exit_submit_blocked", None)
+        order.pop("closed_at", None)
+        if market == "us" and env_dv not in ("prod", "real"):
+            _mark_us_paper_exit_submitted(
                 order,
                 exit_reason=exit_reason,
                 order_type=order_type,
@@ -1007,31 +1382,11 @@ def _submit_triggered_exit(
                 current_price=current_price,
                 order_no=order_no,
             )
-            order.setdefault("events", []).append({
-                "type": f"{exit_reason}_reservation_submitted",
-                "at": _now(),
-                "order_no": order_no,
-                "order_type": order_type,
-                "order_price": price if order_type == "limit" else None,
-                "current_price": current_price,
-            })
-            return order
-
-        order["status"] = "exit_submitted"
-        order["exit_order_no"] = order_no
-        order["exit_org_no"] = org_no
-        order["exit_reason"] = exit_reason
-        order["exit_order_type"] = order_type
-        order["exit_submitted_at"] = _now()
-        _clear_submit_retry_state(order)
-        order.pop("last_error", None)
-        order.pop("exit_submit_failed_at", None)
-        order.pop("exit_submit_blocked", None)
-        order.pop("closed_at", None)
-        order.pop("app_exit_reservation", None)
-        order.pop("app_exit_reservation_status", None)
-        order.pop("app_exit_reserved_at", None)
-        order.pop("app_exit_reason", None)
+        else:
+            order.pop("app_exit_reservation", None)
+            order.pop("app_exit_reservation_status", None)
+            order.pop("app_exit_reserved_at", None)
+            order.pop("app_exit_reason", None)
         order.setdefault("events", []).append({
             "type": f"{exit_reason}_submitted",
             "at": _now(),
@@ -1078,13 +1433,22 @@ def _submit_triggered_exit(
     return order
 
 
-def _check_order_sync(order: dict[str, Any], env_dv: str) -> dict[str, Any]:
+def _check_order_sync(
+    order: dict[str, Any],
+    env_dv: str,
+    snapshot: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     if order.get("status") != "active":
         return order
 
     market = str(order.get("market") or "domestic")
-    holdings = _get_holding_map(env_dv, market)
-    pending = _get_pending_order_map(env_dv, market, order.get("exchange"))
+    holdings = _snapshot_holdings(snapshot, env_dv, market)
+    pending, pending_query_ok = _snapshot_pending(
+        snapshot,
+        env_dv,
+        market,
+        order.get("exchange"),
+    )
 
     if not holdings:
         order["last_checked_at"] = _now()
@@ -1114,17 +1478,35 @@ def _check_order_sync(order: dict[str, Any], env_dv: str) -> dict[str, Any]:
         order.pop("last_error", None)
 
     order["quantity"] = min(int(order["quantity"]), int(holding.get("quantity") or 0))
-    _ensure_take_profit(order, env_dv, pending)
+    if pending_query_ok:
+        _ensure_take_profit(order, env_dv, pending)
+    elif order.get("take_profit_submit_mode") != "on_trigger":
+        order["last_error"] = "pending order query failed; take-profit reconciliation deferred"
 
-    if market == "us":
+    if snapshot is not None:
+        current_price = float(
+            snapshot.get("prices", {}).get(
+                _snapshot_key(
+                    env_dv,
+                    market,
+                    order.get("exchange"),
+                    str(order["stock_code"]),
+                ),
+                0,
+            )
+            or holding.get("current_price")
+            or 0
+        )
+    elif market == "us":
         price_info = overseas_data_fetcher.get_current_price(
             str(order["stock_code"]),
             env_dv,
             order.get("exchange"),
         )
+        current_price = float(price_info.get("price") or holding.get("current_price") or 0)
     else:
         price_info = data_fetcher.get_current_price(str(order["stock_code"]), env_dv)
-    current_price = float(price_info.get("price") or holding.get("current_price") or 0)
+        current_price = float(price_info.get("price") or holding.get("current_price") or 0)
     if current_price <= 0:
         order["last_error"] = "current price unavailable"
         return order
@@ -1424,12 +1806,171 @@ async def upsert_existing_position_protection(
     return protection
 
 
+def _monitor_health(
+    *,
+    orders: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    started_at: datetime,
+    processing_errors: list[str],
+) -> dict[str, Any]:
+    now = datetime.now()
+    rate_limited = [
+        order for order in orders
+        if order.get("last_error_code") == "EGW00201"
+        or _is_us_paper_rate_limit_error(str(order.get("last_error") or ""))
+    ]
+    overdue = []
+    for order in orders:
+        if order.get("status") not in {"exit_submitted", "active"}:
+            continue
+        reservation = order.get("app_exit_reservation")
+        waiting = (
+            order.get("status") == "exit_submitted"
+            or (
+                isinstance(reservation, dict)
+                and reservation.get("status") in {"waiting_retry", "submitted_unconfirmed"}
+            )
+        )
+        if not waiting:
+            continue
+        if not _is_order_market_open(order):
+            continue
+        started = _order_timestamp(
+            order,
+            "exit_submitted_at",
+            "app_exit_reserved_at",
+            "exit_submit_failed_at",
+        )
+        if isinstance(reservation, dict) and reservation.get("status") == "waiting_retry":
+            retry_at = _order_timestamp(order, "next_retry_at")
+            if retry_at and (started is None or retry_at > started):
+                started = retry_at
+        if started and (now - started).total_seconds() >= PROTECTIVE_EXIT_ALERT_AFTER_SECONDS:
+            overdue.append({
+                "stock_code": order.get("stock_code"),
+                "status": order.get("status"),
+                "age_seconds": int((now - started).total_seconds()),
+            })
+
+    snapshot_errors = list(snapshot.get("errors") or [])
+    errors = snapshot_errors + processing_errors
+    status = "degraded" if errors or rate_limited or overdue else "healthy"
+    return {
+        "status": status,
+        "last_cycle_started_at": started_at.isoformat(timespec="seconds"),
+        "last_cycle_completed_at": now.isoformat(timespec="seconds"),
+        "last_cycle_duration_seconds": round((now - started_at).total_seconds(), 2),
+        "snapshot_api_calls": int(snapshot.get("api_calls") or 0),
+        "snapshot_errors": snapshot_errors[-20:],
+        "processing_errors": processing_errors[-20:],
+        "rate_limited_order_count": len(rate_limited),
+        "overdue_exit_count": len(overdue),
+        "overdue_exits": overdue[:20],
+        "active_order_count": sum(order.get("status") == "active" for order in orders),
+        "submitted_exit_count": sum(order.get("status") == "exit_submitted" for order in orders),
+    }
+
+
+def _send_monitor_health_alert_sync(
+    health: dict[str, Any],
+    previous_health: dict[str, Any],
+) -> dict[str, Any]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_ALLOWED_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return {"status": "disabled"}
+
+    is_degraded = health.get("status") == "degraded"
+    previous_status = previous_health.get("status")
+    signature = "|".join((
+        str(health.get("status") or ""),
+        str(health.get("rate_limited_order_count") or 0),
+        str(health.get("overdue_exit_count") or 0),
+        str(len(health.get("snapshot_errors") or [])),
+        str(len(health.get("processing_errors") or [])),
+    ))
+    previous_signature = str(previous_health.get("last_alert_signature") or "")
+    last_alert_at = _parse_time(previous_health.get("last_alert_at"))
+    cooldown_elapsed = (
+        last_alert_at is None
+        or (datetime.now() - last_alert_at).total_seconds() >= PROTECTIVE_ALERT_COOLDOWN_SECONDS
+    )
+    should_send = (
+        (is_degraded and (previous_status != "degraded" or cooldown_elapsed))
+        or (not is_degraded and previous_status == "degraded")
+    )
+    if not should_send:
+        return {"status": "skipped", "signature": previous_signature}
+
+    report_url = os.environ.get("US_MARKET_REPORT_URL", "").rstrip("/")
+    link = f"\n{report_url}/review" if report_url else ""
+    if is_degraded:
+        overdue_symbols = ", ".join(
+            str(item.get("stock_code"))
+            for item in health.get("overdue_exits", [])[:8]
+        ) or "-"
+        text = (
+            "KIS protective monitor degraded\n"
+            f"API calls {health.get('snapshot_api_calls', 0)}, "
+            f"rate limits {health.get('rate_limited_order_count', 0)}, "
+            f"overdue exits {health.get('overdue_exit_count', 0)}\n"
+            f"Overdue symbols: {overdue_symbols}\n"
+            f"Snapshot errors: {len(health.get('snapshot_errors') or [])}, "
+            f"processing errors: {len(health.get('processing_errors') or [])}{link}"
+        )
+    else:
+        text = f"KIS protective monitor recovered{link}"
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=12,
+        )
+        body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.ok and body.get("ok"):
+            return {
+                "status": "sent",
+                "signature": signature,
+                "sent_at": _now(),
+            }
+        return {
+            "status": "error",
+            "signature": previous_signature,
+            "message": str(body.get("description") or "telegram send failed")[:500],
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "signature": previous_signature,
+            "message": f"{type(exc).__name__}: {exc}"[:500],
+        }
+
+
 async def run_monitor_cycle() -> None:
+    started_at = datetime.now()
     state = await _load_state()
     settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
     price_source = settings.get("price_source") or "websocket"
     changed = False
     updated_orders = []
+    processing_errors: list[str] = []
+    snapshot_targets = [
+        order
+        for order in state.get("orders", [])
+        if order.get("status") == "exit_submitted"
+        or (
+            order.get("status") == "active"
+            and _is_order_market_open(order)
+            and not (
+                price_source == "websocket"
+                and order.get("source") == "review"
+                and order.get("take_profit_submit_mode") == "on_trigger"
+                and _is_recent_realtime(order)
+            )
+        )
+    ]
+    snapshot = await asyncio.to_thread(_build_monitor_snapshot_sync, snapshot_targets)
 
     for order in state.get("orders", []):
         if order.get("status") == "exit_submitted":
@@ -1439,6 +1980,7 @@ async def run_monitor_cycle() -> None:
                     _reconcile_exit_submitted_sync,
                     order,
                     str(order.get("env_dv") or "vps"),
+                    snapshot,
                 )
                 updated_orders.append(updated)
                 changed = changed or json.dumps(updated, sort_keys=True, default=str) != before
@@ -1447,10 +1989,15 @@ async def run_monitor_cycle() -> None:
                 order["last_checked_at"] = _now()
                 updated_orders.append(order)
                 changed = True
+                processing_errors.append(f"{order.get('stock_code')}: {exc}")
                 logger.exception("protective exit reconciliation failed")
             continue
 
         if order.get("status") != "active":
+            updated_orders.append(order)
+            continue
+
+        if not _is_order_market_open(order):
             updated_orders.append(order)
             continue
 
@@ -1465,7 +2012,12 @@ async def run_monitor_cycle() -> None:
 
         try:
             before = json.dumps(order, sort_keys=True, default=str)
-            updated = await asyncio.to_thread(_check_order_sync, order, str(order.get("env_dv") or "vps"))
+            updated = await asyncio.to_thread(
+                _check_order_sync,
+                order,
+                str(order.get("env_dv") or "vps"),
+                snapshot,
+            )
             updated_orders.append(updated)
             changed = changed or json.dumps(updated, sort_keys=True, default=str) != before
         except Exception as exc:
@@ -1473,10 +2025,33 @@ async def run_monitor_cycle() -> None:
             order["last_checked_at"] = _now()
             updated_orders.append(order)
             changed = True
+            processing_errors.append(f"{order.get('stock_code')}: {exc}")
             logger.exception("protective order check failed")
 
+    health = _monitor_health(
+        orders=updated_orders,
+        snapshot=snapshot,
+        started_at=started_at,
+        processing_errors=processing_errors,
+    )
+    alert = await asyncio.to_thread(
+        _send_monitor_health_alert_sync,
+        health,
+        state.get("health") if isinstance(state.get("health"), dict) else {},
+    )
+    health["alert_status"] = alert.get("status")
+    if alert.get("status") == "sent":
+        health["last_alert_signature"] = alert.get("signature")
+        health["last_alert_at"] = alert.get("sent_at")
+    else:
+        previous_health = state.get("health") if isinstance(state.get("health"), dict) else {}
+        health["last_alert_signature"] = previous_health.get("last_alert_signature")
+        health["last_alert_at"] = previous_health.get("last_alert_at")
+        if alert.get("message"):
+            health["alert_error"] = alert["message"]
+
+    state = await _merge_updated_orders(updated_orders, {"health": health})
     if changed:
-        state = await _merge_updated_orders(updated_orders)
         await _sync_realtime_subscriptions(state)
 
 
@@ -1572,13 +2147,121 @@ async def stop_monitor() -> None:
 
 
 async def list_protective_orders() -> dict[str, Any]:
-    return await _load_state()
+    state = await _load_state()
+    settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
+    health = dict(state.get("health") if isinstance(state.get("health"), dict) else {})
+    completed_at = _parse_time(health.get("last_cycle_completed_at"))
+    stale_after = max(
+        90,
+        _normalize_monitor_interval(settings.get("monitor_interval_seconds")) * 3,
+    )
+    health["monitor_running"] = bool(_monitor_task is not None and not _monitor_task.done())
+    health["stale"] = bool(
+        completed_at is None
+        or (datetime.now() - completed_at).total_seconds() > stale_after
+    )
+    health["stale_after_seconds"] = stale_after
+    if health["stale"] and health.get("status") != "degraded":
+        health["status"] = "stale"
+    state["health"] = health
+    return state
 
 
-async def update_monitor_settings(*, monitor_interval_seconds: int) -> dict[str, Any]:
+async def list_protective_app_reservations() -> list[dict[str, Any]]:
+    state = await _load_state()
+    rows = []
+    for order in state.get("orders", []):
+        if not _is_us_paper_order(order):
+            continue
+        reservation = order.get("app_exit_reservation")
+        if not isinstance(reservation, dict):
+            continue
+        reservation_status = str(reservation.get("status") or "")
+        if order.get("status") == "closed" and reservation_status != "filled":
+            reservation_status = "closed"
+        created_at = reservation.get("reserved_at") or order.get("created_at") or _now()
+        action = "SELL"
+        rows.append({
+            **reservation,
+            "status": reservation_status,
+            "id": f"protective:{order.get('id')}",
+            "reservation_order_no": f"protective:{order.get('id')}",
+            "reservation_order_date": str(created_at)[:10].replace("-", ""),
+            "reservation_order_org_no": "app",
+            "reservation_source": "app",
+            "reservation_kind": "protective_exit",
+            "cancellable": False,
+            "market": "us",
+            "action": action,
+            "stock_code": order.get("stock_code"),
+            "stock_name": order.get("stock_name"),
+            "exchange": order.get("exchange"),
+            "quantity": order.get("quantity"),
+            "price": reservation.get("limit_price"),
+            "order_type": reservation.get("order_type") or "limit",
+            "scheduled_at": reservation.get("next_retry_at") or reservation.get("reserved_at"),
+            "expires_at": None,
+            "submitted_order_no": reservation.get("submitted_order_no"),
+            "SLL_BUY_DVSN_NAME": "매도",
+            "ORD_QTY": order.get("quantity"),
+            "ORD_UNPR": reservation.get("limit_price"),
+            "RSVN_ORD_PRCS_STAT_NAME": {
+                "waiting_retry": "보호매도 재시도 대기",
+                "submitted_unconfirmed": "보호매도 체결 확인 중",
+                "filled": "보호매도 체결 완료",
+                "closed": "보호매도 종료",
+            }.get(reservation_status, reservation_status or "-"),
+        })
+    return rows
+
+
+async def update_monitor_settings(
+    *,
+    monitor_interval_seconds: int,
+    us_stop_loss_limit_offset_pct: float | None = None,
+    us_take_profit_limit_offset_pct: float | None = None,
+    exit_reprice_interval_seconds: int | None = None,
+    us_exit_reprice_step_pct: float | None = None,
+    us_exit_max_offset_pct: float | None = None,
+) -> dict[str, Any]:
     state = await _load_state()
     settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
     settings["monitor_interval_seconds"] = _normalize_monitor_interval(monitor_interval_seconds)
+    if us_stop_loss_limit_offset_pct is not None:
+        settings["us_stop_loss_limit_offset_pct"] = _normalize_us_exit_offset(
+            us_stop_loss_limit_offset_pct,
+            US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT,
+        )
+    if us_take_profit_limit_offset_pct is not None:
+        settings["us_take_profit_limit_offset_pct"] = _normalize_us_exit_offset(
+            us_take_profit_limit_offset_pct,
+            US_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT,
+        )
+    if exit_reprice_interval_seconds is not None:
+        settings["exit_reprice_interval_seconds"] = _normalize_monitor_interval(
+            exit_reprice_interval_seconds
+        )
+    if us_exit_reprice_step_pct is not None:
+        settings["us_exit_reprice_step_pct"] = _normalize_us_exit_offset(
+            us_exit_reprice_step_pct,
+            US_EXIT_REPRICE_STEP_PCT,
+        )
+    if us_exit_max_offset_pct is not None:
+        settings["us_exit_max_offset_pct"] = _normalize_us_exit_offset(
+            us_exit_max_offset_pct,
+            US_EXIT_MAX_OFFSET_PCT,
+        )
+    if (
+        float(settings.get("us_exit_max_offset_pct") or US_EXIT_MAX_OFFSET_PCT)
+        < max(
+            float(settings.get("us_stop_loss_limit_offset_pct") or 0),
+            float(settings.get("us_take_profit_limit_offset_pct") or 0),
+        )
+    ):
+        settings["us_exit_max_offset_pct"] = max(
+            float(settings.get("us_stop_loss_limit_offset_pct") or 0),
+            float(settings.get("us_take_profit_limit_offset_pct") or 0),
+        )
     state["settings"] = settings
     await _save_state(state)
     await _sync_realtime_subscriptions(state)
