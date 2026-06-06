@@ -80,11 +80,16 @@ class OverseasDataFetcherTest(unittest.TestCase):
                 "frcr_evlu_pfls_amt": "100.25",
             }],
             "output2": [{
-                "frcr_buy_amt_smtl1": "200.25",
+                "frcr_buy_amt_smtl1": "9999999.99",
                 "tot_evlu_pfls_amt": "999.99",
             }],
         }
         present_raw = {
+            "output2": [{
+                "crcy_cd": "USD",
+                "frcr_dncl_amt_2": "200.25",
+                "frcr_use_psbl_amt": "180.00",
+            }],
             "output3": [{
                 "tot_asst_amt": "1200500.00",
             }],
@@ -111,7 +116,7 @@ class OverseasDataFetcherTest(unittest.TestCase):
                 "frcr_evlu_pfls_amt": "30.00",
             }],
             "output2": [{
-                "frcr_buy_amt_smtl1": "50.00",
+                "frcr_buy_amt_smtl1": "5000000.00",
                 "tot_evlu_pfls_amt": "30.00",
             }],
         }
@@ -121,10 +126,10 @@ class OverseasDataFetcherTest(unittest.TestCase):
         ):
             deposit = overseas_data_fetcher.get_deposit("vps")
 
-        self.assertEqual(deposit["deposit"], 50.0)
+        self.assertEqual(deposit["deposit"], 0.0)
         self.assertEqual(deposit["eval_amount"], 150.0)
         self.assertEqual(deposit["profit_loss"], 30.0)
-        self.assertEqual(deposit["total_eval"], 200.0)
+        self.assertEqual(deposit["total_eval"], 150.0)
 
     def test_get_deposit_reads_usd_cash_from_present_balance_currency_rows(self):
         present_raw = {

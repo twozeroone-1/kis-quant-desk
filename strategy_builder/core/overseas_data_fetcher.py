@@ -647,14 +647,10 @@ def get_deposit(env_dv: str = "real") -> dict[str, Any]:
         present_df = _frame_from_output((present_raw or {}).get("output3"))
         present_summary = present_df.iloc[0].to_dict() if not present_df.empty else {}
 
-        deposit = _first_number(balance_summary, ("frcr_buy_amt_smtl1", "frcr_buy_amt_smtl2", "buy_psbl_amt", "ovrs_ord_psbl_amt"))
-        if deposit == 0:
-            deposit = _first_number(balance_summary, ("frcr_drwg_psbl_amt_1", "frcr_dncl_amt_2"))
-        if deposit == 0:
-            deposit = _first_number(
-                present_currency,
-                ("frcr_dncl_amt_2", "frcr_use_psbl_amt", "frcr_drwg_psbl_amt_1", "nxdy_frcr_drwg_psbl_amt"),
-            )
+        deposit = _first_number(
+            present_currency,
+            ("frcr_dncl_amt_2", "frcr_use_psbl_amt", "frcr_drwg_psbl_amt_1", "nxdy_frcr_drwg_psbl_amt"),
+        )
         available_amount = _first_number(
             present_currency,
             ("frcr_use_psbl_amt", "frcr_drwg_psbl_amt_1", "frcr_dncl_amt_2", "nxdy_frcr_drwg_psbl_amt"),
@@ -676,10 +672,7 @@ def get_deposit(env_dv: str = "real") -> dict[str, Any]:
         eval_amount = stock_eval_amount or _first_number(balance_summary, ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt_smtl_amt", "evlu_amt_smtl", "tot_evlu_amt"))
         profit_loss = stock_profit_loss or _first_number(balance_summary, ("evlu_pfls_smtl_amt", "frcr_evlu_pfls_amt", "tot_evlu_pfls_amt", "ovrs_tot_pfls"))
         total_eval = deposit + eval_amount
-        total_asset_krw = _first_number(
-            present_summary,
-            ("tot_asst_amt", "frcr_evlu_tota", "evlu_amt_smtl_amt", "evlu_amt_smtl", "tot_dncl_amt", "wdrw_psbl_tot_amt"),
-        )
+        total_asset_krw = _first_number(present_summary, ("tot_asst_amt",))
         return {
             "deposit": deposit,
             "total_eval": total_eval,
