@@ -303,7 +303,7 @@ export default function ReservationsPage() {
   };
 
   return (
-    <div className="max-w-7xl mx-auto px-4 py-6">
+    <div className="mx-auto max-w-[96rem] px-4 py-6">
       <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <h1 className="text-display text-slate-900 dark:text-slate-100 flex items-center gap-3">
@@ -352,8 +352,8 @@ export default function ReservationsPage() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[420px_1fr]">
-        <form onSubmit={handleSubmit} className="card p-6 space-y-5">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
+        <form onSubmit={handleSubmit} className="card space-y-5 p-5">
           <div className="space-y-2">
             <label className="text-sm font-semibold text-slate-700 dark:text-slate-200">예약 방식</label>
             <div className="grid grid-cols-2 gap-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 p-1">
@@ -571,54 +571,65 @@ export default function ReservationsPage() {
           </button>
         </form>
 
-        <section className="card p-0 overflow-hidden">
+        <section className="card min-w-0 p-0">
           <div className="flex flex-col gap-3 border-b border-slate-200 dark:border-slate-800 p-4 md:flex-row md:items-end md:justify-between">
             <div>
               <h2 className="text-heading text-slate-900 dark:text-slate-100">예약주문 목록</h2>
               <p className="text-caption text-slate-500 dark:text-slate-400">{orders.length}건</p>
             </div>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid w-full grid-cols-1 gap-2 sm:w-auto sm:grid-cols-2">
               <input
                 type="date"
                 value={startDate}
                 onChange={(event) => setStartDate(event.target.value)}
-                className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                className="min-w-0 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
               />
               <input
                 type="date"
                 value={listEndDate}
                 onChange={(event) => setListEndDate(event.target.value)}
-                className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
+                className="min-w-0 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
               />
             </div>
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[960px] text-left text-sm">
+          <div className="w-full overflow-x-auto overscroll-x-contain">
+            <table className="w-full min-w-[860px] table-fixed text-left text-sm">
+              <colgroup>
+                <col className="w-[9%]" />
+                <col className="w-[16%]" />
+                <col className="w-[15%]" />
+                <col className="w-[15%]" />
+                <col className="w-[7%]" />
+                <col className="w-[8%]" />
+                <col className="w-[9%]" />
+                <col className="w-[14%]" />
+                <col className="w-[7%]" />
+              </colgroup>
               <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-500 dark:bg-slate-950 dark:text-slate-400">
                 <tr>
-                  <th className="px-4 py-3">접수일</th>
-                  <th className="px-4 py-3">예약번호</th>
-                  <th className="px-4 py-3">실행시각</th>
-                  <th className="px-4 py-3">종목</th>
-                  <th className="px-4 py-3">구분</th>
-                  <th className="px-4 py-3 text-right">수량</th>
-                  <th className="px-4 py-3 text-right">가격</th>
-                  <th className="px-4 py-3">상태</th>
-                  <th className="px-4 py-3 text-right">관리</th>
+                  <th className="px-3 py-3">접수일</th>
+                  <th className="px-3 py-3">예약번호</th>
+                  <th className="px-3 py-3">실행시각</th>
+                  <th className="px-3 py-3">종목</th>
+                  <th className="px-3 py-3">구분</th>
+                  <th className="px-3 py-3 text-right">수량</th>
+                  <th className="px-3 py-3 text-right">가격</th>
+                  <th className="px-3 py-3">상태</th>
+                  <th className="px-3 py-3 text-right">관리</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
                 {loading ? (
                   <tr>
-                    <td colSpan={9} className="px-4 py-10 text-center text-slate-500">
+                    <td colSpan={9} className="px-3 py-10 text-center text-slate-500">
                       <Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin" />
                       조회 중
                     </td>
                   </tr>
                 ) : orders.length === 0 ? (
                   <tr>
-                    <td colSpan={9} className="px-4 py-10 text-center text-slate-500">
+                    <td colSpan={9} className="px-3 py-10 text-center text-slate-500">
                       예약주문 없음
                     </td>
                   </tr>
@@ -645,10 +656,10 @@ export default function ReservationsPage() {
                     const cancelDisabled = row.cancellable === false || !orderNo || appFinal || (rowSource === "broker" && (!orderDate || (market === "domestic" && !orgNo)));
 
                     return (
-                      <tr key={`${orderNo || "row"}-${index}`} className="bg-white dark:bg-slate-900">
-                        <td className="px-4 py-3 text-slate-600 dark:text-slate-300">{formatDate(orderDate)}</td>
-                        <td className="px-4 py-3">
-                          <div className="font-mono text-xs text-slate-700 dark:text-slate-200">{orderNo || "-"}</div>
+                      <tr key={`${orderNo || "row"}-${index}`} className="align-top bg-white dark:bg-slate-900">
+                        <td className="px-3 py-3 text-slate-600 dark:text-slate-300">{formatDate(orderDate)}</td>
+                        <td className="px-3 py-3">
+                          <div className="break-all font-mono text-xs text-slate-700 dark:text-slate-200">{orderNo || "-"}</div>
                           <div className={`mt-1 inline-flex rounded px-1.5 py-0.5 text-[11px] font-semibold ${
                             rowSource === "app"
                               ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-200"
@@ -660,7 +671,7 @@ export default function ReservationsPage() {
                             <div className="mt-1 text-[11px] font-semibold text-blue-600 dark:text-blue-300">손익절 보호매도</div>
                           )}
                         </td>
-                        <td className="px-4 py-3 text-slate-600 dark:text-slate-300">
+                        <td className="px-3 py-3 text-slate-600 dark:text-slate-300">
                           {rowSource === "app" ? (
                             <div>
                               <div>{formatDateTime(scheduled)}</div>
@@ -668,19 +679,19 @@ export default function ReservationsPage() {
                             </div>
                           ) : "-"}
                         </td>
-                        <td className="px-4 py-3">
-                          <div className="font-medium text-slate-900 dark:text-slate-100">{name || stock || "-"}</div>
-                          {name && stock && <div className="text-xs text-slate-500">{stock}</div>}
+                        <td className="px-3 py-3">
+                          <div className="break-words font-medium text-slate-900 dark:text-slate-100">{name || stock || "-"}</div>
+                          {name && stock && <div className="break-all text-xs text-slate-500">{stock}</div>}
                         </td>
-                        <td className="px-4 py-3 text-slate-700 dark:text-slate-200">{side || "-"}</td>
-                        <td className="px-4 py-3 text-right text-slate-700 dark:text-slate-200">{formatNumber(qty)}</td>
-                        <td className="px-4 py-3 text-right text-slate-700 dark:text-slate-200">{formatNumber(orderPrice)}</td>
-                        <td className="px-4 py-3 text-slate-600 dark:text-slate-300">
-                          <div>{status || "-"}</div>
+                        <td className="px-3 py-3 text-slate-700 dark:text-slate-200">{side || "-"}</td>
+                        <td className="px-3 py-3 text-right text-slate-700 dark:text-slate-200">{formatNumber(qty)}</td>
+                        <td className="px-3 py-3 text-right text-slate-700 dark:text-slate-200">{formatNumber(orderPrice)}</td>
+                        <td className="px-3 py-3 text-slate-600 dark:text-slate-300">
+                          <div className="break-words">{status || "-"}</div>
                           {submittedOrderNo && <div className="mt-1 text-xs text-green-600 dark:text-green-300">주문 {submittedOrderNo}</div>}
-                          {lastError && <div className="mt-1 max-w-[220px] truncate text-xs text-red-600 dark:text-red-300" title={lastError}>{lastError}</div>}
+                          {lastError && <div className="mt-1 break-words text-xs text-red-600 dark:text-red-300" title={lastError}>{lastError}</div>}
                         </td>
-                        <td className="px-4 py-3 text-right">
+                        <td className="px-3 py-3 text-right">
                           <button
                             type="button"
                             onClick={() => void handleCancel(row)}
