@@ -655,9 +655,6 @@ export default function ReviewPage() {
           {market === "us" && usTotalEval <= 0 && usOrderableAmount > 0 && (
             <span className="block mt-1 text-xs text-slate-500">평가금액(API) {formatMoney(balance?.total_eval, "USD")}</span>
           )}
-          {market === "us" && Number(balance?.total_asset_krw || 0) > 0 && (
-            <span className="block mt-1 text-xs text-slate-500">원화 총자산(참고) {formatMoney(balance?.total_asset_krw, "KRW")}</span>
-          )}
         </div>
         <div className="card p-4">
           <span className="text-caption text-slate-500">{streamLabel}</span>

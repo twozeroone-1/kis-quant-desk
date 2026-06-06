@@ -46,6 +46,7 @@ export function HoldingsList({
   const totalProfitRate =
     totalEval > 0 ? (totalProfitLoss / (totalEval - totalProfitLoss)) * 100 : 0;
   const currency = market === "us" ? "USD" : "KRW";
+  const orderableAmount = Number(balance?.orderable_amount ?? balance?.available_amount ?? 0);
   const formatMoney = useCallback((value: number) => (
     market === "us" ? `$${value.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : `${Math.round(value).toLocaleString()}원`
   ), [market]);
@@ -80,11 +81,17 @@ export function HoldingsList({
               계좌 요약
             </span>
           </div>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-3 gap-4">
             <div>
-              <p className="text-xs text-slate-500">예수금</p>
+              <p className="text-xs text-slate-500">{market === "us" ? "외화 예수금" : "예수금"}</p>
               <p className="text-sm font-bold text-slate-900 dark:text-white">
                 {formatMoney(balance.deposit)}
+              </p>
+            </div>
+            <div className="text-center">
+              <p className="text-xs text-slate-500">주문가능금액</p>
+              <p className="text-sm font-bold text-slate-900 dark:text-white">
+                {formatMoney(orderableAmount)}
               </p>
             </div>
             <div className="text-right">
