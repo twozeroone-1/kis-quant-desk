@@ -10,7 +10,7 @@ dependencies = [
     "pyqt6>=6.9.1",
     "pyside6>=6.9.1",
     "pyyaml>=6.0.2",
-    "requests>=2.32.4",
+    "requests>=2.33.0",
     "websockets>=15.0.1",
 ]
 

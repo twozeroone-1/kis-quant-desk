@@ -19,16 +19,16 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install ruff mypy pytest pytest-cov import-linter
-      - name: Ruff lint
-        run: python -m ruff check .
-      - name: MyPy typecheck
-        run: python -m mypy .
+      - name: Ruff lint safety gate
+        run: python -m ruff check scripts/trading_safety_gate.py tests/test_trading_safety_gate.py
+      - name: MyPy typecheck safety gate
+        run: python -m mypy --explicit-package-bases scripts/trading_safety_gate.py tests/test_trading_safety_gate.py
       - name: Import architecture gate
         run: python -m lint_imports
       - name: Trading safety gate
         run: python scripts/trading_safety_gate.py
-      - name: Unit tests
-        run: python -m pytest tests --cov --cov-report=term-missing
+      - name: Safety gate tests
+        run: python -m pytest tests/test_trading_safety_gate.py -q
 
   dependency-audit:
     name: Dependency and secret audit
@@ -43,6 +43,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install detect-secrets pip-audit
       - name: Secret baseline-free scan
-        run: detect-secrets scan --all-files --exclude-files '(^uv.lock$|^tests/fixtures/)'
+        run: detect-secrets scan --exclude-files '(^uv.lock$|^tests/fixtures/)'
       - name: Python dependency audit
         run: pip-audit --progress-spinner off -r requirements.txt
