@@ -144,8 +144,8 @@ Codex 같은 코드 에이전트는 사용자 요청 문구를 보고 `.codex/sk
 | `신호 확인`, `자동매매`, `주문 넣어줘` | `kis-order-executor` | BUY/SELL/HOLD 신호 확인 후 모의 주문 또는 실전 승인 절차 |
 | `예약주문`, `미국장 예약` | `kis-reservation-order` | `/api/orders/reservations` 계열 API로 예약 접수/조회/취소 |
 | `손절 설정`, `익절 설정`, `보호주문` | `kis-protective-order` | 보유종목 기준 앱 레벨 손익절 감시 설정과 점검 |
-| `한국장 3번 실행`, `매일 AI 트레이딩` | `kr-market-auto-run` | 한국장 후보 선정, 뉴스/LLM 판단, 주문, 보호주문, 리포트 |
-| `미국장 3번 실행`, `미국 모의 자동매매` | `us-market-auto-run` | 미국장 후보 선정, 신호 분리, 주문/예약, 보호주문 catch-up |
+| `한국장 시간당 실행`, `매일 AI 트레이딩` | `kr-market-auto-run` | 한국장 후보 선정, 뉴스/LLM 판단, 주문, 보호주문, 시간별 리포트 |
+| `미국장 시간당 실행`, `미국 모의 자동매매` | `us-market-auto-run` | 미국장 후보 선정, 신호 분리, 주문/예약, 보호주문 catch-up, 시간별 리포트 |
 | `잔고 확인`, `보유종목` | `my-status` | 계좌, 보유종목, 지수 상태 조회 |
 | `auth vps`, `auth prod` | `auth` | 모의/실전 인증 및 토큰 갱신 |
 
@@ -163,7 +163,8 @@ Codex 같은 코드 에이전트는 사용자 요청 문구를 보고 `.codex/sk
 - `8081`은 `builder-backend-vps`, `8083`은 `builder-backend-prod`입니다. `127.0.0.1:8000`은 컨테이너 내부 또는 개발용 포트일 수 있어 운영 상태 판단에 사용하지 않습니다.
 - `KIS_LOCK_MODE`로 `8081`은 실전 로그인, `8083`은 모의 로그인을 거부해야 합니다.
 - 보호주문은 KIS 서버 OCO가 아니라 Strategy Builder 앱 레벨 감시입니다. 백엔드, 인증, 네트워크가 중단되면 자동 감시도 중단될 수 있습니다.
-- 미국 모의투자 예약조회는 KIS 응답상 `OPSQ0002` 또는 `EGW00201`이 나올 수 있으므로, 자동화는 보유종목, 미체결, 보호주문 상태를 함께 보고 판단합니다.
+- 모의투자 예약주문과 보호주문 보완 경로는 앱 레벨 예약/감시 상태를 함께 봐야 합니다. KIS 브로커 예약조회는 `OPSQ0002`, `EGW00201`, `90000000`, `40490000` 같은 제한 응답을 줄 수 있습니다.
+- 자동화의 남은 매수 예산은 주문가능금액 전체가 아니라 일일 매수 한도, 손실 한도, 종목/섹터 노출 제한, 실제 주문가능금액을 모두 반영한 내부 리스크 예산입니다.
 
 #### KIS Quant Desk 운영 포트
 
@@ -216,8 +217,9 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 | 항목 | 상세 |
 |------|------|
 | 생성 조건 | BUY 주문이 성공하고 전략의 `takeProfit` 또는 `stopLoss`가 활성화되어 있으면 보호주문 그룹을 생성합니다. |
-| 익절 | 익절 비율이 있으면 목표가를 계산하고 지정가 매도 주문을 시도합니다. 한국 주식은 호가 단위에 맞춰 올림, 미국 주식은 소수점 2자리로 반올림합니다. |
-| 손절 | 백그라운드 모니터가 현재가를 주기적으로 확인합니다. 손절가 이하로 내려가면 기존 익절 주문을 취소한 뒤 청산 주문을 제출합니다. 한국은 시장가 매도, 미국은 현재가 기준 지정가 매도로 처리합니다. |
+| 익절 | 익절 비율이 있으면 목표가를 계산하고 매도 주문을 준비합니다. 한국 주식은 호가 단위에 맞춰 올림, 미국 주식은 소수점 2자리로 반올림합니다. |
+| 손절 | 백그라운드 모니터가 현재가를 주기적으로 확인합니다. 손절가 이하로 내려가면 기존 익절 주문을 취소한 뒤 청산 주문을 제출합니다. 한국은 `market` 또는 `limit`, 미국은 `limit`으로 처리합니다. |
+| 지정가 하향/재가격 | 한국/미국 지정가 보호매도는 조건 도달 후 현재가보다 낮은 지정가를 계산해 체결 가능성을 높입니다. 기본값은 손절 `2%`, 익절 `0.3%`, 미체결 재가격 `60초`, 재시도 추가 하향 `0.75%`, 최대 하향 `5%`입니다. 시장가 보호매도에는 지정가 하향 설정이 적용되지 않습니다. |
 | 상태 저장 | 보호주문 상태는 `strategy_builder/.runtime/protective_orders.json`에 저장됩니다. 런타임 상태 파일은 `.gitignore`에 포함되어 커밋되지 않습니다. |
 | 조회/수동 점검 | `GET /api/orders/protective`로 보호주문 목록을 조회하고, `POST /api/orders/protective/check`로 감시 루프를 즉시 1회 실행할 수 있습니다. |
 | 한계 | KIS Open API 자체 OCO 주문이 아니라 애플리케이션 감시 기반입니다. 서버가 중단되면 손절/익절 자동 감시도 중단되므로 운영 환경에서는 프로세스 재시작 정책과 로그 감시가 필요합니다. |
@@ -229,12 +231,13 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 | 항목 | 상세 |
 |------|------|
 | 시장 탭 | `한국` / `미국` 탭을 제공합니다. 한국 탭은 `/api/account/holdings`, 미국 탭은 `/api/overseas/holdings`를 사용합니다. |
+| 상단 요약 | 보유종목 수, 감시 중 수, 평가/주문가능금액, 실시간 연결 상태를 표시합니다. `투입 대비 평가`는 보유종목별 `평균단가 * 수량` 합계와 `평가금액` 합계를 비교해 증가액과 수익률을 계산합니다. 예수금이나 주문가능금액은 이 수익률 계산에 섞지 않습니다. |
 | 감시 사용 | 종목별 감시 규칙을 활성화합니다. 저장하면 `strategy_builder/.runtime/protective_orders.json`에 상태가 기록되고 백엔드 보호주문 서비스가 해당 종목을 감시합니다. |
-| 손절/수익보존 매도 | 카드 좌측 블록입니다. 현재가가 도달가 이하가 되면 설정한 주문 방식으로 매도합니다. 기본값은 시장가입니다. |
+| 손절/수익보존 매도 | 카드 좌측 블록입니다. 현재가가 도달가 이하가 되면 설정한 주문 방식으로 매도합니다. 한국 기본값은 시장가, 미국은 지정가입니다. |
 | 익절 매도 | 카드 우측 블록입니다. 현재가가 도달가 이상이 되면 설정한 주문 방식으로 매도합니다. 기본값은 지정가입니다. |
-| 주문 방식 | `시장가` 또는 `지정가`를 선택합니다. 지정가 선택 시 별도 지정가를 입력합니다. |
+| 주문 방식 | 한국은 `시장가` 또는 `지정가`를 선택합니다. 미국은 보호매도가 지정가로 강제됩니다. 지정가 선택 시 별도 지정가를 입력합니다. |
 | 감시 수량 | 실제 보유 수량 이하로 입력해야 합니다. 저장 시 서버에서 수량과 기준 단가를 검증합니다. |
-| 감시 주기 | REST fallback 주기를 초 단위로 설정합니다. 기본값은 15초이며 저장 가능 범위는 5~300초입니다. |
+| 감시/재가격 설정 | REST fallback 주기, 손절 지정가 하향, 익절 지정가 하향, 미체결 재가격, 재시도 추가 하향, 최대 하향 폭을 조정합니다. 한국장 탭에서 저장하면 국내 설정만, 미국장 탭에서 저장하면 미국 설정만 바뀝니다. |
 | 실시간 시세 | KIS WebSocket 실시간 체결가를 구독합니다. 국내는 `H0STCNT0`, 해외는 `HDFSCNT0` 흐름을 사용합니다. |
 | REST fallback | WebSocket 틱이 최근 30초 안에 들어오면 REST 현재가 조회를 건너뜁니다. 장외, 권한 문제, 연결 오류 등으로 틱이 없으면 설정한 감시 주기마다 REST 조회로 조건을 점검합니다. |
 
@@ -246,6 +249,7 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 - 현재 보유수량을 확인합니다.
 - 조건 도달 여부를 평가합니다.
 - 조건이 충족되면 설정된 매도 주문을 제출합니다.
+- 이미 매도가 제출된 `exit_submitted` 보호주문은 보유수량과 미체결 상태를 다시 맞춰 보고, 재가격 주기가 지났으면 지정가 주문을 취소 후 재제출합니다.
 - 점검 결과와 마지막 점검 시각은 보호주문 상태에 반영됩니다.
 - WebSocket이 정상 동작 중이어도 수동 확인이 필요할 때 사용할 수 있습니다.
 
@@ -254,6 +258,7 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 - 이 기능은 KIS Open API의 서버 측 OCO 주문이 아니라 앱 레벨 감시입니다.
 - 브라우저를 닫아도 백엔드 컨테이너가 살아 있으면 감시는 계속됩니다.
 - 백엔드 컨테이너가 중지되면 자동 감시도 중지됩니다.
+- 지정가 하향/재가격 설정은 보호매도 주문 방식이 `limit`일 때만 의미가 있습니다. 한국장 `market` 보호매도는 시장가 주문이므로 지정가 하향 가격을 계산하지 않습니다.
 - 실전 주문 전에는 반드시 모의투자로 동작을 검증하세요.
 - 해외주식 `HDFSCNT0`는 공식 샘플상 “실시간지연체결가” API이며, 미국은 무료 0분 지연으로 설명되어 있지만 시세 권한과 장 구분에 따라 체감 지연이 달라질 수 있습니다.
 
@@ -271,20 +276,24 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 | 휴장일 처리 | `.codex/scripts/kr_market_calendar.py`로 KRX 거래일을 확인하고, 휴장/주말이면 주문 없이 `market_closed` 리포트만 생성 |
 | LLM 판단 | 기본 `KR_MARKET_LLM_MODE=off`. `shadow`일 때 CLIProxyAPI/OpenAI 호환 LLM 판단을 리포트에만 기록하며 주문 승인 게이트로 쓰지 않음. 기존 `live-vps`/`live-prod` 값은 하위호환 별칭으로 받아 `shadow`처럼 처리 |
 | 보호주문 한계 | KIS 서버 OCO가 아니라 앱 레벨 감시입니다. 백엔드, 인증, 네트워크가 중단되면 자동 감시도 중단될 수 있습니다. |
+| 세션 리포트 | 실행별 JSON/Markdown과 일별 `_summary.json`/`_summary.md`를 `.codex/runtime/kr_market_auto/`에 저장합니다. `/automation` 화면은 이 파일을 읽는 read-only 대시보드입니다. |
 
 **국내 모의투자(vps) 일일 실행**
 
 ```bash
-# 한국장 09:10 / 12:30 / 15:10 KST 크론 설치
+# 한국장 정규장 중 09:10~15:10 KST 매시간 크론 설치
 .codex/scripts/install_kr_market_auto_daily_cron.sh
 
-# 특정 슬롯 수동 실행
-.codex/scripts/run_kr_market_auto_once.sh open 20260602
-.codex/scripts/run_kr_market_auto_once.sh mid 20260602
-.codex/scripts/run_kr_market_auto_once.sh close 20260602
+# 현재 시각이 실행 대상인지 KRX 캘린더로 판정해 실행
+.codex/scripts/run_kr_market_auto_daily.sh hourly
+
+# 특정 세션/실행 ID 수동 실행
+.codex/scripts/run_kr_market_auto_once.sh hourly 20260602 20260602 20260602_0910_KST
 ```
 
 모의투자 실행은 `8081`의 `builder-backend-vps`를 사용합니다. 래퍼는 `KIS_LOCK_MODE=vps`, `KIS_DEFAULT_MODE=vps`를 설정하고, 기본 API 엔드포인트를 `http://127.0.0.1:8081`로 고정해 실전 주문을 호출하지 않습니다. 실행 결과는 `.codex/runtime/kr_market_auto/`에 JSON/Markdown 리포트로 저장됩니다. 엔드포인트를 바꿔야 하면 `KIS_VPS_STRATEGY_API`를 사용합니다.
+
+Telegram 알림은 `.codex/local/kr_market_auto.env`의 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID`, `KR_MARKET_REPORT_URL`을 사용합니다. `KR_MARKET_REPORT_URL`이 없으면 `US_MARKET_REPORT_URL`을 fallback으로 사용합니다. 링크는 운영 접근용 Tailnet 주소처럼 외부에서 열 수 있는 `http://ww.tailea9a3f.ts.net:8081/automation` 형태로 두는 것이 좋습니다.
 
 **미국 모의투자(vps) 일일 실행**
 
@@ -301,7 +310,21 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 
 미국장 모의 자동화도 `8081`의 `builder-backend-vps`만 사용합니다. `exchange_calendars`의 `XNYS` 일정으로 정규장 09:45부터 폐장 15분 전까지 매시간 실행하며, 조기폐장은 실행 횟수를 자동 축소합니다. 기본 `US_MARKET_CANDIDATE_MODE=dynamic`으로 거래대금, 시가총액, 매수체결강도, 거래량 급증 랭킹에서 NASDAQ/NYSE/AMEX 유동성 후보를 선별하며, `SPY`, `QQQ`, `DIA`, `IWM`은 core ETF로 유지합니다. 랭킹 API 실패 또는 후보 부족 시 기존 고정 후보군으로 fallback합니다.
 
-실행별 JSON/Markdown과 세션 누적 요약은 `.codex/runtime/us_market_auto/`에 저장됩니다. 8081의 `/automation` 화면과 `/api/automation/us/*` API에서 타임라인, 주문 결과, 오류와 다운로드를 확인할 수 있으며, 해당 API는 8083에서 제공하지 않습니다. 텔레그램 설정은 로컬 전용 `.codex/local/us_market_auto.env`의 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID`, `US_MARKET_REPORT_URL`을 사용합니다.
+실행별 JSON/Markdown과 세션 누적 요약은 `.codex/runtime/us_market_auto/`에 저장됩니다. 8081의 `/automation` 화면과 `/api/automation/us/*` API에서 타임라인, 주문 결과, 오류와 다운로드를 확인할 수 있으며, 해당 API는 8083에서 제공하지 않습니다. 텔레그램 설정은 로컬 전용 `.codex/local/us_market_auto.env`의 `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_CHAT_ID`, `US_MARKET_REPORT_URL`을 사용합니다. 기본 리포트 URL은 `http://ww.tailea9a3f.ts.net:8081`이며, 시간 표기는 Telegram과 Markdown 요약에서 `UTC+09:00` 기준으로 맞춥니다.
+
+미국 자동화 리포트의 `남은 자동매수 한도`는 해외주식 주문가능금액 전체가 아니라 자동화가 그 세션에서 추가로 쓸 수 있는 내부 리스크 예산입니다. `주문가능금액`은 `/api/overseas/balance`가 기본 참조 심볼의 매수가능 조회를 통해 보정한 값이며, `/review`와 `/automation`에서 별도로 표시됩니다.
+
+#### 자동화 리포트 화면
+
+`http://<host>:8081/automation`은 모의투자 자동화 결과를 읽기 전용으로 보여주는 운영 화면입니다. `KIS_LOCK_MODE=vps` 환경에서만 API가 열리며, 8083 실전 포트에는 자동화 리포트 API가 노출되지 않습니다.
+
+| 항목 | 상세 |
+|------|------|
+| 시장 탭 | `미국장 자동매매`와 `한국장 자동매매` 탭을 제공합니다. |
+| 세션 요약 | 실행 횟수, 누적 매수, 리포트 기준 주문가능금액, 남은 자동매수 한도, 남은 손실 한도, 오류 건수를 표시합니다. |
+| 시간별 타임라인 | 각 실행의 BUY/SELL/HOLD, 제출/체결/실패, 매수금액, 미체결/보호주문 수를 표시합니다. |
+| 상세 리포트 | 실행별 주문 결과, 오류, 원본 Markdown/JSON 다운로드 링크를 제공합니다. |
+| 유지보수 포인트 | 화면의 오류 건수는 자동화 판단 실패, 주문 실패, 예약/보호주문 health 오류를 합산합니다. 원인 분석은 해당 run의 JSON/Markdown을 먼저 보고, 필요하면 백엔드 로그와 보호주문 상태를 확인합니다. |
 
 **국내 실전투자(prod) 일일 실행**
 
@@ -374,9 +397,12 @@ docker logs -f kis-stack-builder-frontend-1
 |------|------|
 | `http://<host>:8081/builder` | 모의투자 전략 빌더. 지표/조건/리스크를 조합하고 `.kis.yaml`로 내보냅니다. |
 | `http://<host>:8081/execute` | 모의투자 전략 실행. 한국/미국 종목에 대해 시그널을 생성하고 주문을 실행합니다. |
+| `http://<host>:8081/automation` | 모의투자 한국/미국 자동매매 세션과 시간별 리포트를 확인합니다. |
+| `http://<host>:8081/reservations` | 모의 앱 레벨 예약주문과 예약/보호매도 상태를 확인합니다. |
 | `http://<host>:8081/review` | 모의투자 보유 종목의 손절/익절 감시 조건과 실시간 시세 상태를 관리합니다. |
 | `http://<host>:8083/builder` | 실전투자 전략 빌더. 실전 테스트 전용 포트입니다. |
 | `http://<host>:8083/execute` | 실전투자 전략 실행. 실제 주문은 서버 확인값과 에이전트/사용자 승인이 있어야 제출됩니다. |
+| `http://<host>:8083/reservations` | 실전 브로커 예약주문을 조회/관리합니다. 실전 예약 변경 전 사용자 확인이 필요합니다. |
 | `http://<host>:8083/review` | 실전투자 보유 종목 보호주문 감시 설정 화면입니다. |
 | `http://<host>:8082` | 백테스터 UI입니다. |
 
@@ -386,6 +412,37 @@ docker logs -f kis-stack-builder-frontend-1
 - `8081` UI 우측 상단 설정에서는 `vps`(모의), `8083` UI 우측 상단 설정에서는 `prod`(실전) 인증을 완료해야 합니다.
 - Caddy Basic Auth를 사용하는 배포에서는 브라우저 접속 시 Basic Auth와 앱 내부 KIS 인증이 모두 필요합니다.
 - `runtime-vps`와 `runtime-prod`의 보호주문 상태 파일은 서로 분리됩니다. 백업/초기화 정책을 운영 환경에 맞춰 정하세요.
+
+빠른 운영 점검:
+
+```bash
+# 모의/실전 인증 및 잠금 모드 확인
+curl -s http://127.0.0.1:8081/api/auth/status
+curl -s http://127.0.0.1:8083/api/auth/status
+
+# 모의 보호주문과 자동화 리포트 확인
+curl -s http://127.0.0.1:8081/api/orders/protective
+curl -s http://127.0.0.1:8081/api/automation/us/sessions
+curl -s http://127.0.0.1:8081/api/automation/kr/sessions
+
+# 컨테이너 상태
+docker compose --env-file .env.production -f compose.yml ps
+```
+
+주문/인증/보호주문/자동화 코드를 수정한 뒤에는 최소한 아래 게이트를 통과시킵니다.
+
+```bash
+(cd strategy_builder/frontend && npm run build)
+env UV_CACHE_DIR=/tmp/uv-cache uv run --project strategy_builder python -m unittest \
+  tests.test_automation_reports_api \
+  tests.test_kr_market_auto_run \
+  tests.test_kr_market_calendar \
+  tests.test_overseas_balance_api \
+  tests.test_overseas_data_fetcher \
+  tests.test_protective_local_reservation \
+  tests.test_us_market_auto_run
+python3 scripts/trading_safety_gate.py
+```
 
 #### 포함된 예시 전략
 
