@@ -121,14 +121,15 @@ async def get_overseas_balance():
             "status": "error",
             "message": "해외 예수금 정보를 가져올 수 없습니다",
         }
-    if (
-        float(data.get("total_eval") or 0) <= 0
-        and float(data.get("deposit") or 0) <= 0
-        and float(data.get("available_amount") or 0) <= 0
-    ):
-        data.update(await asyncio.to_thread(_get_cached_default_orderable, env_dv))
+    available_amount = float(data.get("available_amount") or 0)
+    if available_amount <= 0:
+        orderable = await asyncio.to_thread(_get_cached_default_orderable, env_dv)
+        if float(orderable.get("orderable_amount") or 0) > 0:
+            data.update(orderable)
+        else:
+            data["orderable_amount"] = available_amount
     else:
-        data["orderable_amount"] = data.get("available_amount", 0)
+        data["orderable_amount"] = available_amount
     return {
         "status": "success",
         "data": {

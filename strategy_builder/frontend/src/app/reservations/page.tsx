@@ -183,7 +183,7 @@ export default function ReservationsPage() {
         start_date: startDate,
         end_date: listEndDate,
         exchange,
-        include_cancelled: true,
+        include_cancelled: false,
         reservation_source: reservationSource,
       });
       if (response.status === "success") {

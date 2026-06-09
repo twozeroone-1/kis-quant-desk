@@ -56,6 +56,10 @@ US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT = 2.0
 US_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT = 0.3
 US_EXIT_REPRICE_STEP_PCT = 0.75
 US_EXIT_MAX_OFFSET_PCT = 5.0
+DOMESTIC_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT = 2.0
+DOMESTIC_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT = 0.3
+DOMESTIC_EXIT_REPRICE_STEP_PCT = 0.75
+DOMESTIC_EXIT_MAX_OFFSET_PCT = 5.0
 MIN_US_EXIT_LIMIT_BUFFER_PCT = 0.0
 MAX_US_EXIT_LIMIT_BUFFER_PCT = 10.0
 PROTECTIVE_KIS_CALL_INTERVAL_SECONDS = float(
@@ -240,6 +244,10 @@ def _default_settings() -> dict[str, Any]:
         "exit_reprice_interval_seconds": EXIT_PENDING_REPRICE_SECONDS,
         "us_exit_reprice_step_pct": US_EXIT_REPRICE_STEP_PCT,
         "us_exit_max_offset_pct": US_EXIT_MAX_OFFSET_PCT,
+        "domestic_stop_loss_limit_offset_pct": DOMESTIC_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT,
+        "domestic_take_profit_limit_offset_pct": DOMESTIC_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT,
+        "domestic_exit_reprice_step_pct": DOMESTIC_EXIT_REPRICE_STEP_PCT,
+        "domestic_exit_max_offset_pct": DOMESTIC_EXIT_MAX_OFFSET_PCT,
     }
 
 
@@ -345,6 +353,22 @@ def _load_state_sync() -> dict[str, Any]:
                 "us_exit_max_offset_pct": _normalize_us_exit_offset(
                     settings.get("us_exit_max_offset_pct"),
                     US_EXIT_MAX_OFFSET_PCT,
+                ),
+                "domestic_stop_loss_limit_offset_pct": _normalize_us_exit_offset(
+                    settings.get("domestic_stop_loss_limit_offset_pct"),
+                    DOMESTIC_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT,
+                ),
+                "domestic_take_profit_limit_offset_pct": _normalize_us_exit_offset(
+                    settings.get("domestic_take_profit_limit_offset_pct"),
+                    DOMESTIC_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT,
+                ),
+                "domestic_exit_reprice_step_pct": _normalize_us_exit_offset(
+                    settings.get("domestic_exit_reprice_step_pct"),
+                    DOMESTIC_EXIT_REPRICE_STEP_PCT,
+                ),
+                "domestic_exit_max_offset_pct": _normalize_us_exit_offset(
+                    settings.get("domestic_exit_max_offset_pct"),
+                    DOMESTIC_EXIT_MAX_OFFSET_PCT,
                 ),
             }
             data["health"] = data.get("health") if isinstance(data.get("health"), dict) else {}
@@ -898,6 +922,55 @@ def _us_triggered_exit_order_price(
     )
 
 
+def _triggered_exit_order_price(
+    market: str,
+    configured_price: Optional[float],
+    current_price: float,
+    exit_reason: str,
+    settings: Optional[dict[str, Any]] = None,
+    reprice_count: int = 0,
+) -> float:
+    market = "us" if market == "us" else "domestic"
+    if market == "us":
+        return _us_triggered_exit_order_price(
+            configured_price,
+            current_price,
+            exit_reason,
+            settings,
+            reprice_count,
+        )
+    settings = settings or _settings_sync()
+    setting_key = (
+        "domestic_stop_loss_limit_offset_pct"
+        if exit_reason == "stop_loss"
+        else "domestic_take_profit_limit_offset_pct"
+    )
+    default = (
+        DOMESTIC_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT
+        if exit_reason == "stop_loss"
+        else DOMESTIC_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT
+    )
+    base_offset = _normalize_us_exit_offset(settings.get(setting_key), default)
+    step_offset = _normalize_us_exit_offset(
+        settings.get("domestic_exit_reprice_step_pct"),
+        DOMESTIC_EXIT_REPRICE_STEP_PCT,
+    )
+    max_offset = _normalize_us_exit_offset(
+        settings.get("domestic_exit_max_offset_pct"),
+        DOMESTIC_EXIT_MAX_OFFSET_PCT,
+    )
+    adaptive_offset = min(
+        max(max_offset, base_offset),
+        base_offset + max(0, int(reprice_count or 0)) * step_offset,
+    )
+    if current_price <= 0:
+        return _round_price("domestic", float(configured_price or 0), "down")
+    marketable_price = current_price * (1 - adaptive_offset / 100)
+    if configured_price and configured_price > 0:
+        marketable_price = min(float(configured_price), marketable_price)
+    return _round_price("domestic", marketable_price, "down")
+
+
 def _reconcile_exit_submitted_sync(
     order: dict[str, Any],
     env_dv: str,
@@ -929,6 +1002,12 @@ def _reconcile_exit_submitted_sync(
     exit_order_no = str(order.get("exit_order_no") or "")
     pending_exit = pending.get(exit_order_no)
     exit_reason = str(order.get("exit_reason") or "stop_loss")
+    exit_order_type = str(
+        order.get(f"{exit_reason}_order_type")
+        or order.get("exit_order_type")
+        or "limit"
+    )
+    reprices_limit_exit = exit_order_type == "limit" and market in {"domestic", "us"}
     if not _is_order_market_open(order):
         order["last_error"] = "exit submitted; waiting for regular market session before repricing"
         return order
@@ -946,14 +1025,14 @@ def _reconcile_exit_submitted_sync(
     )
     submitted_at = _order_timestamp(order, "exit_submitted_at", "closed_at")
     if (
-        is_us_paper
+        (is_us_paper or reprices_limit_exit)
         and submitted_at
         and datetime.now() - submitted_at < timedelta(seconds=reprice_seconds)
     ):
         order["last_error"] = "exit submitted; waiting for fill reconciliation before repricing"
         return order
 
-    if pending_exit and (exit_reason == "stop_loss" or is_us_paper):
+    if pending_exit and (exit_reason == "stop_loss" or is_us_paper or reprices_limit_exit):
         if submitted_at and datetime.now() - submitted_at < timedelta(seconds=reprice_seconds):
             order["last_error"] = "exit order pending; waiting before repricing"
             return order
@@ -995,7 +1074,7 @@ def _reconcile_exit_submitted_sync(
             return order
         order["exit_reprice_count"] = int(order.get("exit_reprice_count") or 0) + 1
 
-    if (exit_reason == "stop_loss" or is_us_paper) and current_price > 0:
+    if (exit_reason == "stop_loss" or is_us_paper or reprices_limit_exit) and current_price > 0:
         if not pending_exit:
             order["exit_reprice_count"] = int(order.get("exit_reprice_count") or 0) + 1
         order["status"] = "active"
@@ -1012,11 +1091,7 @@ def _reconcile_exit_submitted_sync(
             env_dv,
             reason=f"보호주문 {exit_reason} 재시도: 현재가 {current_price}, 기존 청산 주문 후에도 보유 잔량 확인",
             exit_reason=exit_reason,
-            order_type=str(
-                order.get(f"{exit_reason}_order_type")
-                or order.get("exit_order_type")
-                or "limit"
-            ),
+            order_type=exit_order_type,
             price=float(
                 order.get(f"{exit_reason}_limit_price")
                 or order.get(f"{exit_reason}_price")
@@ -1319,8 +1394,9 @@ def _submit_triggered_exit(
     if market == "us" and order_type == "market":
         order_type = "limit"
         price = current_price
-    if market == "us" and order_type == "limit":
-        price = _us_triggered_exit_order_price(
+    if order_type == "limit" and market in {"domestic", "us"}:
+        price = _triggered_exit_order_price(
+            market,
             float(price or 0),
             current_price,
             exit_reason,
@@ -2167,7 +2243,7 @@ async def list_protective_orders() -> dict[str, Any]:
     return state
 
 
-async def list_protective_app_reservations() -> list[dict[str, Any]]:
+async def list_protective_app_reservations(*, include_closed: bool = True) -> list[dict[str, Any]]:
     state = await _load_state()
     rows = []
     for order in state.get("orders", []):
@@ -2179,6 +2255,8 @@ async def list_protective_app_reservations() -> list[dict[str, Any]]:
         reservation_status = str(reservation.get("status") or "")
         if order.get("status") == "closed" and reservation_status != "filled":
             reservation_status = "closed"
+        if not include_closed and reservation_status in {"closed", "filled"}:
+            continue
         created_at = reservation.get("reserved_at") or order.get("created_at") or _now()
         action = "SELL"
         rows.append({
@@ -2223,6 +2301,10 @@ async def update_monitor_settings(
     exit_reprice_interval_seconds: int | None = None,
     us_exit_reprice_step_pct: float | None = None,
     us_exit_max_offset_pct: float | None = None,
+    domestic_stop_loss_limit_offset_pct: float | None = None,
+    domestic_take_profit_limit_offset_pct: float | None = None,
+    domestic_exit_reprice_step_pct: float | None = None,
+    domestic_exit_max_offset_pct: float | None = None,
 ) -> dict[str, Any]:
     state = await _load_state()
     settings = state.get("settings") if isinstance(state.get("settings"), dict) else {}
@@ -2251,6 +2333,26 @@ async def update_monitor_settings(
             us_exit_max_offset_pct,
             US_EXIT_MAX_OFFSET_PCT,
         )
+    if domestic_stop_loss_limit_offset_pct is not None:
+        settings["domestic_stop_loss_limit_offset_pct"] = _normalize_us_exit_offset(
+            domestic_stop_loss_limit_offset_pct,
+            DOMESTIC_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT,
+        )
+    if domestic_take_profit_limit_offset_pct is not None:
+        settings["domestic_take_profit_limit_offset_pct"] = _normalize_us_exit_offset(
+            domestic_take_profit_limit_offset_pct,
+            DOMESTIC_TAKE_PROFIT_MARKETABLE_LIMIT_BUFFER_PCT,
+        )
+    if domestic_exit_reprice_step_pct is not None:
+        settings["domestic_exit_reprice_step_pct"] = _normalize_us_exit_offset(
+            domestic_exit_reprice_step_pct,
+            DOMESTIC_EXIT_REPRICE_STEP_PCT,
+        )
+    if domestic_exit_max_offset_pct is not None:
+        settings["domestic_exit_max_offset_pct"] = _normalize_us_exit_offset(
+            domestic_exit_max_offset_pct,
+            DOMESTIC_EXIT_MAX_OFFSET_PCT,
+        )
     if (
         float(settings.get("us_exit_max_offset_pct") or US_EXIT_MAX_OFFSET_PCT)
         < max(
@@ -2261,6 +2363,17 @@ async def update_monitor_settings(
         settings["us_exit_max_offset_pct"] = max(
             float(settings.get("us_stop_loss_limit_offset_pct") or 0),
             float(settings.get("us_take_profit_limit_offset_pct") or 0),
+        )
+    if (
+        float(settings.get("domestic_exit_max_offset_pct") or DOMESTIC_EXIT_MAX_OFFSET_PCT)
+        < max(
+            float(settings.get("domestic_stop_loss_limit_offset_pct") or 0),
+            float(settings.get("domestic_take_profit_limit_offset_pct") or 0),
+        )
+    ):
+        settings["domestic_exit_max_offset_pct"] = max(
+            float(settings.get("domestic_stop_loss_limit_offset_pct") or 0),
+            float(settings.get("domestic_take_profit_limit_offset_pct") or 0),
         )
     state["settings"] = settings
     await _save_state(state)

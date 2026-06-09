@@ -181,6 +181,10 @@ class ProtectiveSettingsRequest(BaseModel):
     exit_reprice_interval_seconds: int | None = None
     us_exit_reprice_step_pct: float | None = None
     us_exit_max_offset_pct: float | None = None
+    domestic_stop_loss_limit_offset_pct: float | None = None
+    domestic_take_profit_limit_offset_pct: float | None = None
+    domestic_exit_reprice_step_pct: float | None = None
+    domestic_exit_max_offset_pct: float | None = None
 
 
 class OrderRequest(BaseModel):
@@ -1046,7 +1050,9 @@ async def get_reservation_orders_api(
             include_cancelled=include_cancelled,
         )
         if normalized_market == "us":
-            protective_orders = await list_protective_app_reservations()
+            protective_orders = await list_protective_app_reservations(
+                include_closed=include_cancelled,
+            )
             protective_orders = [
                 order for order in protective_orders
                 if start <= str(order.get("reservation_order_date") or "") <= end
@@ -1349,6 +1355,10 @@ async def update_protective_settings_api(request: ProtectiveSettingsRequest):
         exit_reprice_interval_seconds=request.exit_reprice_interval_seconds,
         us_exit_reprice_step_pct=request.us_exit_reprice_step_pct,
         us_exit_max_offset_pct=request.us_exit_max_offset_pct,
+        domestic_stop_loss_limit_offset_pct=request.domestic_stop_loss_limit_offset_pct,
+        domestic_take_profit_limit_offset_pct=request.domestic_take_profit_limit_offset_pct,
+        domestic_exit_reprice_step_pct=request.domestic_exit_reprice_step_pct,
+        domestic_exit_max_offset_pct=request.domestic_exit_max_offset_pct,
     )
     return {
         "status": "success",

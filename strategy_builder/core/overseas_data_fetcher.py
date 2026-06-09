@@ -42,6 +42,17 @@ _BALANCE_CACHE_TTL = 10
 US_DAYTIME_START = (10, 0)
 US_DAYTIME_END = (18, 0)
 US_EXCHANGES = {"NASD", "NYSE", "AMEX"}
+RANKING_CURRENCY_BY_PRICE_EXCHANGE = {
+    "NAS": "USD",
+    "NYS": "USD",
+    "AMS": "USD",
+    "HKS": "HKD",
+    "SHS": "CNY",
+    "SZS": "CNY",
+    "TSE": "JPY",
+    "HSX": "VND",
+    "HNX": "VND",
+}
 
 
 @dataclass(frozen=True)
@@ -447,13 +458,24 @@ def get_overseas_market_cap_rank(
     *,
     exchange: str = "NAS",
     vol_rang: str = "2",
+    curr_gb: str | None = None,
     max_depth: int = 1,
 ) -> OverseasRankingResult:
+    price_exchange = _price_exchange(exchange) or exchange
+    currency = (
+        curr_gb
+        if curr_gb is not None
+        else RANKING_CURRENCY_BY_PRICE_EXCHANGE.get(price_exchange, "")
+    )
     return _fetch_overseas_ranking(
         api_url="/uapi/overseas-stock/v1/ranking/market-cap",
         tr_id="HHDFS76350100",
-        exchange=exchange,
-        params={"VOL_RANG": vol_rang, "AUTH": ""},
+        exchange=price_exchange,
+        params={
+            "VOL_RANG": vol_rang,
+            "CURR_GB": currency,
+            "AUTH": "",
+        },
         max_depth=max_depth,
     )
 

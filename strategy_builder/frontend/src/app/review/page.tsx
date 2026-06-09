@@ -51,6 +51,11 @@ const parseNumber = (value: string): number | null => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const finiteNumber = (value: unknown, fallback = 0) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
 const orderTypeLabel = (value?: string) => (value === "market" ? "시장가" : "지정가");
 const exitReasonLabel = (value?: string) => (value === "take_profit" ? "익절" : value === "stop_loss" ? "손절" : "매도");
 const protectionStatusLabel = (value?: string) => {
@@ -87,7 +92,7 @@ const holdingKey = (market: ReviewMarket, holding: Pick<Holding, "stock_code" | 
 const orderKey = (order: ProtectiveOrder) =>
   `${order.market || "domestic"}:${order.stock_code}:${order.exchange || ""}`;
 
-const detachedProtectionStatuses = new Set(["active", "disabled", "exit_submitted", "submit_failed"]);
+const detachedProtectionStatuses = new Set(["active", "exit_submitted", "submit_failed"]);
 
 function defaultDraft(holding: Holding, protection: ProtectiveOrder | undefined, market: ReviewMarket): ReviewDraft {
   const hasSavedProtection = Boolean(protection);
@@ -172,6 +177,25 @@ export default function ReviewPage() {
     [holdingKeys, market, protectiveOrders]
   );
 
+  const positionSummary = useMemo(() => {
+    const totals = holdings.reduce(
+      (acc, holding) => {
+        const quantity = finiteNumber(holding.quantity);
+        const principal = finiteNumber(holding.avg_price) * quantity;
+        const evaluation = finiteNumber(holding.eval_amount)
+          || finiteNumber(holding.current_price) * quantity;
+        return {
+          principal: acc.principal + principal,
+          evaluation: acc.evaluation + evaluation,
+        };
+      },
+      { principal: 0, evaluation: 0 }
+    );
+    const profit = totals.evaluation - totals.principal;
+    const profitRate = totals.principal > 0 ? (profit / totals.principal) * 100 : null;
+    return { ...totals, profit, profitRate };
+  }, [holdings]);
+
   const realtimeInterestKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const holding of holdings) {
@@ -202,25 +226,40 @@ export default function ReviewPage() {
       }
       setLivePrices((current) => ({ ...current, ...ticks }));
     }
-    if (response.settings?.monitor_interval_seconds) {
-      setMonitorInterval(String(response.settings.monitor_interval_seconds));
+    if (response.settings) {
+      const displayedStopLossOffset = market === "us"
+        ? response.settings.us_stop_loss_limit_offset_pct ?? response.settings.domestic_stop_loss_limit_offset_pct
+        : response.settings.domestic_stop_loss_limit_offset_pct ?? response.settings.us_stop_loss_limit_offset_pct;
+      const displayedTakeProfitOffset = market === "us"
+        ? response.settings.us_take_profit_limit_offset_pct ?? response.settings.domestic_take_profit_limit_offset_pct
+        : response.settings.domestic_take_profit_limit_offset_pct ?? response.settings.us_take_profit_limit_offset_pct;
+      const displayedRepriceStep = market === "us"
+        ? response.settings.us_exit_reprice_step_pct ?? response.settings.domestic_exit_reprice_step_pct
+        : response.settings.domestic_exit_reprice_step_pct ?? response.settings.us_exit_reprice_step_pct;
+      const displayedMaxExitOffset = market === "us"
+        ? response.settings.us_exit_max_offset_pct ?? response.settings.domestic_exit_max_offset_pct
+        : response.settings.domestic_exit_max_offset_pct ?? response.settings.us_exit_max_offset_pct;
+
+      if (response.settings.monitor_interval_seconds) {
+        setMonitorInterval(String(response.settings.monitor_interval_seconds));
+      }
+      if (displayedStopLossOffset !== undefined) {
+        setStopLossOffset(String(displayedStopLossOffset));
+      }
+      if (displayedTakeProfitOffset !== undefined) {
+        setTakeProfitOffset(String(displayedTakeProfitOffset));
+      }
+      if (response.settings.exit_reprice_interval_seconds) {
+        setRepriceInterval(String(response.settings.exit_reprice_interval_seconds));
+      }
+      if (displayedRepriceStep !== undefined) {
+        setRepriceStep(String(displayedRepriceStep));
+      }
+      if (displayedMaxExitOffset !== undefined) {
+        setMaxExitOffset(String(displayedMaxExitOffset));
+      }
     }
-    if (response.settings?.us_stop_loss_limit_offset_pct !== undefined) {
-      setStopLossOffset(String(response.settings.us_stop_loss_limit_offset_pct));
-    }
-    if (response.settings?.us_take_profit_limit_offset_pct !== undefined) {
-      setTakeProfitOffset(String(response.settings.us_take_profit_limit_offset_pct));
-    }
-    if (response.settings?.exit_reprice_interval_seconds) {
-      setRepriceInterval(String(response.settings.exit_reprice_interval_seconds));
-    }
-    if (response.settings?.us_exit_reprice_step_pct !== undefined) {
-      setRepriceStep(String(response.settings.us_exit_reprice_step_pct));
-    }
-    if (response.settings?.us_exit_max_offset_pct !== undefined) {
-      setMaxExitOffset(String(response.settings.us_exit_max_offset_pct));
-    }
-  }, [fetchBalance, fetchHoldings, resetThrottle]);
+  }, [fetchBalance, fetchHoldings, market, resetThrottle]);
 
   useEffect(() => {
     if (authStatus.authenticated) {
@@ -349,7 +388,7 @@ export default function ReviewPage() {
       || parsedMaxExitOffset < Math.max(parsedStopLossOffset, parsedTakeProfitOffset)
       || parsedMaxExitOffset > 10
     ) {
-      setMessage("미국 매도 오프셋은 0%에서 10% 사이이며, 최대 오프셋은 기본 오프셋보다 커야 합니다.");
+      setMessage("보호매도 지정가 하향 폭은 0%에서 10% 사이이며, 최대 하향 폭은 기본 하향 폭보다 커야 합니다.");
       return;
     }
     if (!parsedRepriceInterval || parsedRepriceInterval < 5 || parsedRepriceInterval > 300) {
@@ -362,18 +401,47 @@ export default function ReviewPage() {
     try {
       const response = await saveProtectiveSettings({
         monitor_interval_seconds: Math.round(interval),
-        us_stop_loss_limit_offset_pct: parsedStopLossOffset,
-        us_take_profit_limit_offset_pct: parsedTakeProfitOffset,
         exit_reprice_interval_seconds: Math.round(parsedRepriceInterval),
-        us_exit_reprice_step_pct: parsedRepriceStep,
-        us_exit_max_offset_pct: parsedMaxExitOffset,
+        ...(market === "us"
+          ? {
+              us_stop_loss_limit_offset_pct: parsedStopLossOffset,
+              us_take_profit_limit_offset_pct: parsedTakeProfitOffset,
+              us_exit_reprice_step_pct: parsedRepriceStep,
+              us_exit_max_offset_pct: parsedMaxExitOffset,
+            }
+          : {
+              domestic_stop_loss_limit_offset_pct: parsedStopLossOffset,
+              domestic_take_profit_limit_offset_pct: parsedTakeProfitOffset,
+              domestic_exit_reprice_step_pct: parsedRepriceStep,
+              domestic_exit_max_offset_pct: parsedMaxExitOffset,
+            }),
       });
       setMonitorInterval(String(response.settings.monitor_interval_seconds));
-      setStopLossOffset(String(response.settings.us_stop_loss_limit_offset_pct ?? parsedStopLossOffset));
-      setTakeProfitOffset(String(response.settings.us_take_profit_limit_offset_pct ?? parsedTakeProfitOffset));
+      setStopLossOffset(String(
+        (market === "us"
+          ? response.settings.us_stop_loss_limit_offset_pct ?? response.settings.domestic_stop_loss_limit_offset_pct
+          : response.settings.domestic_stop_loss_limit_offset_pct ?? response.settings.us_stop_loss_limit_offset_pct)
+        ?? parsedStopLossOffset
+      ));
+      setTakeProfitOffset(String(
+        (market === "us"
+          ? response.settings.us_take_profit_limit_offset_pct ?? response.settings.domestic_take_profit_limit_offset_pct
+          : response.settings.domestic_take_profit_limit_offset_pct ?? response.settings.us_take_profit_limit_offset_pct)
+        ?? parsedTakeProfitOffset
+      ));
       setRepriceInterval(String(response.settings.exit_reprice_interval_seconds ?? parsedRepriceInterval));
-      setRepriceStep(String(response.settings.us_exit_reprice_step_pct ?? parsedRepriceStep));
-      setMaxExitOffset(String(response.settings.us_exit_max_offset_pct ?? parsedMaxExitOffset));
+      setRepriceStep(String(
+        (market === "us"
+          ? response.settings.us_exit_reprice_step_pct ?? response.settings.domestic_exit_reprice_step_pct
+          : response.settings.domestic_exit_reprice_step_pct ?? response.settings.us_exit_reprice_step_pct)
+        ?? parsedRepriceStep
+      ));
+      setMaxExitOffset(String(
+        (market === "us"
+          ? response.settings.us_exit_max_offset_pct ?? response.settings.domestic_exit_max_offset_pct
+          : response.settings.domestic_exit_max_offset_pct ?? response.settings.us_exit_max_offset_pct)
+        ?? parsedMaxExitOffset
+      ));
       setMessage("보호주문 실행 설정을 저장했습니다.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "감시 주기 저장 실패");
@@ -455,7 +523,7 @@ export default function ReviewPage() {
 
   const currency = market === "us" ? "USD" : "KRW";
   const usTotalEval = Number(balance?.total_eval || 0);
-  const usOrderableAmount = Number(balance?.orderable_amount || balance?.available_amount || 0);
+  const usOrderableAmount = Number(balance?.orderable_amount ?? balance?.available_amount ?? 0);
   const displayTotalEval = market === "us" && usTotalEval <= 0 && usOrderableAmount > 0
     ? usOrderableAmount
     : balance?.total_eval;
@@ -464,7 +532,8 @@ export default function ReviewPage() {
     : market === "us"
       ? "미국 평가금액"
       : "총 평가금액";
-  const depositLabel = market === "us" ? "외화 예수금(API)" : "예수금";
+  const secondaryBalanceLabel = market === "us" ? "주문가능금액" : "예수금";
+  const secondaryBalanceAmount = market === "us" ? usOrderableAmount : balance?.deposit;
   const realtimeError = realtimeInterestKeys.size > 0 ? realtimeStatus?.last_error : null;
   const streamLabel =
     priceStreamState === "connected"
@@ -537,70 +606,66 @@ export default function ReviewPage() {
               <span className="text-sm text-slate-500">초</span>
             </div>
           </label>
-          {market === "us" && (
-            <>
-              <label className="block">
-                <span className="text-caption text-slate-500">손절 지정가 하향</span>
-                <div className="mt-1 flex items-center gap-2">
-                  <input
-                    value={stopLossOffset}
-                    onChange={(event) => setStopLossOffset(event.target.value)}
-                    inputMode="decimal"
-                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
-                  />
-                  <span className="text-sm text-slate-500">%</span>
-                </div>
-              </label>
-              <label className="block">
-                <span className="text-caption text-slate-500">익절 지정가 하향</span>
-                <div className="mt-1 flex items-center gap-2">
-                  <input
-                    value={takeProfitOffset}
-                    onChange={(event) => setTakeProfitOffset(event.target.value)}
-                    inputMode="decimal"
-                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
-                  />
-                  <span className="text-sm text-slate-500">%</span>
-                </div>
-              </label>
-              <label className="block">
-                <span className="text-caption text-slate-500">미체결 재가격</span>
-                <div className="mt-1 flex items-center gap-2">
-                  <input
-                    value={repriceInterval}
-                    onChange={(event) => setRepriceInterval(event.target.value)}
-                    inputMode="numeric"
-                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
-                  />
-                  <span className="text-sm text-slate-500">초</span>
-                </div>
-              </label>
-              <label className="block">
-                <span className="text-caption text-slate-500">재시도 추가 하향</span>
-                <div className="mt-1 flex items-center gap-2">
-                  <input
-                    value={repriceStep}
-                    onChange={(event) => setRepriceStep(event.target.value)}
-                    inputMode="decimal"
-                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
-                  />
-                  <span className="text-sm text-slate-500">%</span>
-                </div>
-              </label>
-              <label className="block">
-                <span className="text-caption text-slate-500">최대 하향 폭</span>
-                <div className="mt-1 flex items-center gap-2">
-                  <input
-                    value={maxExitOffset}
-                    onChange={(event) => setMaxExitOffset(event.target.value)}
-                    inputMode="decimal"
-                    className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
-                  />
-                  <span className="text-sm text-slate-500">%</span>
-                </div>
-              </label>
-            </>
-          )}
+          <label className="block">
+            <span className="text-caption text-slate-500">손절 지정가 하향</span>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                value={stopLossOffset}
+                onChange={(event) => setStopLossOffset(event.target.value)}
+                inputMode="decimal"
+                className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+              />
+              <span className="text-sm text-slate-500">%</span>
+            </div>
+          </label>
+          <label className="block">
+            <span className="text-caption text-slate-500">익절 지정가 하향</span>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                value={takeProfitOffset}
+                onChange={(event) => setTakeProfitOffset(event.target.value)}
+                inputMode="decimal"
+                className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+              />
+              <span className="text-sm text-slate-500">%</span>
+            </div>
+          </label>
+          <label className="block">
+            <span className="text-caption text-slate-500">미체결 재가격</span>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                value={repriceInterval}
+                onChange={(event) => setRepriceInterval(event.target.value)}
+                inputMode="numeric"
+                className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+              />
+              <span className="text-sm text-slate-500">초</span>
+            </div>
+          </label>
+          <label className="block">
+            <span className="text-caption text-slate-500">재시도 추가 하향</span>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                value={repriceStep}
+                onChange={(event) => setRepriceStep(event.target.value)}
+                inputMode="decimal"
+                className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+              />
+              <span className="text-sm text-slate-500">%</span>
+            </div>
+          </label>
+          <label className="block">
+            <span className="text-caption text-slate-500">최대 하향 폭</span>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                value={maxExitOffset}
+                onChange={(event) => setMaxExitOffset(event.target.value)}
+                inputMode="decimal"
+                className="w-24 px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900"
+              />
+              <span className="text-sm text-slate-500">%</span>
+            </div>
+          </label>
           <button
             onClick={saveSettings}
             disabled={!authStatus.authenticated || savingSettings}
@@ -639,7 +704,7 @@ export default function ReviewPage() {
         </div>
       )}
 
-      <section className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+      <section className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4 mb-6">
         <div className="card p-4">
           <span className="text-caption text-slate-500">보유 종목</span>
           <strong className="block text-2xl mt-1">{holdings.length}개</strong>
@@ -651,10 +716,24 @@ export default function ReviewPage() {
         <div className="card p-4">
           <span className="text-caption text-slate-500">{totalEvalLabel}</span>
           <strong className="block text-2xl mt-1">{formatMoney(displayTotalEval, currency)}</strong>
-          <span className="block mt-1 text-xs text-slate-500">{depositLabel} {formatMoney(balance?.deposit, currency)}</span>
+          <span className="block mt-1 text-xs text-slate-500">
+            {secondaryBalanceLabel} {formatMoney(secondaryBalanceAmount, currency)}
+          </span>
           {market === "us" && usTotalEval <= 0 && usOrderableAmount > 0 && (
             <span className="block mt-1 text-xs text-slate-500">평가금액(API) {formatMoney(balance?.total_eval, "USD")}</span>
           )}
+        </div>
+        <div className="card p-4">
+          <span className="text-caption text-slate-500">투입 대비 평가</span>
+          <strong className={`block text-2xl mt-1 ${positionSummary.profit >= 0 ? "text-green-600" : "text-red-600"}`}>
+            {formatMoney(positionSummary.profit, currency)}
+          </strong>
+          <span className="block mt-1 text-xs text-slate-500">
+            {positionSummary.profitRate === null ? "수익률 -" : `수익률 ${positionSummary.profitRate >= 0 ? "+" : ""}${positionSummary.profitRate.toFixed(2)}%`}
+          </span>
+          <span className="block mt-1 text-xs text-slate-500">
+            원금 {formatMoney(positionSummary.principal, currency)}
+          </span>
         </div>
         <div className="card p-4">
           <span className="text-caption text-slate-500">{streamLabel}</span>

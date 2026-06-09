@@ -227,6 +227,10 @@ export interface ProtectiveSettings {
   exit_reprice_interval_seconds?: number;
   us_exit_reprice_step_pct?: number;
   us_exit_max_offset_pct?: number;
+  domestic_stop_loss_limit_offset_pct?: number;
+  domestic_take_profit_limit_offset_pct?: number;
+  domestic_exit_reprice_step_pct?: number;
+  domestic_exit_max_offset_pct?: number;
 }
 
 export interface ProtectiveMonitorHealth {

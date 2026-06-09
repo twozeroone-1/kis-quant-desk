@@ -69,6 +69,7 @@ ACTIVE_PROTECTION_STATUSES = {"active", "exit_submitted"}
 ACTIVE_APP_RESERVATION_STATUSES = {"scheduled", "submitting"}
 ACTIVE_PENDING_ACTIONS = {"BUY", "SELL"}
 DETAIL_RETENTION_DAYS = 30
+DEFAULT_REPORT_URL = "http://ww.tailea9a3f.ts.net:8081"
 US_SECTOR_BY_SYMBOL = {
     "SPY": "broad_etf",
     "QQQ": "broad_etf",
@@ -1441,14 +1442,14 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
         f"- Remaining loss budget: ${summary['remaining_loss_budget']:,.2f}",
         "",
         "## Timeline",
-        "| ET Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Errors |",
+        "| UTC+09:00 Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Errors |",
         "|---|---|---|---:|---|---|---:|",
     ]
     for run in runs:
         counts = run.get("signal_counts", {})
         order_counts = run.get("order_counts", {})
         lines.append(
-            f"| {run.get('scheduled_at_et') or '-'} | {run.get('run_id')} | {run.get('status')} | "
+            f"| {display_kst_time(run)} | {run.get('run_id')} | {run.get('status')} | "
             f"{float(run.get('duration_seconds') or 0):.1f}s | "
             f"{counts.get('BUY', 0)}/{counts.get('SELL', 0)}/{counts.get('HOLD', 0)} | "
             f"{order_counts.get('submitted', 0)}/{order_counts.get('filled', 0)}/{order_counts.get('failed', 0)} | "
@@ -1506,16 +1507,33 @@ def normalize_summary_run(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def report_url() -> str:
+    raw = (os.environ.get("US_MARKET_REPORT_URL") or DEFAULT_REPORT_URL).strip().rstrip("/")
+    if raw.startswith("http://127.0.0.1") or raw.startswith("http://localhost"):
+        return DEFAULT_REPORT_URL
+    return raw
+
+
+def display_kst_time(payload: dict[str, Any]) -> str:
+    raw = payload.get("started_at") or payload.get("updated_at") or payload.get("scheduled_at_kst")
+    if not raw:
+        return "-"
+    try:
+        value = datetime.fromisoformat(str(raw)).astimezone(ZoneInfo("Asia/Seoul"))
+    except ValueError:
+        return str(raw)
+    return value.strftime("%Y-%m-%d %H:%M UTC+09:00")
+
+
 def telegram_message(payload: dict[str, Any], summary: dict[str, Any] | None = None) -> str:
     if payload.get("status") == "market_closed":
-        return f"US paper automation {payload.get('date')}: market closed. No orders."
+        return f"US paper automation {payload.get('date')}: market closed. No orders.\n{report_url()}/automation"
     run = run_summary(payload)
     counts = run["signal_counts"]
     order_counts = run["order_counts"]
-    report_url = os.environ.get("US_MARKET_REPORT_URL", "").rstrip("/")
-    link = f"\n{report_url}/automation" if report_url else ""
+    link = f"\n{report_url()}/automation"
     text = (
-        f"US paper {run.get('run_id')} {run.get('status')}\n"
+        f"US paper {display_kst_time(payload)} {run.get('status')}\n"
         f"Signals B/S/H {counts['BUY']}/{counts['SELL']}/{counts['HOLD']}\n"
         f"Orders submitted/filled/failed "
         f"{order_counts['submitted']}/{order_counts['filled']}/{order_counts['failed']}\n"
@@ -1534,11 +1552,11 @@ def telegram_message(payload: dict[str, Any], summary: dict[str, Any] | None = N
 
 
 def session_telegram_message(summary: dict[str, Any]) -> str:
-    report_url = os.environ.get("US_MARKET_REPORT_URL", "").rstrip("/")
-    link = f"\n{report_url}/automation" if report_url else ""
+    link = f"\n{report_url()}/automation"
     totals = summary.get("totals", {})
     return (
         f"US paper session {summary.get('session_date')} complete\n"
+        f"Updated {display_kst_time(summary)}\n"
         f"Runs {summary.get('run_count', 0)}, submitted/filled/failed "
         f"{totals.get('submitted', 0)}/{totals.get('filled', 0)}/{totals.get('failed', 0)}\n"
         f"Buys ${float(summary.get('cumulative_buy_notional') or 0):,.2f}, "

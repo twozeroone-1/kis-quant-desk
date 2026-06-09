@@ -14,9 +14,7 @@ if ! grep -q '^CRON_TZ=Asia/Seoul$' "$tmp"; then
 fi
 
 cat >> "$tmp" <<EOF
-10 9 * * 1-5 $PROJECT_ROOT/.codex/scripts/run_kr_market_auto_daily.sh open >> $CRON_LOG 2>&1 # KIS_KR_MARKET_AUTO_DAILY
-30 12 * * 1-5 $PROJECT_ROOT/.codex/scripts/run_kr_market_auto_daily.sh mid >> $CRON_LOG 2>&1 # KIS_KR_MARKET_AUTO_DAILY
-10 15 * * 1-5 $PROJECT_ROOT/.codex/scripts/run_kr_market_auto_daily.sh close >> $CRON_LOG 2>&1 # KIS_KR_MARKET_AUTO_DAILY
+10 9-15 * * 1-5 $PROJECT_ROOT/.codex/scripts/run_kr_market_auto_daily.sh hourly >> $CRON_LOG 2>&1 # KIS_KR_MARKET_AUTO_DAILY
 EOF
 
 awk '!seen[$0]++' "$tmp" | crontab -

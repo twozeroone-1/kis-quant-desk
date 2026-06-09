@@ -22,6 +22,9 @@ mkdir -p "$LOG_DIR"
 slot="${1:?slot required}"
 scheduled_date="${2:?YYYYMMDD scheduled local date required}"
 session_date="${3:-$scheduled_date}"
+run_id="${4:-}"
+shift $(( $# >= 4 ? 4 : $# ))
+extra_args=("$@")
 today="$(date +%Y%m%d)"
 
 if [[ "$today" != "$scheduled_date" ]]; then
@@ -41,5 +44,23 @@ if ! printf '%s' "$status" | grep -q '"mode"[[:space:]]*:[[:space:]]*"vps"'; the
   exit 1
 fi
 
+lock_file="$LOG_DIR/kr_market_auto.lock"
+exec 9>"$lock_file"
+if ! flock -n 9; then
+  if [[ -n "$run_id" ]]; then
+    cd "$PROJECT_ROOT/strategy_builder"
+    "$UV_BIN" run "$PROJECT_ROOT/.codex/scripts/kr_market_auto_run.py" \
+      --slot "$slot" --date "$session_date" --run-id "$run_id" \
+      --record-skip skipped_overlap
+  fi
+  echo "skip: overlapping KR automation run session=$session_date run_id=${run_id:-legacy}"
+  exit 0
+fi
+
 cd "$PROJECT_ROOT/strategy_builder"
-"$UV_BIN" run "$PROJECT_ROOT/.codex/scripts/kr_market_auto_run.py" --slot "$slot" --date "$session_date"
+args=(--slot "$slot" --date "$session_date")
+if [[ -n "$run_id" ]]; then
+  args+=(--run-id "$run_id")
+fi
+args+=("${extra_args[@]}")
+"$UV_BIN" run "$PROJECT_ROOT/.codex/scripts/kr_market_auto_run.py" "${args[@]}"

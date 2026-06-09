@@ -202,6 +202,59 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
 
         self.assertEqual(price, 96.5)
 
+    def test_domestic_triggered_exit_uses_marketable_limit_and_tick(self):
+        price = protective_orders._triggered_exit_order_price(
+            "domestic",
+            160800.0,
+            160000.0,
+            "stop_loss",
+            {"domestic_stop_loss_limit_offset_pct": 2.0},
+        )
+
+        self.assertEqual(price, 156800.0)
+
+    def test_domestic_take_profit_reprice_offset_expands_by_retry_count(self):
+        price = protective_orders._triggered_exit_order_price(
+            "domestic",
+            174500.0,
+            170000.0,
+            "take_profit",
+            {
+                "domestic_take_profit_limit_offset_pct": 0.3,
+                "domestic_exit_reprice_step_pct": 0.75,
+                "domestic_exit_max_offset_pct": 5.0,
+            },
+            reprice_count=2,
+        )
+
+        self.assertEqual(price, 166900.0)
+
+    def test_update_monitor_settings_saves_domestic_offsets(self):
+        state = {"orders": [], "settings": {}, "health": {}}
+
+        async def run_update():
+            with patch.object(protective_orders, "_load_state", return_value=copy.deepcopy(state)), patch.object(
+                protective_orders,
+                "_save_state",
+            ) as save_mock, patch.object(protective_orders, "_sync_realtime_subscriptions") as sync_mock:
+                settings = await protective_orders.update_monitor_settings(
+                    monitor_interval_seconds=15,
+                    domestic_stop_loss_limit_offset_pct=1.5,
+                    domestic_take_profit_limit_offset_pct=0.4,
+                    domestic_exit_reprice_step_pct=0.5,
+                    domestic_exit_max_offset_pct=3.0,
+                )
+                return settings, save_mock, sync_mock
+
+        settings, save_mock, sync_mock = asyncio.run(run_update())
+
+        self.assertEqual(settings["domestic_stop_loss_limit_offset_pct"], 1.5)
+        self.assertEqual(settings["domestic_take_profit_limit_offset_pct"], 0.4)
+        self.assertEqual(settings["domestic_exit_reprice_step_pct"], 0.5)
+        self.assertEqual(settings["domestic_exit_max_offset_pct"], 3.0)
+        save_mock.assert_awaited_once()
+        sync_mock.assert_awaited_once()
+
     def test_monitor_snapshot_batches_holdings_and_pending_queries(self):
         orders = [
             {
@@ -664,6 +717,37 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
         self.assertEqual(rows[0]["reservation_kind"], "protective_exit")
         self.assertEqual(rows[0]["status"], "submitted_unconfirmed")
         self.assertFalse(rows[0]["cancellable"])
+
+    def test_closed_protective_app_reservation_can_be_hidden_from_current_list(self):
+        state = {
+            "orders": [{
+                "id": "order-closed",
+                "status": "closed",
+                "env_dv": "vps",
+                "market": "us",
+                "exchange": "NASD",
+                "stock_code": "AMZN",
+                "stock_name": "Amazon",
+                "quantity": 1,
+                "app_exit_reservation": {
+                    "status": "closed",
+                    "exit_reason": "stop_loss",
+                    "order_type": "limit",
+                    "limit_price": 98.0,
+                    "reserved_at": datetime.now().isoformat(timespec="seconds"),
+                    "last_error": "reservation sell failed: 40490000",
+                },
+            }],
+            "settings": {},
+        }
+
+        with patch.object(protective_orders, "_load_state", return_value=state):
+            visible = asyncio.run(protective_orders.list_protective_app_reservations())
+            hidden = asyncio.run(protective_orders.list_protective_app_reservations(include_closed=False))
+
+        self.assertEqual(visible[0]["stock_code"], "AMZN")
+        self.assertEqual(visible[0]["status"], "closed")
+        self.assertEqual(hidden, [])
 
     def test_monitor_health_does_not_alert_for_closed_market_retry(self):
         order = {

@@ -45,35 +45,35 @@ class KrMarketAutoRunTest(unittest.TestCase):
         self.assertTrue(kr_market_auto_run.order_execution_enabled("prod", False, True))
         self.assertTrue(kr_market_auto_run.prod_llm_orders_enabled("prod", "off"))
 
-    def test_build_buy_orders_balances_when_all_candidates_can_get_one_share(self):
+    def test_build_buy_orders_applies_hourly_risk_caps(self):
         results = [
             {"code": "105560", "name": "KB금융", "action": "BUY", "strength": 0.95, "target_price": 400000},
             {"code": "396500", "name": "TIGER 반도체TOP10", "action": "BUY", "strength": 0.80, "target_price": 100000},
             {"code": "005930", "name": "삼성전자", "action": "BUY", "strength": 0.75, "target_price": 200000},
         ]
+        account = {"deposit": {"total_eval": 100_000_000, "deposit": 100_000_000}}
+
+        orders = kr_market_auto_run.build_buy_orders(results, account, {"orders": []})
+
+        self.assertEqual([order["code"] for order in orders], ["105560", "396500"])
+        self.assertEqual({order["code"]: order["quantity"] for order in orders}, {
+            "105560": 2,
+            "396500": 10,
+        })
+        self.assertLessEqual(sum(order["amount"] for order in orders), 10_000_000)
+        self.assertLessEqual(max(order["amount"] for order in orders), 1_000_000)
+
+    def test_build_buy_orders_uses_signal_order_when_only_one_share_fits(self):
+        results = [
+            {"code": "105560", "name": "KB금융", "action": "BUY", "strength": 0.95, "target_price": 400000},
+            {"code": "396500", "name": "TIGER 반도체TOP10", "action": "BUY", "strength": 0.80, "target_price": 100000},
+            {"code": "005930", "name": "삼성전자", "action": "BUY", "strength": 0.75, "target_price": 100000},
+        ]
         account = {"deposit": {"total_eval": 10_000_000, "deposit": 10_000_000}}
 
         orders = kr_market_auto_run.build_buy_orders(results, account, {"orders": []})
 
-        self.assertEqual([order["code"] for order in orders], ["105560", "396500", "005930"])
-        self.assertEqual({order["code"]: order["quantity"] for order in orders}, {
-            "105560": 1,
-            "396500": 3,
-            "005930": 1,
-        })
-        self.assertLessEqual(sum(order["amount"] for order in orders), 1_000_000)
-
-    def test_build_buy_orders_uses_signal_order_when_only_one_share_fits(self):
-        results = [
-            {"code": "105560", "name": "KB금융", "action": "BUY", "strength": 0.95, "target_price": 90000},
-            {"code": "396500", "name": "TIGER 반도체TOP10", "action": "BUY", "strength": 0.80, "target_price": 60000},
-            {"code": "005930", "name": "삼성전자", "action": "BUY", "strength": 0.75, "target_price": 60000},
-        ]
-        account = {"deposit": {"total_eval": 1_000_000, "deposit": 1_000_000}}
-
-        orders = kr_market_auto_run.build_buy_orders(results, account, {"orders": []})
-
-        self.assertEqual([(order["code"], order["quantity"]) for order in orders], [("105560", 1)])
+        self.assertEqual([(order["code"], order["quantity"]) for order in orders], [("396500", 1)])
 
     def test_prod_telegram_approval_adds_confirm_prod_to_buy_payload(self):
         calls = []
@@ -328,6 +328,64 @@ class KrMarketAutoRunTest(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "timeout")
+
+    def test_run_summary_and_telegram_message_use_kr_orders(self):
+        payload = {
+            "run_id": "20260609_0910_KST",
+            "slot": "hourly",
+            "date": "20260609",
+            "started_at": "2026-06-09T09:10:00+09:00",
+            "scheduled_at_kst": "2026-06-09T09:10:00+09:00",
+            "status": "completed",
+            "signals": [
+                {"code": "005930", "action": "BUY"},
+                {"code": "000660", "action": "SELL"},
+                {"code": "005380", "action": "HOLD"},
+            ],
+            "submitted_buys": [{"code": "005930", "amount": 140000, "order_status": "success"}],
+            "submitted_sells": [],
+            "account_before": {"account": {"deposit": {"total_eval": 10_000_000, "deposit": 5_000_000}}},
+            "account_after": {"account": {"deposit": {"total_eval": 10_000_000, "deposit": 4_860_000}}},
+        }
+
+        summary = kr_market_auto_run.run_summary(payload)
+        message = kr_market_auto_run.telegram_message(payload)
+
+        self.assertEqual(summary["signal_counts"]["BUY"], 1)
+        self.assertEqual(summary["signal_counts"]["SELL"], 1)
+        self.assertEqual(summary["signal_counts"]["HOLD"], 1)
+        self.assertEqual(summary["order_counts"]["submitted"], 1)
+        self.assertEqual(summary["buy_notional"], 140000)
+        self.assertIn("KR paper 20260609_0910_KST completed", message)
+        self.assertIn("Buy 140,000원", message)
+
+    def test_write_session_summary_persists_kr_summary_files(self):
+        original_runtime = kr_market_auto_run.RUNTIME_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                kr_market_auto_run.RUNTIME_DIR = Path(tmpdir)
+                state = {
+                    "runs": [{
+                        "run_id": "20260609_0910_KST",
+                        "slot": "hourly",
+                        "scheduled_at_kst": "2026-06-09T09:10:00+09:00",
+                        "started_at": "2026-06-09T09:10:00+09:00",
+                        "status": "completed",
+                        "signal_counts": {"BUY": 1, "SELL": 0, "HOLD": 1, "ERROR": 0},
+                        "order_counts": {"submitted": 1, "filled": 0, "failed": 0, "skipped": 0},
+                        "buy_notional": 140000,
+                        "account_after": {"risk_equity": 10_000_000},
+                        "errors": [],
+                    }]
+                }
+
+                summary = kr_market_auto_run.write_session_summary("20260609", state)
+
+                self.assertEqual(summary["remaining_buy_budget"], 860000)
+                self.assertTrue((Path(tmpdir) / "20260609_summary.json").is_file())
+                self.assertTrue((Path(tmpdir) / "20260609_summary.md").is_file())
+        finally:
+            kr_market_auto_run.RUNTIME_DIR = original_runtime
 
 
 if __name__ == "__main__":

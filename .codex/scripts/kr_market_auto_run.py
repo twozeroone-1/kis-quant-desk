@@ -54,6 +54,13 @@ def env_fraction(name: str, default: float) -> float:
     return value / 100 if value > 1 else value
 
 
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw.strip())
+
+
 def env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "y", "on", "allow"}
 
@@ -63,6 +70,8 @@ DAILY_LOSS_PCT = env_fraction("KR_MARKET_DAILY_LOSS_PCT", 0.005)
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 MIN_BUY_STRENGTH = 0.70
+MAX_NEW_BUY_SYMBOLS = env_int("KR_MARKET_MAX_NEW_BUY_SYMBOLS", 2)
+MAX_PER_SYMBOL_BUY_PCT = env_fraction("KR_MARKET_MAX_PER_SYMBOL_BUY_PCT", 0.01)
 LLM_DECIDER_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_llm_decider.py"
 CALENDAR_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_calendar.py"
 
@@ -204,6 +213,23 @@ def save_state(session_date: str, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
+def run_already_recorded(state: dict[str, Any], run_id: str | None) -> bool:
+    if not run_id:
+        return False
+    return any(run.get("run_id") == run_id for run in state.get("runs", []) if isinstance(run, dict))
+
+
+def record_skip_event(session_date: str, run_id: str, status: str, slot: str) -> None:
+    state = load_state(session_date)
+    state.setdefault("events", []).append({
+        "run_id": run_id,
+        "slot": slot,
+        "status": status,
+        "at": datetime.now().isoformat(timespec="seconds"),
+    })
+    save_state(session_date, state)
+
+
 def account_snapshot() -> dict[str, Any]:
     api("POST", "/api/orders/account/clear-cache")
     time.sleep(1.0)
@@ -245,6 +271,8 @@ def build_buy_orders(results: list[dict[str, Any]], account: dict[str, Any], sta
         and float(row.get("target_price") or 0) > 0
     ]
     candidates.sort(key=lambda row: float(row.get("strength") or 0), reverse=True)
+    selected_candidates = candidates[:MAX_NEW_BUY_SYMBOLS]
+    total_strength = sum(float(row.get("strength") or 0) for row in selected_candidates) or 1.0
 
     def make_order(row: dict[str, Any], qty: int) -> dict[str, Any]:
         price = float(row["target_price"])
@@ -254,57 +282,33 @@ def build_buy_orders(results: list[dict[str, Any]], account: dict[str, Any], sta
             "quantity": qty,
             "amount": amount,
             "weight": amount / max(1.0, usable_budget),
+            "risk_amount": amount * STOP_LOSS_PCT,
             "take_profit": math.floor(price * (1 + TAKE_PROFIT_PCT)),
             "stop_loss": math.floor(price * (1 - STOP_LOSS_PCT)),
             "order_type": "market",
             "order_decision": "주문",
         }
 
-    if not candidates or usable_budget <= 0:
+    if not selected_candidates or usable_budget <= 0:
         return []
 
-    one_share_cost = sum(float(row["target_price"]) for row in candidates)
-    if one_share_cost > usable_budget:
-        remaining = usable_budget
-        orders: list[dict[str, Any]] = []
-        for row in candidates:
-            price = float(row["target_price"])
-            if price > remaining:
-                continue
-            orders.append(make_order(row, 1))
-            remaining -= price
-        return orders
-
-    quantities = {str(row["code"]): 1 for row in candidates}
-    remaining = usable_budget - one_share_cost
-    target_amount = usable_budget / len(candidates)
-
-    while remaining >= min(float(row["target_price"]) for row in candidates):
-        eligible = []
-        for row in candidates:
-            code = str(row["code"])
-            price = float(row["target_price"])
-            current_amount = quantities[code] * price
-            if price <= remaining and current_amount + price <= target_amount:
-                eligible.append(row)
-        if not eligible:
-            break
-        selected = min(
-            eligible,
-            key=lambda row: (
-                quantities[str(row["code"])] * float(row["target_price"]),
-                -float(row.get("strength") or 0),
-            ),
+    orders: list[dict[str, Any]] = []
+    remaining = usable_budget
+    per_symbol_cap = max(0.0, total_eval * MAX_PER_SYMBOL_BUY_PCT)
+    for row in selected_candidates:
+        price = float(row["target_price"])
+        target_amount = min(
+            usable_budget * float(row.get("strength") or 0) / total_strength,
+            per_symbol_cap,
+            remaining,
         )
-        selected_code = str(selected["code"])
-        quantities[selected_code] += 1
-        remaining -= float(selected["target_price"])
-
-    return [
-        make_order(row, quantities[str(row["code"])])
-        for row in candidates
-        if quantities[str(row["code"])] > 0
-    ]
+        qty = int(target_amount // price)
+        if qty <= 0:
+            continue
+        order = make_order(row, qty)
+        orders.append(order)
+        remaining -= float(order["amount"])
+    return orders
 
 
 def load_llm_decider():
@@ -811,11 +815,250 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
+    errors = [str(item) for item in payload.get("errors", []) if item]
+    errors.extend(
+        f"candidate_selection: {item}"
+        for item in payload.get("candidate_selection", {}).get("errors", [])
+        if item
+    )
+    for signal in payload.get("signals", []):
+        if signal.get("action") == "ERROR" and signal.get("reason"):
+            errors.append(f"{signal.get('code') or signal.get('symbol')}: {signal.get('reason')}")
+    for order in [*payload.get("submitted_sells", []), *payload.get("submitted_buys", [])]:
+        status = str(order.get("order_status") or "")
+        if status in {"failed", "error", "reservation_failed"} and (order.get("last_error") or order.get("message")):
+            errors.append(
+                f"{order.get('code') or order.get('stock_code') or order.get('symbol')}: "
+                f"{order.get('last_error') or order.get('message')}"
+            )
+        result = order.get("order_result") if isinstance(order.get("order_result"), dict) else {}
+        if result.get("status") == "error" and result.get("message"):
+            errors.append(f"{order.get('code') or order.get('stock_code')}: {result.get('message')}")
+    for item in payload.get("account_after", {}).get("reservations", {}).get("errors", []):
+        errors.append(f"reservations: {item}")
+    protective_health = payload.get("account_after", {}).get("protective", {}).get("health", {})
+    if protective_health.get("status") in {"degraded", "stale"}:
+        errors.append(f"protective monitor: {protective_health.get('status')}")
+    return list(dict.fromkeys(errors))
+
+
+def compact_account(snapshot: dict[str, Any]) -> dict[str, Any]:
+    account = snapshot.get("account", {}) if isinstance(snapshot, dict) else {}
+    deposit = account.get("deposit", {}) if isinstance(account, dict) else {}
+    holdings = account.get("holdings", []) if isinstance(account, dict) else []
+    total_eval = float(deposit.get("total_eval") or 0)
+    cash = float(deposit.get("deposit") or deposit.get("available_amount") or 0)
+    return {
+        "equity": round(total_eval, 2),
+        "risk_equity": round(total_eval, 2),
+        "cash": round(cash, 2),
+        "holdings_count": len(holdings) if isinstance(holdings, list) else 0,
+    }
+
+
+def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    signals = payload.get("signals") or []
+    orders = [*payload.get("submitted_sells", []), *payload.get("submitted_buys", [])]
+    success_statuses = {"success", "submitted", "reservation_submitted"}
+    failed_statuses = {"failed", "error", "reservation_failed"}
+    return {
+        "run_id": payload.get("run_id"),
+        "slot": payload.get("slot"),
+        "scheduled_at_kst": payload.get("scheduled_at_kst"),
+        "started_at": payload.get("started_at"),
+        "finished_at": payload.get("finished_at"),
+        "duration_seconds": round(float(payload.get("duration_seconds") or 0), 2),
+        "status": payload.get("status", "completed"),
+        "report_only": bool(payload.get("report_only")),
+        "signal_counts": {
+            action: sum(1 for signal in signals if signal.get("action") == action)
+            for action in ("BUY", "SELL", "HOLD", "ERROR")
+        },
+        "order_counts": {
+            "submitted": sum(1 for order in orders if order.get("order_status") in success_statuses),
+            "filled": sum(1 for order in orders if float(order.get("filled_quantity") or 0) > 0),
+            "failed": sum(1 for order in orders if order.get("order_status") in failed_statuses),
+            "skipped": sum(1 for order in orders if str(order.get("order_status") or "").startswith("skipped")),
+        },
+        "buy_notional": round(sum(
+            float(order.get("amount") or order.get("notional") or 0)
+            for order in payload.get("submitted_buys", [])
+            if order.get("order_status") in success_statuses
+        ), 2),
+        "account_before": compact_account(payload.get("account_before", {})),
+        "account_after": compact_account(payload.get("account_after", {})),
+        "pending_count": int(payload.get("account_after", {}).get("pending", {}).get("total_count") or 0),
+        "app_reservation_count": int(payload.get("account_after", {}).get("reservations", {}).get("total_count") or 0),
+        "protective_count": len(payload.get("account_after", {}).get("protective", {}).get("orders") or []),
+        "errors": collect_payload_errors(payload),
+        "json_report": f"{payload.get('run_id')}.json",
+        "markdown_report": f"{payload.get('run_id')}.md",
+    }
+
+
+def normalize_summary_run(run: dict[str, Any]) -> dict[str, Any]:
+    if run.get("run_id") and run.get("signal_counts") and run.get("order_counts"):
+        return run
+    report = str(run.get("report") or "")
+    report_id = Path(report).stem if report else ""
+    status = run.get("status") or ("market_closed" if run.get("skipped") == "market_closed" else "legacy")
+    return {
+        "run_id": run.get("run_id") or report_id or f"legacy_{run.get('started_at', 'unknown')}",
+        "slot": run.get("slot", "legacy"),
+        "scheduled_at_kst": run.get("scheduled_at_kst"),
+        "started_at": run.get("started_at"),
+        "finished_at": None,
+        "duration_seconds": 0.0,
+        "status": status,
+        "report_only": False,
+        "signal_counts": {"BUY": 0, "SELL": 0, "HOLD": 0, "ERROR": 0},
+        "order_counts": {"submitted": 0, "filled": 0, "failed": 0, "skipped": 0},
+        "buy_notional": 0.0,
+        "account_before": {},
+        "account_after": {},
+        "pending_count": 0,
+        "app_reservation_count": 0,
+        "protective_count": 0,
+        "errors": [],
+        "json_report": f"{report_id}.json" if report_id else None,
+        "markdown_report": f"{report_id}.md" if report_id else None,
+    }
+
+
+def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str, Any]:
+    runs = [normalize_summary_run(run) for run in state.get("runs", []) if isinstance(run, dict)]
+    cumulative_buy = round(sum(float(run.get("buy_notional") or 0) for run in runs), 2)
+    latest_account = next((run.get("account_after") for run in reversed(runs) if run.get("account_after")), {})
+    risk_equity = float((latest_account or {}).get("risk_equity") or 0)
+    summary = {
+        "session_date": session_date,
+        "mode": "vps",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "run_count": len(runs),
+        "runs": runs,
+        "events": state.get("events", []),
+        "cumulative_buy_notional": cumulative_buy,
+        "session_buy_limit": round(risk_equity * TOTAL_BUY_PCT, 2),
+        "remaining_buy_budget": round(max(0.0, risk_equity * TOTAL_BUY_PCT - cumulative_buy), 2),
+        "session_loss_limit": round(risk_equity * DAILY_LOSS_PCT, 2),
+        "remaining_loss_budget": round(max(0.0, risk_equity * DAILY_LOSS_PCT - cumulative_buy * STOP_LOSS_PCT), 2),
+        "latest_account": latest_account,
+        "totals": {
+            "submitted": sum(int(run.get("order_counts", {}).get("submitted") or 0) for run in runs),
+            "filled": sum(int(run.get("order_counts", {}).get("filled") or 0) for run in runs),
+            "failed": sum(int(run.get("order_counts", {}).get("failed") or 0) for run in runs),
+            "errors": sum(len(run.get("errors") or []) for run in runs),
+        },
+    }
+    (RUNTIME_DIR / f"{session_date}_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    lines = [
+        f"# KR Automation Session - {session_date}",
+        "",
+        "- Mode: vps only",
+        f"- Updated: {summary['updated_at']}",
+        f"- Runs: {summary['run_count']}",
+        f"- Cumulative buys: {cumulative_buy:,.0f}원",
+        f"- Remaining buy budget: {summary['remaining_buy_budget']:,.0f}원",
+        f"- Remaining loss budget: {summary['remaining_loss_budget']:,.0f}원",
+        "",
+        "## Timeline",
+        "| KST Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Errors |",
+        "|---|---|---|---:|---|---|---:|",
+    ]
+    for run in runs:
+        counts = run.get("signal_counts", {})
+        order_counts = run.get("order_counts", {})
+        lines.append(
+            f"| {run.get('scheduled_at_kst') or '-'} | {run.get('run_id')} | {run.get('status')} | "
+            f"{float(run.get('duration_seconds') or 0):.1f}s | "
+            f"{counts.get('BUY', 0)}/{counts.get('SELL', 0)}/{counts.get('HOLD', 0)} | "
+            f"{order_counts.get('submitted', 0)}/{order_counts.get('filled', 0)}/{order_counts.get('failed', 0)} | "
+            f"{len(run.get('errors') or [])} |"
+        )
+    (RUNTIME_DIR / f"{session_date}_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return summary
+
+
+def telegram_message(payload: dict[str, Any], summary: dict[str, Any] | None = None) -> str:
+    if payload.get("status") == "market_closed":
+        return f"KR paper automation {payload.get('date')}: market closed. No orders."
+    run = run_summary(payload)
+    counts = run["signal_counts"]
+    order_counts = run["order_counts"]
+    report_url = (
+        os.environ.get("KR_MARKET_REPORT_URL")
+        or os.environ.get("US_MARKET_REPORT_URL")
+        or ""
+    ).rstrip("/")
+    link = f"\n{report_url}/automation" if report_url else ""
+    text = (
+        f"KR paper {run.get('run_id')} {run.get('status')}\n"
+        f"Signals B/S/H {counts['BUY']}/{counts['SELL']}/{counts['HOLD']}\n"
+        f"Orders submitted/filled/failed "
+        f"{order_counts['submitted']}/{order_counts['filled']}/{order_counts['failed']}\n"
+        f"Buy {run['buy_notional']:,.0f}원, errors {len(run['errors'])}{link}"
+    )
+    if summary is not None:
+        text += (
+            f"\nSession total: {summary['run_count']} runs, "
+            f"buys {summary['cumulative_buy_notional']:,.0f}원, "
+            f"remaining risk {summary['remaining_loss_budget']:,.0f}원"
+        )
+    return text
+
+
+def session_telegram_message(summary: dict[str, Any]) -> str:
+    report_url = (
+        os.environ.get("KR_MARKET_REPORT_URL")
+        or os.environ.get("US_MARKET_REPORT_URL")
+        or ""
+    ).rstrip("/")
+    link = f"\n{report_url}/automation" if report_url else ""
+    totals = summary.get("totals", {})
+    return (
+        f"KR paper session {summary.get('session_date')} complete\n"
+        f"Runs {summary.get('run_count', 0)}, submitted/filled/failed "
+        f"{totals.get('submitted', 0)}/{totals.get('filled', 0)}/{totals.get('failed', 0)}\n"
+        f"Buys {float(summary.get('cumulative_buy_notional') or 0):,.0f}원, "
+        f"remaining loss budget {float(summary.get('remaining_loss_budget') or 0):,.0f}원, "
+        f"errors {totals.get('errors', 0)}{link}"
+    )
+
+
+def send_telegram(text: str) -> dict[str, Any]:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_ALLOWED_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return {"status": "disabled"}
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=12,
+        )
+        body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+        if response.ok and body.get("ok"):
+            return {"status": "sent"}
+        return {
+            "status": "error",
+            "http_status": response.status_code,
+            "message": str(body.get("description") or "telegram send failed")[:500],
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"[:500]}
+
+
 def main() -> int:
     global API_BASE
     parser = argparse.ArgumentParser()
-    parser.add_argument("--slot", required=True, choices=["open", "mid", "close", "manual"])
+    parser.add_argument("--slot", required=True, choices=["hourly", "open", "mid", "close", "manual"])
     parser.add_argument("--date", required=True)
+    parser.add_argument("--run-id", help="Stable run identifier, normally YYYYMMDD_HHMM_KST.")
+    parser.add_argument("--record-skip", choices=["skipped_overlap", "skipped_duplicate", "skipped_not_scheduled"])
     parser.add_argument(
         "--trade-mode",
         choices=["vps", "prod"],
@@ -838,6 +1081,7 @@ def main() -> int:
     global RUNTIME_DIR
     RUNTIME_DIR = runtime_dir_for(args.trade_mode)
     prod_confirmed = prod_auto_confirmed(args.prod_auto_confirm)
+    monotonic_started = time.monotonic()
     prod_telegram_enabled = prod_telegram_approval_enabled()
     order_block_reasons = []
     if args.trade_mode == "prod" and not prod_confirmed and not prod_telegram_enabled:
@@ -846,15 +1090,41 @@ def main() -> int:
     strategy_sell_enabled = strategy_sell_execution_enabled(args.trade_mode)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
-    report_base = RUNTIME_DIR / f"{now.strftime('%Y%m%d_%H%M%S')}_{args.slot}"
+    run_id = args.run_id or f"{now.strftime('%Y%m%d_%H%M%S')}_{args.slot}"
+    report_base = RUNTIME_DIR / run_id
     state = load_state(args.date)
+
+    if args.record_skip:
+        record_skip_event(args.date, run_id, args.record_skip, args.slot)
+        write_session_summary(args.date, load_state(args.date))
+        return 0
+    if run_already_recorded(state, run_id):
+        record_skip_event(args.date, run_id, "skipped_duplicate", args.slot)
+        write_session_summary(args.date, load_state(args.date))
+        return 0
+
     trading_day = trading_day_status(args.date)
+    schedule_entry = next(
+        (item for item in trading_day.get("scheduled_runs", []) if item.get("run_id") == run_id),
+        {},
+    )
+    if args.slot == "hourly" and trading_day.get("is_open") and args.run_id and not schedule_entry:
+        record_skip_event(args.date, run_id, "skipped_not_scheduled", args.slot)
+        write_session_summary(args.date, load_state(args.date))
+        return 0
 
     if not trading_day.get("is_open"):
+        finished = datetime.now()
         payload = {
+            "run_id": run_id,
             "slot": args.slot,
             "date": args.date,
             "started_at": now.isoformat(timespec="seconds"),
+            "finished_at": finished.isoformat(timespec="seconds"),
+            "duration_seconds": round(time.monotonic() - monotonic_started, 2),
+            "status": "market_closed",
+            "report_only": True,
+            "scheduled_at_kst": schedule_entry.get("scheduled_at_kst"),
             "headlines": [],
             "news_summary": {"regime": "market_closed", "scores": {}},
             "signals": [],
@@ -892,6 +1162,8 @@ def main() -> int:
                 "take_profit_pct": TAKE_PROFIT_PCT,
                 "stop_loss_pct": STOP_LOSS_PCT,
                 "min_buy_strength": MIN_BUY_STRENGTH,
+                "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
+                "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
                 "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
                 "order_block_reasons": order_block_reasons,
                 "prod_telegram_approval_enabled": prod_telegram_enabled,
@@ -900,12 +1172,13 @@ def main() -> int:
             },
         }
         state.setdefault("runs", []).append({
-            "slot": args.slot,
-            "started_at": payload["started_at"],
+            **run_summary(payload),
             "report": str(report_base.with_suffix(".md")),
             "skipped": "market_closed",
         })
         save_state(args.date, state)
+        summary = write_session_summary(args.date, state)
+        payload["telegram"] = send_telegram(telegram_message(payload, summary))
         report_base.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         write_report(report_base.with_suffix(".md"), payload)
         return 0
@@ -944,9 +1217,11 @@ def main() -> int:
         )
     planned_buys = build_buy_orders(signals, account_before["account"], state)
     llm_context = {
+        "run_id": run_id,
         "slot": args.slot,
         "date": args.date,
         "started_at": now.isoformat(timespec="seconds"),
+        "scheduled_at_kst": schedule_entry.get("scheduled_at_kst"),
         "headlines": headlines,
         "news_summary": news_summary,
         "signals": signals,
@@ -966,6 +1241,8 @@ def main() -> int:
             "take_profit_pct": TAKE_PROFIT_PCT,
             "stop_loss_pct": STOP_LOSS_PCT,
             "min_buy_strength": MIN_BUY_STRENGTH,
+            "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
+            "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
             "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
         },
     }
@@ -1015,9 +1292,11 @@ def main() -> int:
     account_after = account_snapshot()
 
     payload = {
+        "run_id": run_id,
         "slot": args.slot,
         "date": args.date,
         "started_at": now.isoformat(timespec="seconds"),
+        "scheduled_at_kst": schedule_entry.get("scheduled_at_kst"),
         "headlines": headlines,
         "news_summary": news_summary,
         "signals": signals,
@@ -1042,6 +1321,8 @@ def main() -> int:
         "order_block_reasons": order_block_reasons,
         "strategy_sell_execution_enabled": strategy_sell_enabled,
         "trading_day": trading_day,
+        "status": "completed",
+        "report_only": False,
         "safety": {
             "mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
@@ -1055,18 +1336,28 @@ def main() -> int:
             "take_profit_pct": TAKE_PROFIT_PCT,
             "stop_loss_pct": STOP_LOSS_PCT,
             "min_buy_strength": MIN_BUY_STRENGTH,
+            "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
+            "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
             "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
         },
     }
-    state.setdefault("runs", []).append({
-        "slot": args.slot,
-        "started_at": payload["started_at"],
-        "report": str(report_base.with_suffix(".md")),
-    })
+    finished = datetime.now()
+    payload["finished_at"] = finished.isoformat(timespec="seconds")
+    payload["duration_seconds"] = round(time.monotonic() - monotonic_started, 2)
+    payload["errors"] = collect_payload_errors(payload)
+    summary_row = run_summary(payload)
+    state.setdefault("runs", []).append({**summary_row, "report": str(report_base.with_suffix(".md"))})
     state.setdefault("orders", []).extend(
         order for order in buys if order.get("order_status") == "success"
     )
     save_state(args.date, state)
+    summary = write_session_summary(args.date, state)
+    is_last_run = bool(schedule_entry) and schedule_entry == trading_day.get("scheduled_runs", [])[-1]
+    payload["telegram"] = {
+        "run": send_telegram(telegram_message(payload)),
+    }
+    if is_last_run:
+        payload["telegram"]["session"] = send_telegram(session_telegram_message(summary))
     report_base.with_suffix(".json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     write_report(report_base.with_suffix(".md"), payload)
     return 0

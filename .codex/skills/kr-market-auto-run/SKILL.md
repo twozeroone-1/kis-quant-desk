@@ -25,8 +25,8 @@ Run the Korean-market intraday paper-trading workflow through the local Open Tra
 
 ## Scripts
 
-- Single slot: `.codex/scripts/run_kr_market_auto_once.sh <open|mid|close|manual> YYYYMMDD [session_date]`
-- Daily slot wrapper: `.codex/scripts/run_kr_market_auto_daily.sh <open|mid|close>`
+- Single slot: `.codex/scripts/run_kr_market_auto_once.sh <hourly|open|mid|close|manual> YYYYMMDD [session_date] [run_id]`
+- Hourly wrapper: `.codex/scripts/run_kr_market_auto_daily.sh hourly`
 - Install daily cron: `.codex/scripts/install_kr_market_auto_daily_cron.sh`
 - Main implementation: `.codex/scripts/kr_market_auto_run.py`
 - LLM decision layer: `.codex/scripts/kr_market_llm_decider.py`
@@ -38,9 +38,8 @@ Do not rewrite the workflow in the response. Prefer running or patching these sc
 
 Korea time:
 
-- open: 09:10
-- mid: 12:30
-- close: 15:10
+- hourly: 09:10, 10:10, 11:10, 12:10, 13:10, 14:10, 15:10
+- legacy manual slots remain available: open, mid, close
 
 For a same-day request:
 
@@ -77,7 +76,7 @@ For a same-day request:
 
 ## Daily Automation
 
-For "매일 하루 3번" automation, install cron:
+For hourly Korean regular-session automation, install cron:
 
 ```bash
 .codex/scripts/install_kr_market_auto_daily_cron.sh

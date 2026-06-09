@@ -11,14 +11,18 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_BUILDER = PROJECT_ROOT / "strategy_builder"
 RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto" / "calendar"
+KST = ZoneInfo("Asia/Seoul")
+KR_HOURLY_START = (9, 10)
+KR_HOURLY_END = (15, 10)
 
 
 def cache_path(date: str) -> Path:
@@ -38,6 +42,40 @@ def load_cache(date: str) -> dict[str, Any] | None:
 def save_cache(date: str, payload: dict[str, Any]) -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     cache_path(date).write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _checked_at() -> str:
+    return datetime.now(KST).isoformat(timespec="seconds")
+
+
+def scheduled_runs(date: str) -> list[dict[str, Any]]:
+    current = datetime.strptime(date, "%Y%m%d").replace(
+        hour=KR_HOURLY_START[0],
+        minute=KR_HOURLY_START[1],
+        tzinfo=KST,
+    )
+    last = datetime.strptime(date, "%Y%m%d").replace(
+        hour=KR_HOURLY_END[0],
+        minute=KR_HOURLY_END[1],
+        tzinfo=KST,
+    )
+    runs: list[dict[str, Any]] = []
+    while current <= last:
+        hhmm = current.strftime("%H%M")
+        runs.append({
+            "run_id": f"{date}_{hhmm}_KST",
+            "session_date": date,
+            "hhmm_kst": hhmm,
+            "scheduled_at_kst": current.isoformat(timespec="seconds"),
+        })
+        current += timedelta(hours=1)
+    return runs
+
+
+def _with_schedule(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("is_open"):
+        return {**payload, "scheduled_runs": scheduled_runs(str(payload.get("date")))}
+    return {**payload, "scheduled_runs": []}
 
 
 def normalize_flag(value: Any) -> str:
@@ -112,8 +150,9 @@ def query_kis_calendar(date: str) -> dict[str, Any]:
         "is_open": is_open,
         "source": "kis_chk_holiday",
         "record": record,
-        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "checked_at": _checked_at(),
     }
+    payload = _with_schedule(payload)
     save_cache(date, payload)
     return payload
 
@@ -152,8 +191,9 @@ def query_price_probe(date: str, calendar_error: dict[str, Any]) -> dict[str, An
                     "price": price,
                     "calendar_error": calendar_error,
                 },
-                "checked_at": datetime.now().isoformat(timespec="seconds"),
+                "checked_at": _checked_at(),
             }
+            payload = _with_schedule(payload)
             save_cache(date, payload)
             return payload
 
@@ -173,7 +213,7 @@ def market_status(date: str, refresh: bool = False) -> dict[str, Any]:
     if not refresh:
         cached = load_cache(date)
         if cached:
-            return {**cached, "cached": True}
+            return {**_with_schedule(cached), "cached": True}
 
     # Weekend fallback before KIS call avoids pointless auth/API calls.
     dt = datetime.strptime(date, "%Y%m%d")
@@ -184,26 +224,84 @@ def market_status(date: str, refresh: bool = False) -> dict[str, Any]:
             "is_open": False,
             "source": "weekend",
             "record": {"reason": "weekend"},
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "checked_at": _checked_at(),
         }
+        payload = _with_schedule(payload)
         save_cache(date, payload)
         return payload
 
     payload = query_kis_calendar(date)
     if payload.get("status") == "success":
-        return payload
-    return query_price_probe(date, payload)
+        return _with_schedule(payload)
+    return _with_schedule(query_price_probe(date, payload))
+
+
+def resolve_scheduled_run(now: datetime | None = None) -> dict[str, Any]:
+    current = now or datetime.now(KST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KST)
+    current = current.astimezone(KST)
+    session_date = current.strftime("%Y%m%d")
+    status = market_status(session_date)
+    rounded = current.replace(second=0, microsecond=0)
+
+    if not status.get("is_open"):
+        first_slot = (
+            rounded.hour == KR_HOURLY_START[0]
+            and rounded.minute == KR_HOURLY_START[1]
+        )
+        return {
+            **status,
+            "resolution": "market_closed" if first_slot else "not_scheduled",
+            "first_closed_slot": first_slot,
+            "now_kst": current.isoformat(timespec="seconds"),
+        }
+
+    runs = status.get("scheduled_runs") or []
+    for index, run in enumerate(runs):
+        scheduled = datetime.fromisoformat(run["scheduled_at_kst"]).astimezone(KST)
+        if scheduled == rounded:
+            return {
+                **status,
+                **run,
+                "resolution": "scheduled",
+                "is_first_run": index == 0,
+                "is_last_run": index == len(runs) - 1,
+                "now_kst": current.isoformat(timespec="seconds"),
+            }
+    return {
+        **status,
+        "resolution": "not_scheduled",
+        "now_kst": current.isoformat(timespec="seconds"),
+    }
+
+
+def parse_now(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=KST)
+    return parsed
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date", default=datetime.now().strftime("%Y%m%d"))
+    parser.add_argument("--date", default=datetime.now(KST).strftime("%Y%m%d"))
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--check-open", action="store_true", help="Exit 0 if open, 2 if closed/unknown.")
+    parser.add_argument("--scheduled-runs", action="store_true", help="Print scheduled hourly runs.")
+    parser.add_argument("--resolve-now", action="store_true", help="Resolve the current cron invocation.")
+    parser.add_argument("--now", help="ISO timestamp used with --resolve-now.")
     args = parser.parse_args()
 
     try:
-        payload = market_status(args.date, refresh=args.refresh)
+        if args.resolve_now:
+            payload = resolve_scheduled_run(parse_now(args.now))
+        elif args.scheduled_runs:
+            payload = {"date": args.date, "runs": scheduled_runs(args.date)}
+        else:
+            payload = market_status(args.date, refresh=args.refresh)
     except Exception as exc:
         payload = {
             "status": "error",

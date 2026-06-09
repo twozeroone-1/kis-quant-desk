@@ -34,6 +34,17 @@ class _FakeResponse:
         return {"output": []}
 
 
+class _FakeRankingResponse:
+    def isOK(self):
+        return True
+
+    def getBody(self):
+        return {"output2": [{"symb": "AAPL", "excd": "NAS", "rank": "1"}]}
+
+    def getHeader(self):
+        return type("Header", (), {"tr_cont": ""})()
+
+
 @unittest.skipIf(overseas_data_fetcher is None, f"strategy_builder dependencies unavailable: {IMPORT_ERROR}")
 class OverseasDataFetcherTest(unittest.TestCase):
     def test_pending_orders_uses_demo_tr_id_for_vps(self):
@@ -159,6 +170,26 @@ class OverseasDataFetcherTest(unittest.TestCase):
         self.assertEqual(deposit["available_amount"], 105000.0)
         self.assertEqual(deposit["total_eval"], 105672.33)
         self.assertEqual(deposit["total_asset_krw"], 393505227.0)
+
+    def test_overseas_market_cap_rank_sends_required_currency_field(self):
+        seen = {}
+
+        def fake_fetch(api_url, tr_id, tr_cont, params):
+            seen["api_url"] = api_url
+            seen["tr_id"] = tr_id
+            seen["params"] = params
+            return _FakeRankingResponse()
+
+        with patch.object(overseas_data_fetcher, "_assert_trenv_ready", return_value=True), patch.object(
+            overseas_data_fetcher.ka, "_url_fetch", side_effect=fake_fetch
+        ):
+            result = overseas_data_fetcher.get_overseas_market_cap_rank(exchange="NASD", max_depth=1)
+
+        self.assertTrue(result.success)
+        self.assertEqual(seen["api_url"], "/uapi/overseas-stock/v1/ranking/market-cap")
+        self.assertEqual(seen["tr_id"], "HHDFS76350100")
+        self.assertEqual(seen["params"]["EXCD"], "NAS")
+        self.assertEqual(seen["params"]["CURR_GB"], "USD")
 
 
 if __name__ == "__main__":

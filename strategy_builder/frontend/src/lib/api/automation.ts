@@ -1,9 +1,12 @@
 import { apiGet } from "./client";
 
+export type AutomationMarket = "us" | "kr";
+
 export interface AutomationRunSummary {
   run_id: string;
   slot: string;
   scheduled_at_et?: string;
+  scheduled_at_kst?: string;
   started_at: string;
   finished_at?: string;
   duration_seconds: number;
@@ -34,6 +37,14 @@ export interface AutomationSession {
   remaining_buy_budget: number;
   session_loss_limit: number;
   remaining_loss_budget: number;
+  latest_account?: {
+    cash?: number;
+    risk_equity?: number;
+    equity?: number;
+    holdings_value?: number;
+    holdings_count?: number;
+    risk_equity_sources?: string[];
+  };
   totals: {
     submitted: number;
     filled: number;
@@ -56,20 +67,32 @@ export interface AutomationRunDetail {
   account_after: Record<string, unknown>;
 }
 
-export async function getUsAutomationSessions() {
+export async function getAutomationSessions(market: AutomationMarket) {
   return apiGet<{ status: "success"; sessions: AutomationSession[]; total_count: number }>(
-    "/api/automation/us/sessions"
+    `/api/automation/${market}/sessions`
   );
 }
 
-export async function getUsAutomationSession(sessionDate: string) {
+export async function getAutomationSession(market: AutomationMarket, sessionDate: string) {
   return apiGet<{ status: "success"; data: AutomationSession }>(
-    `/api/automation/us/sessions/${sessionDate}`
+    `/api/automation/${market}/sessions/${sessionDate}`
   );
 }
 
-export async function getUsAutomationRun(runId: string) {
+export async function getAutomationRun(market: AutomationMarket, runId: string) {
   return apiGet<{ status: "success"; data: AutomationRunDetail }>(
-    `/api/automation/us/runs/${runId}`
+    `/api/automation/${market}/runs/${runId}`
   );
+}
+
+export function getUsAutomationSessions() {
+  return getAutomationSessions("us");
+}
+
+export function getUsAutomationSession(sessionDate: string) {
+  return getAutomationSession("us", sessionDate);
+}
+
+export function getUsAutomationRun(runId: string) {
+  return getAutomationRun("us", runId);
 }

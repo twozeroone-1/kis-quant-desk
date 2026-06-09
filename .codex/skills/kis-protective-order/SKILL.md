@@ -166,7 +166,11 @@ POST /api/orders/protective/check
   "us_take_profit_limit_offset_pct": 0.3,
   "exit_reprice_interval_seconds": 60,
   "us_exit_reprice_step_pct": 0.75,
-  "us_exit_max_offset_pct": 5.0
+  "us_exit_max_offset_pct": 5.0,
+  "domestic_stop_loss_limit_offset_pct": 2.0,
+  "domestic_take_profit_limit_offset_pct": 0.3,
+  "domestic_exit_reprice_step_pct": 0.75,
+  "domestic_exit_max_offset_pct": 5.0
 }
 ```
 

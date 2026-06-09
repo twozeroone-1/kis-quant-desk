@@ -15,16 +15,18 @@ services:
       KIS_RUNTIME_DIR: /app/.runtime-vps
       KIS_DEFAULT_MODE: vps
       KIS_LOCK_MODE: vps
-      KIS_DISABLE_BACKGROUND_MONITORS: ${KIS_DISABLE_VPS_BACKGROUND_MONITORS:-1}
+      KIS_DISABLE_BACKGROUND_MONITORS: ${KIS_DISABLE_VPS_BACKGROUND_MONITORS:-0}
       AUDIT_LOG_DIR: ${AUDIT_LOG_DIR:-/var/log/kis/orders}
       AUDIT_LOG_RETENTION_DAYS: ${AUDIT_LOG_RETENTION_DAYS:-365}
       US_MARKET_REPORT_DIR: /app/us-market-reports
+      KR_MARKET_REPORT_DIR: /app/kr-market-reports
     volumes:
       - ${KIS_CONFIG_BIND_DIR:-/home/from0to01/KIS/config}:/home/kis/KIS/config
       - ${KIS_LOG_BIND_DIR:-/home/from0to01/.local/state/kis-stack/logs}:/var/log/kis
       - ${KIS_TOKEN_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/token-vps}:/home/kis/KIS/token-vps
       - ${KIS_RUNTIME_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/runtime-vps}:/app/.runtime-vps
       - ./.codex/runtime/us_market_auto:/app/us-market-reports:ro
+      - ./.codex/runtime/kr_market_auto:/app/kr-market-reports:ro
     expose:
       - "8000"
     healthcheck:

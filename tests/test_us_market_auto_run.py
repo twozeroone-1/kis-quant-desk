@@ -457,6 +457,46 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue((Path(tempdir) / "20260605_summary.json").is_file())
             self.assertTrue((Path(tempdir) / "20260605_summary.md").is_file())
 
+    def test_telegram_message_uses_tailnet_link_and_kst_time(self):
+        payload = {
+            "run_id": "20260605_0945_ET",
+            "slot": "hourly",
+            "date": "20260605",
+            "started_at": "2026-06-05T22:45:02+09:00",
+            "status": "completed",
+            "signals": [
+                {"symbol": "AAPL", "action": "BUY"},
+                {"symbol": "IBM", "action": "HOLD"},
+            ],
+            "orders": [{"symbol": "AAPL", "notional": 100.0, "order_status": "submitted"}],
+            "submitted_sells": [],
+            "account_before": {},
+            "account_after": {},
+        }
+
+        with patch.dict("os.environ", {"US_MARKET_REPORT_URL": "http://127.0.0.1:8081"}, clear=False):
+            message = us_market_auto_run.telegram_message(payload)
+
+        self.assertIn("2026-06-05 22:45 UTC+09:00", message)
+        self.assertIn("http://ww.tailea9a3f.ts.net:8081/automation", message)
+        self.assertNotIn("0945_ET", message)
+
+    def test_session_telegram_message_uses_kst_update_time(self):
+        summary = {
+            "session_date": "20260608",
+            "updated_at": "2026-06-09T04:46:12+09:00",
+            "run_count": 7,
+            "cumulative_buy_notional": 1788.9,
+            "remaining_loss_budget": 481.65,
+            "totals": {"submitted": 2, "filled": 2, "failed": 0, "errors": 28},
+        }
+
+        with patch.dict("os.environ", {}, clear=True):
+            message = us_market_auto_run.session_telegram_message(summary)
+
+        self.assertIn("Updated 2026-06-09 04:46 UTC+09:00", message)
+        self.assertIn("http://ww.tailea9a3f.ts.net:8081/automation", message)
+
     def test_cleanup_removes_only_old_detail_reports(self):
         with tempfile.TemporaryDirectory() as tempdir, patch.object(
             us_market_auto_run,

@@ -151,9 +151,13 @@ export {
 
 // Automation
 export {
+  getAutomationSessions,
+  getAutomationSession,
+  getAutomationRun,
   getUsAutomationSessions,
   getUsAutomationSession,
   getUsAutomationRun,
+  type AutomationMarket,
   type AutomationRunSummary,
   type AutomationSession,
   type AutomationRunDetail,
