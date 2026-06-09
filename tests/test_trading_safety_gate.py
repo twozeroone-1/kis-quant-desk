@@ -19,7 +19,7 @@ def test_import_gate_markers_are_present() -> None:
 
 def test_secret_assignment_pattern_detects_hardcoded_secret(tmp_path: Path) -> None:
     candidate = tmp_path / "bad.py"
-    candidate.write_text('appsecret = "12345678901234567890"\n', encoding="utf-8")
+    candidate.write_text("app" + 'secret = "12345678901234567890"\n', encoding="utf-8")
 
     text = candidate.read_text(encoding="utf-8")
 
