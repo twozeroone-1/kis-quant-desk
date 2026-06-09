@@ -59,6 +59,24 @@ export interface AutomationRunDetail {
   report_only: boolean;
   started_at: string;
   duration_seconds: number;
+  market_risk?: Record<string, unknown>;
+  strategy_orchestration?: {
+    regime?: string;
+    enabled_count?: number;
+    risk_gate_open?: boolean;
+    warnings?: string[];
+    target_strategy_count?: { min?: number; max?: number };
+    enabled?: Array<Record<string, unknown>>;
+    disabled?: Array<Record<string, unknown>>;
+  };
+  strategy_run?: {
+    successful_strategy_count?: number;
+    failed_strategy_count?: number;
+    raw_result_count?: number;
+    errors?: string[];
+    runs?: Array<Record<string, unknown>>;
+  };
+  order_decisions?: Array<Record<string, unknown>>;
   signals: Array<Record<string, unknown>>;
   orders: Array<Record<string, unknown>>;
   submitted_sells: Array<Record<string, unknown>>;

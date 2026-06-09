@@ -13,13 +13,13 @@ import argparse
 import asyncio
 import importlib.util
 import json
-import math
 import os
 import re
 import sys
 import tempfile
 import time
-from datetime import datetime, time as dt_time, timedelta
+from datetime import datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
@@ -27,9 +27,13 @@ from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 import requests
-
 from market_candidate_selector import select_us_candidates
-
+from organic_strategy_router import (
+    execute_strategy_pool,
+    explain_order_decisions,
+    merge_us_anchor_signals,
+    select_strategy_candidates,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_BUILDER = PROJECT_ROOT / "strategy_builder"
@@ -98,6 +102,16 @@ US_SECTOR_BY_SYMBOL = {
 }
 
 
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+US_ORGANIC_STRATEGY_MAX_SYMBOLS = env_int("US_MARKET_ORGANIC_MAX_SYMBOLS", 3)
+
+
 def normalize_llm_mode(mode: str | None) -> tuple[str, list[str]]:
     raw = (mode or "off").strip().lower()
     if raw in {"", "off"}:
@@ -122,12 +136,31 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
+def strategy_api_base() -> str:
+    return (
+        os.environ.get("KIS_VPS_STRATEGY_API")
+        or os.environ.get("KIS_STRATEGY_API")
+        or "http://127.0.0.1:8081"
+    ).rstrip("/")
+
+
+def strategy_api(method: str, path: str, **kwargs) -> dict[str, Any]:
+    response = requests.request(method, f"{strategy_api_base()}{path}", timeout=90, **kwargs)
+    response.raise_for_status()
+    data = response.json()
+    return data if isinstance(data, dict) else {"status": "error", "message": "non-object API response"}
+
+
 def load_modules():
     sys.path.insert(0, str(STRATEGY_BUILDER))
     import kis_auth as ka
-    from core import indicators, overseas_data_fetcher
     from backend.services.app_reservations import create_app_reservation, list_app_reservations
-    from backend.services.protective_orders import list_protective_orders, upsert_existing_position_protection
+    from backend.services.protective_orders import (
+        list_protective_orders,
+        run_monitor_cycle,
+        upsert_existing_position_protection,
+    )
+    from core import indicators, overseas_data_fetcher
 
     return (
         ka,
@@ -137,6 +170,7 @@ def load_modules():
         upsert_existing_position_protection,
         list_protective_orders,
         list_app_reservations,
+        run_monitor_cycle,
     )
 
 
@@ -724,6 +758,7 @@ async def account_status(
     odf,
     list_protective_orders,
     list_app_reservations=None,
+    run_protective_monitor_cycle=None,
 ) -> dict[str, Any]:
     equity_snapshot = account_equity_snapshot(odf)
     pending = list_pending_by_exchange(odf)
@@ -746,6 +781,18 @@ async def account_status(
         except Exception as exc:
             app_reservations = {"status": "error", "orders": [], "total_count": 0, "errors": [str(exc)]}
     protective = compact_protective_payload(await list_protective_orders())
+    health = protective.get("health") if isinstance(protective, dict) else {}
+    if (
+        callable(run_protective_monitor_cycle)
+        and isinstance(health, dict)
+        and (health.get("stale") or health.get("status") == "stale")
+    ):
+        try:
+            await run_protective_monitor_cycle()
+            protective = compact_protective_payload(await list_protective_orders())
+        except Exception as exc:
+            health = protective.setdefault("health", {})
+            health["refresh_error"] = str(exc)
     return {
         **equity_snapshot,
         "pending": pending,
@@ -1161,11 +1208,11 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         f"- Regime: {payload.get('market_risk', {}).get('regime', payload['news_summary']['regime'])}",
         f"- LLM mode: {payload.get('llm_mode', 'off')}",
         f"- Effective LLM mode: {payload.get('effective_llm_mode', payload.get('llm_mode', 'off'))}",
-        f"- Order mode: vps only",
+        "- Order mode: vps only",
         f"- Equity: ${payload['account']['equity']:,.2f}",
         f"- Cash: ${payload['account']['cash']:,.2f}",
         f"- Risk equity source: {', '.join(payload.get('account_before', {}).get('risk_equity_sources', [])) or '-'}",
-        f"- Protective orders are app-level monitoring, not KIS server OCO; backend/auth/network health matters.",
+        "- Protective orders are app-level monitoring, not KIS server OCO; backend/auth/network health matters.",
     ]
     if payload.get("llm_warnings"):
         lines.extend(["", "## LLM Warnings"])
@@ -1189,6 +1236,54 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
             f"- Sector exposure: {portfolio_risk.get('sector_exposure_pct', {})}",
             f"- Total exposure gate open: {portfolio_risk.get('total_exposure_gate_open', False)}",
         ])
+    strategy_orchestration = payload.get("strategy_orchestration") or {}
+    if strategy_orchestration:
+        enabled = strategy_orchestration.get("enabled") or []
+        disabled = strategy_orchestration.get("disabled") or []
+        lines.extend([
+            "",
+            "## Strategy Orchestration",
+            f"- Regime: {strategy_orchestration.get('regime', '-')}",
+            f"- Enabled strategies: {len(enabled)}",
+            f"- Target count: {strategy_orchestration.get('target_strategy_count', {}).get('min', 3)}"
+            f"-{strategy_orchestration.get('target_strategy_count', {}).get('max', 5)}",
+            f"- Symbol limit: {strategy_orchestration.get('symbol_limit', '-')}",
+            f"- Symbols: {', '.join(strategy_orchestration.get('symbols') or []) or '-'}",
+            f"- Risk gate open: {strategy_orchestration.get('risk_gate_open', True)}",
+            f"- Warnings: {'; '.join(strategy_orchestration.get('warnings') or []) or '-'}",
+            "",
+            "| Strategy | Family | Weight | Reason |",
+            "|---|---|---:|---|",
+        ])
+        for item in enabled:
+            lines.append(
+                f"| {item.get('name', item.get('id'))} ({item.get('id')}) | "
+                f"{item.get('family', '-')} | {float(item.get('weight') or 0):.2f} | "
+                f"{item.get('reason', '-')} |"
+            )
+        if disabled:
+            lines.extend(["", "### Disabled Strategy Candidates", "| Strategy | Reason |", "|---|---|"])
+            for item in disabled:
+                lines.append(f"| {item.get('name', item.get('id'))} ({item.get('id')}) | {item.get('reason', '-')} |")
+
+    strategy_run = payload.get("strategy_run") or {}
+    if strategy_run:
+        lines.extend([
+            "",
+            "## Strategy Run Results",
+            f"- Successful: {strategy_run.get('successful_strategy_count', 0)}",
+            f"- Failed: {strategy_run.get('failed_strategy_count', 0)}",
+            f"- Raw signal rows: {strategy_run.get('raw_result_count', 0)}",
+            f"- Errors: {'; '.join(strategy_run.get('errors') or []) or '-'}",
+            "",
+            "| Strategy | Status | Results | Message |",
+            "|---|---|---:|---|",
+        ])
+        for item in strategy_run.get("runs") or []:
+            lines.append(
+                f"| {item.get('strategy_id')} | {item.get('status')} | "
+                f"{int(item.get('result_count') or 0)} | {item.get('message') or '-'} |"
+            )
     lines.extend(["", "## Headlines"])
     for item in payload["headlines"][:10]:
         lines.append(f"- {item['title']} ({item['source']})")
@@ -1202,6 +1297,7 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
             f"- Fallback used: {candidate_selection.get('fallback_used', False)}",
             f"- Generated at: {candidate_selection.get('generated_at', '-')}",
             f"- Errors: {'; '.join(candidate_selection.get('errors') or []) or '-'}",
+            f"- Warnings: {'; '.join(candidate_selection.get('warnings') or []) or '-'}",
             "",
             "| Symbol | Exchange | Category | Score | Sources | Reasons |",
             "|---|---|---|---:|---|---|",
@@ -1234,6 +1330,21 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
             lines.append(
                 f"| {signal['symbol']} | {signal.get('exchange', '')} | {signal['action']} | "
                 f"{signal.get('strength', 0):.2f} | ${float(signal.get('price') or 0):.2f} | {signal.get('reason', '')} |"
+            )
+
+    order_decisions = payload.get("order_decisions") or []
+    if order_decisions:
+        lines.extend([
+            "",
+            "## Order Gate Decisions",
+            "| Symbol | Action | Strength | Status | Reasons |",
+            "|---|---:|---:|---|---|",
+        ])
+        for item in order_decisions:
+            lines.append(
+                f"| {item.get('name', item.get('code'))}({item.get('code')}) | {item.get('action')} | "
+                f"{float(item.get('strength') or 0):.2f} | {item.get('status')} | "
+                f"{'; '.join(item.get('reasons') or []) or '-'} |"
             )
 
     lines.extend([
@@ -1324,6 +1435,11 @@ def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
         for item in payload.get("candidate_selection", {}).get("errors", [])
         if item
     )
+    errors.extend(
+        f"strategy_run: {item}"
+        for item in payload.get("strategy_run", {}).get("errors", [])
+        if item
+    )
     for signal in payload.get("signals", []):
         if signal.get("action") == "ERROR" and signal.get("reason"):
             errors.append(f"{signal.get('symbol')}: {signal.get('reason')}")
@@ -1337,6 +1453,8 @@ def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
         for item in payload.get("account_after", {}).get(section, {}).get("errors", []):
             errors.append(f"{section}: {item}")
     protective_health = payload.get("account_after", {}).get("protective", {}).get("health", {})
+    if protective_health.get("refresh_error"):
+        errors.append(f"protective monitor refresh: {protective_health.get('refresh_error')}")
     if protective_health.get("status") in {"degraded", "stale"}:
         errors.append(
             "protective monitor: "
@@ -1673,6 +1791,20 @@ async def main() -> int:
             "account": {"equity": 0.0, "cash": 0.0, "holdings": []},
             "account_before": {},
             "account_after": {},
+            "strategy_orchestration": select_strategy_candidates(
+                market="us",
+                regime="market_closed",
+                risk_gate_open=False,
+            ),
+            "strategy_run": {
+                "runs": [],
+                "raw_result_count": 0,
+                "successful_strategy_count": 0,
+                "failed_strategy_count": 0,
+                "errors": [],
+                "merged_signals": [],
+            },
+            "order_decisions": [],
             "candidate_selection": {
                 "mode": os.environ.get("US_MARKET_CANDIDATE_MODE", "dynamic"),
                 "selected": [],
@@ -1753,6 +1885,7 @@ async def main() -> int:
             upsert_protection,
             list_protective_orders,
             list_app_reservations,
+            run_monitor_cycle,
         ) = load_modules()
         ka.auth(svr="vps")
 
@@ -1762,6 +1895,7 @@ async def main() -> int:
             odf,
             list_protective_orders,
             list_app_reservations,
+            run_monitor_cycle,
         )
         account_before = apply_session_risk_baseline(account_before, state)
         save_today_state(state_path, state)
@@ -1812,6 +1946,42 @@ async def main() -> int:
                 })
 
         market_risk = evaluate_market_risk(signals, news_summary)
+        organic_symbols = [
+            str(candidate.get("symbol") or candidate.get("code") or "").upper()
+            for candidate in candidate_selection.get("selected", [])[:US_ORGANIC_STRATEGY_MAX_SYMBOLS]
+        ]
+        organic_symbols = [symbol for symbol in organic_symbols if symbol]
+        symbol_meta = {
+            str(candidate.get("symbol") or candidate.get("code") or "").upper(): {
+                "exchange": str(candidate.get("exchange") or "NASD"),
+                "name": candidate.get("name") or candidate.get("symbol") or candidate.get("code"),
+            }
+            for candidate in candidate_selection.get("selected", [])
+            if candidate.get("symbol") or candidate.get("code")
+        }
+        strategy_orchestration = select_strategy_candidates(
+            market="us",
+            regime=str(market_risk.get("regime") or news_summary.get("regime") or "broad_momentum"),
+            risk_gate_open=bool(market_risk.get("risk_gate_open")),
+        )
+        strategy_orchestration["symbol_limit"] = US_ORGANIC_STRATEGY_MAX_SYMBOLS
+        strategy_orchestration["symbols"] = organic_symbols
+        strategy_run = execute_strategy_pool(
+            strategy_api,
+            organic_symbols,
+            strategy_orchestration,
+            market="us",
+            symbol_meta={symbol: symbol_meta.get(symbol, {}) for symbol in organic_symbols},
+        ) if organic_symbols else {
+            "orchestration": strategy_orchestration,
+            "runs": [],
+            "raw_result_count": 0,
+            "successful_strategy_count": 0,
+            "failed_strategy_count": 0,
+            "errors": [],
+            "merged_signals": [],
+        }
+        signals = merge_us_anchor_signals(signals, strategy_run.get("merged_signals") or [])
         portfolio_risk = portfolio_risk_snapshot(holdings, equity)
         combined_risk_gate_open = bool(
             account_before.get("risk_gate_open")
@@ -1834,6 +2004,21 @@ async def main() -> int:
             market_regime=str(market_risk.get("regime") or "risk_control"),
             risk_gate_open=combined_risk_gate_open,
         )
+        risk_reasons = []
+        if account_before.get("risk_gate_reason"):
+            risk_reasons.append(str(account_before.get("risk_gate_reason")))
+        risk_reasons.extend(str(item) for item in market_risk.get("reasons") or [])
+        if not portfolio_risk.get("total_exposure_gate_open"):
+            risk_reasons.append("total holdings exposure limit reached")
+        order_decisions = explain_order_decisions(
+            signals,
+            planned_orders,
+            min_buy_strength=MIN_BUY_STRENGTH,
+            risk_gate_open=combined_risk_gate_open,
+            risk_reasons=risk_reasons,
+            order_execution_enabled=not args.report_only,
+            order_block_reasons=["report-only mode"] if args.report_only else [],
+        )
         payload.update({
             "headlines": headlines,
             "news_summary": news_summary,
@@ -1842,9 +2027,12 @@ async def main() -> int:
             "account": {"equity": equity, "cash": cash, "holdings": holdings},
             "account_before": account_before,
             "candidate_selection": candidate_selection,
+            "strategy_orchestration": strategy_orchestration,
+            "strategy_run": {key: value for key, value in strategy_run.items() if key != "merged_signals"},
             "signals": signals,
             "submitted_sells": submitted_sells,
             "planned_buys": planned_orders,
+            "order_decisions": order_decisions,
             "duplicate_guards": {
                 "held_symbols": sorted(held_symbols),
                 "pending_buy_symbols": sorted(pending_buy_symbols),
@@ -1875,6 +2063,7 @@ async def main() -> int:
             odf,
             list_protective_orders,
             list_app_reservations,
+            run_monitor_cycle,
         )
         eligible_protection_symbols = (
             held_symbols
@@ -1894,6 +2083,7 @@ async def main() -> int:
                 odf,
                 list_protective_orders,
                 list_app_reservations,
+                run_monitor_cycle,
             )
         planned_display = annotate_llm_decisions(
             planned_orders,

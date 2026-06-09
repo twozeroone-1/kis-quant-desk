@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,7 @@ MAX_MONITOR_INTERVAL_SECONDS = 300
 REALTIME_FRESH_SECONDS = 30
 POSITION_MISSING_CONFIRMATIONS = 3
 EXIT_SUBMIT_RETRY_SECONDS = 60
+EXIT_SUBMIT_INFLIGHT_TTL_SECONDS = 30
 US_PAPER_LOCAL_RESERVATION_RETRY_SECONDS = 60
 EXIT_PENDING_REPRICE_SECONDS = 60
 US_STOP_LOSS_MARKETABLE_LIMIT_BUFFER_PCT = 2.0
@@ -73,6 +75,7 @@ PROTECTIVE_ALERT_COOLDOWN_SECONDS = int(
 )
 US_PAPER_RATE_LIMIT_BASE_SECONDS = 1
 US_PAPER_RATE_LIMIT_MAX_SECONDS = 60
+US_PAPER_UNSUPPORTED_RETRY_SECONDS = 15 * 60
 US_PAPER_DIRECT_SELL_UNSUPPORTED_PATH = "us_paper_direct_sell"
 US_PAPER_LOCAL_RESERVATION_MARKERS = (
     "90000000",
@@ -86,6 +89,8 @@ US_PAPER_LOCAL_RESERVATION_RETRY_STATUS = "waiting_retry"
 
 _monitor_task: Optional[asyncio.Task] = None
 _state_lock = asyncio.Lock()
+_exit_submit_inflight_lock = threading.Lock()
+_exit_submit_inflight_until: dict[str, float] = {}
 
 
 def _now() -> str:
@@ -265,6 +270,8 @@ def _apply_us_paper_submit_error_policy(order: dict[str, Any], error: Optional[s
     if _is_us_paper_rate_limit_error(error):
         delay = _rate_limit_retry_seconds(order["retry_count"])
         next_retry = datetime.now() + timedelta(seconds=delay)
+    elif _is_us_paper_direct_sell_unsupported(error):
+        next_retry = datetime.now() + timedelta(seconds=US_PAPER_UNSUPPORTED_RETRY_SECONDS)
     elif _is_us_paper_reservation_time_error(error):
         next_retry = _next_us_paper_reservation_retry_at()
     else:
@@ -506,7 +513,7 @@ def _next_us_regular_session_retry_at(now: Optional[datetime] = None) -> datetim
         opened = pd.Timestamp(US_EXCHANGE_CALENDAR.session_open(session_label)).to_pydatetime()
         closed = pd.Timestamp(US_EXCHANGE_CALENDAR.session_close(session_label)).to_pydatetime()
         if opened <= current_utc <= closed:
-            return current.replace(tzinfo=None)
+            return current_utc.replace(tzinfo=None)
         if current_utc < opened:
             target = opened
         else:
@@ -519,7 +526,7 @@ def _next_us_regular_session_retry_at(now: Optional[datetime] = None) -> datetim
         next_session = US_EXCHANGE_CALENDAR.date_to_session(session_label, direction="next")
         target = pd.Timestamp(US_EXCHANGE_CALENDAR.session_open(next_session)).to_pydatetime()
 
-    return target.astimezone(ZoneInfo("Asia/Seoul")).replace(tzinfo=None)
+    return target.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
 
 def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
@@ -529,7 +536,18 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
     app_reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
     retry_at = _parse_time(order.get("next_retry_at"))
     if retry_at:
-        return datetime.now() >= retry_at
+        now = datetime.now()
+        if now >= retry_at:
+            return True
+        if _is_us_paper_order(order) and app_reservation.get("status") == "waiting_retry":
+            if retry_at - now > timedelta(hours=6):
+                legacy_kst_retry_at = retry_at.replace(tzinfo=ZoneInfo("Asia/Seoul")).astimezone(
+                    ZoneInfo("UTC")
+                ).replace(tzinfo=None)
+                if now >= legacy_kst_retry_at:
+                    _set_next_retry_at(order, legacy_kst_retry_at)
+                    return True
+        return False
     value = order.get("exit_submit_failed_at")
     if not value:
         return True
@@ -549,6 +567,19 @@ def _exit_submit_retry_due(order: dict[str, Any]) -> bool:
         ):
             retry_seconds = US_PAPER_LOCAL_RESERVATION_RETRY_SECONDS
     return datetime.now() - failed_at >= timedelta(seconds=retry_seconds)
+
+
+def _claim_exit_submit_attempt(order: dict[str, Any]) -> bool:
+    if not _exit_submit_retry_due(order):
+        return False
+    key = str(order.get("id") or f"{order.get('env_dv')}:{order.get('market')}:{order.get('stock_code')}")
+    now = time.monotonic()
+    with _exit_submit_inflight_lock:
+        until = float(_exit_submit_inflight_until.get(key) or 0)
+        if until > now:
+            return False
+        _exit_submit_inflight_until[key] = now + EXIT_SUBMIT_INFLIGHT_TTL_SECONDS
+        return True
 
 
 def _should_create_local_us_paper_reservation(env_dv: str, market: str, error: Optional[str]) -> bool:
@@ -646,6 +677,8 @@ def _retry_local_exit_reservation(order: dict[str, Any], env_dv: str, current_pr
     reservation = order.get("app_exit_reservation") if isinstance(order.get("app_exit_reservation"), dict) else {}
     if reservation.get("status") != US_PAPER_LOCAL_RESERVATION_RETRY_STATUS:
         return None
+    if not _claim_exit_submit_attempt(order):
+        return order
     exit_reason = str(reservation.get("exit_reason") or order.get("app_exit_reason") or "stop_loss")
     order_type = str(reservation.get("order_type") or order.get("stop_loss_order_type") or "limit")
     if order_type not in {"market", "limit"}:

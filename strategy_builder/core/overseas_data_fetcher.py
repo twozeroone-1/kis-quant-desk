@@ -7,12 +7,11 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 from zoneinfo import ZoneInfo
 
-import pandas as pd
-
 import kis_auth as ka
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -42,26 +41,14 @@ _BALANCE_CACHE_TTL = 10
 US_DAYTIME_START = (10, 0)
 US_DAYTIME_END = (18, 0)
 US_EXCHANGES = {"NASD", "NYSE", "AMEX"}
-RANKING_CURRENCY_BY_PRICE_EXCHANGE = {
-    "NAS": "USD",
-    "NYS": "USD",
-    "AMS": "USD",
-    "HKS": "HKD",
-    "SHS": "CNY",
-    "SZS": "CNY",
-    "TSE": "JPY",
-    "HSX": "VND",
-    "HNX": "VND",
-}
-
-
+MARKET_CAP_CURRENCY_DIVISION = "1"
 @dataclass(frozen=True)
 class ExchangeResolution:
     symbol: str
     exchange: str
     price_exchange: str
     name: str
-    warning: Optional[str] = None
+    warning: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         data = {
@@ -79,10 +66,10 @@ class ExchangeResolution:
 class OverseasOrderResult:
     dataframe: pd.DataFrame
     success: bool
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-    api_url: Optional[str] = None
-    tr_id: Optional[str] = None
+    error_code: str | None = None
+    error_message: str | None = None
+    api_url: str | None = None
+    tr_id: str | None = None
 
     def display_error(self) -> str:
         parts = [part for part in (self.error_code, self.error_message) if part]
@@ -93,10 +80,10 @@ class OverseasOrderResult:
 class OverseasRankingResult:
     dataframe: pd.DataFrame
     success: bool
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-    api_url: Optional[str] = None
-    tr_id: Optional[str] = None
+    error_code: str | None = None
+    error_message: str | None = None
+    api_url: str | None = None
+    tr_id: str | None = None
 
     def display_error(self) -> str:
         parts = [part for part in (self.error_code, self.error_message) if part]
@@ -111,7 +98,7 @@ def normalize_env(env_dv: str = "real") -> str:
     return "real" if env_dv in ("real", "prod") else "demo"
 
 
-def is_us_daytime_session(now: Optional[datetime] = None) -> bool:
+def is_us_daytime_session(now: datetime | None = None) -> bool:
     """Return True during KIS US daytime trading hours in Korea time."""
     korea_now = now.astimezone(ZoneInfo("Asia/Seoul")) if now else datetime.now(ZoneInfo("Asia/Seoul"))
     if korea_now.weekday() >= 5:
@@ -193,7 +180,7 @@ def _frame_from_output(value: Any) -> pd.DataFrame:
     return pd.DataFrame([value])
 
 
-def _response_error(res: Any, fallback: str) -> tuple[Optional[str], str]:
+def _response_error(res: Any, fallback: str) -> tuple[str | None, str]:
     code = None
     message = fallback
     try:
@@ -207,21 +194,21 @@ def _response_error(res: Any, fallback: str) -> tuple[Optional[str], str]:
     return code, message
 
 
-def _trading_exchange(exchange: Optional[str]) -> Optional[str]:
+def _trading_exchange(exchange: str | None) -> str | None:
     if not exchange:
         return None
     code = exchange.upper()
     return TRADING_EXCHANGE_BY_PRICE.get(code, code)
 
 
-def _price_exchange(exchange: Optional[str]) -> Optional[str]:
+def _price_exchange(exchange: str | None) -> str | None:
     if not exchange:
         return None
     code = exchange.upper()
     return PRICE_EXCHANGE_BY_TRADING.get(code, code)
 
 
-def resolve_exchange(symbol: str, exchange: Optional[str] = None) -> ExchangeResolution:
+def resolve_exchange(symbol: str, exchange: str | None = None) -> ExchangeResolution:
     """Resolve a US symbol to KIS trading and quotation exchange codes."""
     normalized = symbol.strip().upper()
     explicit_exchange = _trading_exchange(exchange)
@@ -288,7 +275,7 @@ def resolve_exchange(symbol: str, exchange: Optional[str] = None) -> ExchangeRes
     return resolution
 
 
-def get_current_price(symbol: str, env_dv: str = "real", exchange: Optional[str] = None) -> dict[str, Any]:
+def get_current_price(symbol: str, env_dv: str = "real", exchange: str | None = None) -> dict[str, Any]:
     if not _assert_trenv_ready(f"해외 현재가 조회 {symbol}"):
         return {}
     resolution = resolve_exchange(symbol, exchange)
@@ -341,7 +328,7 @@ def get_daily_prices(
     symbol: str,
     days: int = 100,
     env_dv: str = "real",
-    exchange: Optional[str] = None,
+    exchange: str | None = None,
 ) -> pd.DataFrame:
     if not _assert_trenv_ready(f"해외 일봉 조회 {symbol}"):
         return pd.DataFrame()
@@ -462,20 +449,16 @@ def get_overseas_market_cap_rank(
     max_depth: int = 1,
 ) -> OverseasRankingResult:
     price_exchange = _price_exchange(exchange) or exchange
-    currency = (
-        curr_gb
-        if curr_gb is not None
-        else RANKING_CURRENCY_BY_PRICE_EXCHANGE.get(price_exchange, "")
-    )
+    params = {
+        "VOL_RANG": vol_rang,
+        "CURR_GB": curr_gb if curr_gb is not None else MARKET_CAP_CURRENCY_DIVISION,
+        "AUTH": "",
+    }
     return _fetch_overseas_ranking(
         api_url="/uapi/overseas-stock/v1/ranking/market-cap",
         tr_id="HHDFS76350100",
         exchange=price_exchange,
-        params={
-            "VOL_RANG": vol_rang,
-            "CURR_GB": currency,
-            "AUTH": "",
-        },
+        params=params,
         max_depth=max_depth,
     )
 
@@ -512,7 +495,7 @@ def get_overseas_volume_surge_rank(
     )
 
 
-def _fetch_balance_raw(env_dv: str = "real") -> Optional[dict[str, Any]]:
+def _fetch_balance_raw(env_dv: str = "real") -> dict[str, Any] | None:
     if not _assert_trenv_ready("해외 잔고 조회"):
         return None
     trenv = ka.getTREnv()
@@ -541,7 +524,7 @@ def _fetch_balance_raw(env_dv: str = "real") -> Optional[dict[str, Any]]:
     }
 
 
-def _fetch_present_balance_raw(env_dv: str = "real", currency_division: str = "02") -> Optional[dict[str, Any]]:
+def _fetch_present_balance_raw(env_dv: str = "real", currency_division: str = "02") -> dict[str, Any] | None:
     if not _assert_trenv_ready("해외 체결기준현재잔고 조회"):
         return None
     trenv = ka.getTREnv()
@@ -573,7 +556,7 @@ def _fetch_present_balance_raw(env_dv: str = "real", currency_division: str = "0
     }
 
 
-def _get_balance_cached(env_dv: str = "real") -> Optional[dict[str, Any]]:
+def _get_balance_cached(env_dv: str = "real") -> dict[str, Any] | None:
     global _balance_cache
     mode = normalize_env(env_dv)
     with _balance_cache_lock:
@@ -590,7 +573,7 @@ def _get_balance_cached(env_dv: str = "real") -> Optional[dict[str, Any]]:
     return data
 
 
-def _get_present_balance_cached(env_dv: str = "real") -> Optional[dict[str, Any]]:
+def _get_present_balance_cached(env_dv: str = "real") -> dict[str, Any] | None:
     global _present_balance_cache
     mode = normalize_env(env_dv)
     with _present_balance_cache_lock:
@@ -714,7 +697,7 @@ def get_buyable_amount(
     symbol: str,
     price: float,
     env_dv: str = "real",
-    exchange: Optional[str] = None,
+    exchange: str | None = None,
 ) -> dict[str, Any]:
     if not _assert_trenv_ready(f"해외 매수가능 조회 {symbol}"):
         return {"amount": 0, "quantity": 0}
@@ -757,7 +740,7 @@ def submit_order(
     quantity: int,
     price: float,
     env_dv: str = "real",
-    exchange: Optional[str] = None,
+    exchange: str | None = None,
 ) -> OverseasOrderResult:
     if not _assert_trenv_ready(f"해외 주문 {symbol}"):
         return OverseasOrderResult(
@@ -778,9 +761,12 @@ def submit_order(
         tr_id = "TTTS6036U" if is_buy else "TTTS6037U"
     else:
         api_url = "/uapi/overseas-stock/v1/trading/order"
-        tr_id = "TTTT1002U" if is_buy else "TTTT1006U"
         if mode == "demo":
-            tr_id = "V" + tr_id[1:]
+            # KIS mock US sell is not the real TR ID with a V prefix.
+            # Repo KIS samples document VTTT1002U for buy and VTTT1001U for sell.
+            tr_id = "VTTT1002U" if is_buy else "VTTT1001U"
+        else:
+            tr_id = "TTTT1002U" if is_buy else "TTTT1006U"
 
     params = {
         "CANO": trenv.my_acct,
@@ -842,7 +828,7 @@ def execute_order(
     quantity: int,
     price: float,
     env_dv: str = "real",
-    exchange: Optional[str] = None,
+    exchange: str | None = None,
 ) -> pd.DataFrame:
     return submit_order(
         symbol=symbol,
@@ -915,7 +901,7 @@ def cancel_order(
     symbol: str,
     qty: int,
     env_dv: str = "real",
-    exchange: Optional[str] = None,
+    exchange: str | None = None,
 ) -> dict[str, Any]:
     if not _assert_trenv_ready(f"해외 주문 취소 {symbol}"):
         return {"success": False, "order_no": order_no, "message": "인증이 필요합니다"}

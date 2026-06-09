@@ -78,6 +78,12 @@ function orderSymbol(item: Record<string, unknown>) {
   return String(item.symbol ?? item.code ?? item.stock_code ?? "-");
 }
 
+function textList(value: unknown) {
+  if (!Array.isArray(value)) return "-";
+  const items = value.map((item) => String(item)).filter(Boolean);
+  return items.length ? items.join("; ") : "-";
+}
+
 export default function AutomationPage() {
   const { status } = useAuth();
   const [market, setMarket] = useState<AutomationMarket>("us");
@@ -307,6 +313,82 @@ export default function AutomationPage() {
                   {run.duration_seconds.toFixed(1)}초 · {selectedRunSummary?.errors.length ?? 0} errors
                 </span>
               </div>
+
+              {(run.strategy_orchestration || run.strategy_run || run.order_decisions?.length) && (
+                <div className="grid lg:grid-cols-2 gap-6">
+                  <div>
+                    <h4 className="text-sm font-semibold mb-2">전략 오케스트레이션</h4>
+                    <div className="border border-slate-200 dark:border-slate-800 rounded-md overflow-hidden">
+                      <div className="grid grid-cols-2 gap-px bg-slate-200 dark:bg-slate-800 text-sm">
+                        {[
+                          ["레짐", String(run.strategy_orchestration?.regime ?? run.market_risk?.regime ?? "-")],
+                          ["전략 수", `${run.strategy_orchestration?.enabled_count ?? run.strategy_orchestration?.enabled?.length ?? 0}`],
+                          ["성공/실패", `${run.strategy_run?.successful_strategy_count ?? 0}/${run.strategy_run?.failed_strategy_count ?? 0}`],
+                          ["Risk gate", String(run.strategy_orchestration?.risk_gate_open ?? run.market_risk?.risk_gate_open ?? "-")],
+                        ].map(([label, value]) => (
+                          <div key={label} className="bg-white dark:bg-slate-950 p-3 min-w-0">
+                            <span className="block text-caption text-slate-500">{label}</span>
+                            <strong className="block mt-1 break-words">{value}</strong>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full min-w-[520px] text-sm">
+                          <thead className="bg-slate-100 dark:bg-slate-800">
+                            <tr>
+                              <th className="text-left px-3 py-2">전략</th>
+                              <th className="text-left px-3 py-2">계열</th>
+                              <th className="text-right px-3 py-2">가중치</th>
+                              <th className="text-left px-3 py-2">이유</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                            {(run.strategy_orchestration?.enabled ?? []).map((item, index) => (
+                              <tr key={`${String(item.id ?? index)}-${index}`}>
+                                <td className="px-3 py-2">{String(item.name ?? item.id ?? "-")}</td>
+                                <td className="px-3 py-2">{String(item.family ?? "-")}</td>
+                                <td className="px-3 py-2 text-right tabular-nums">{Number(item.weight ?? 0).toFixed(2)}</td>
+                                <td className="px-3 py-2 break-words">{String(item.reason ?? "-")}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <h4 className="text-sm font-semibold mb-2">주문 게이트</h4>
+                    <div className="border border-slate-200 dark:border-slate-800 rounded-md overflow-x-auto">
+                      <table className="w-full min-w-[520px] text-sm">
+                        <thead className="bg-slate-100 dark:bg-slate-800">
+                          <tr>
+                            <th className="text-left px-3 py-2">종목</th>
+                            <th className="text-left px-3 py-2">신호</th>
+                            <th className="text-right px-3 py-2">강도</th>
+                            <th className="text-left px-3 py-2">상태</th>
+                            <th className="text-left px-3 py-2">이유</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                          {(run.order_decisions ?? []).map((item, index) => (
+                            <tr key={`${orderSymbol(item)}-${index}`}>
+                              <td className="px-3 py-2">{String(item.name ?? orderSymbol(item))}</td>
+                              <td className="px-3 py-2">{String(item.action ?? "-")}</td>
+                              <td className="px-3 py-2 text-right tabular-nums">{Number(item.strength ?? 0).toFixed(2)}</td>
+                              <td className="px-3 py-2">{String(item.status ?? "-")}</td>
+                              <td className="px-3 py-2 break-words">{textList(item.reasons)}</td>
+                            </tr>
+                          ))}
+                          {!run.order_decisions?.length && (
+                            <tr><td colSpan={5} className="px-3 py-5 text-center text-slate-500">주문 게이트 기록 없음</td></tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <div className="grid lg:grid-cols-2 gap-6">
                 <div>

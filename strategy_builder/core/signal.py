@@ -7,10 +7,13 @@ Applied Skills: skills/investment-strategy-framework.md
 - 시그널 강도 기준
 """
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+
+DOMESTIC_CODE_PATTERN = re.compile(r"^\d{6}$")
+US_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9.-]{0,9}$")
 
 
 class Action(Enum):
@@ -48,16 +51,17 @@ class Signal:
     strength: float
     reason: str
     timestamp: datetime = field(default_factory=datetime.now)
-    target_price: Optional[int] = None
-    quantity: Optional[int] = None
+    target_price: int | None = None
+    quantity: int | None = None
 
     def __post_init__(self):
         """생성 시 유효성 검증"""
         if not 0.0 <= self.strength <= 1.0:
             raise ValueError(f"strength must be between 0.0 and 1.0, got {self.strength}")
 
-        if len(self.stock_code) != 6:
-            raise ValueError(f"stock_code must be 6 digits, got {self.stock_code}")
+        code = str(self.stock_code or "").upper()
+        if not (DOMESTIC_CODE_PATTERN.fullmatch(code) or US_SYMBOL_PATTERN.fullmatch(code)):
+            raise ValueError(f"stock_code must be 6 digits or a valid US symbol, got {self.stock_code}")
 
     def is_strong(self) -> bool:
         """강한 시그널 여부 (시장가 주문 대상)"""
@@ -74,4 +78,3 @@ class Signal:
             f"strength={self.strength:.2f} "
             f"reason='{self.reason}')"
         )
-

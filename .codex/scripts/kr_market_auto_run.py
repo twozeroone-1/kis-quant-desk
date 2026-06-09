@@ -21,11 +21,14 @@ from typing import Any
 from urllib.parse import quote_plus
 from xml.etree import ElementTree
 
-import requests
-
-from market_candidate_selector import select_kr_candidates
 import prod_telegram_approval
-
+import requests
+from market_candidate_selector import select_kr_candidates
+from organic_strategy_router import (
+    execute_strategy_pool,
+    explain_order_decisions,
+    select_strategy_candidates,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = PROJECT_ROOT / ".codex" / "runtime" / "kr_market_auto"
@@ -72,6 +75,8 @@ TAKE_PROFIT_PCT = 0.06
 MIN_BUY_STRENGTH = 0.70
 MAX_NEW_BUY_SYMBOLS = env_int("KR_MARKET_MAX_NEW_BUY_SYMBOLS", 2)
 MAX_PER_SYMBOL_BUY_PCT = env_fraction("KR_MARKET_MAX_PER_SYMBOL_BUY_PCT", 0.01)
+ORGANIC_STRATEGY_MAX_SYMBOLS = env_int("KR_MARKET_ORGANIC_MAX_SYMBOLS", 3)
+RISK_CONTROL_BLOCKS_NEW_BUYS = True
 LLM_DECIDER_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_llm_decider.py"
 CALENDAR_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_calendar.py"
 
@@ -256,7 +261,31 @@ def account_snapshot() -> dict[str, Any]:
     }
 
 
-def build_buy_orders(results: list[dict[str, Any]], account: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
+def evaluate_market_risk(news_summary: dict[str, Any] | None) -> dict[str, Any]:
+    summary = news_summary or {}
+    regime = str(summary.get("regime") or "unknown")
+    reasons: list[str] = []
+    if RISK_CONTROL_BLOCKS_NEW_BUYS and regime == "risk_control":
+        reasons.append("risk_control news regime blocks new buys")
+    return {
+        "regime": regime,
+        "risk_gate_open": not reasons,
+        "reasons": reasons,
+        "risk_control_blocks_new_buys": RISK_CONTROL_BLOCKS_NEW_BUYS,
+    }
+
+
+def build_buy_orders(
+    results: list[dict[str, Any]],
+    account: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    market_regime: str = "neutral",
+    risk_gate_open: bool = True,
+) -> list[dict[str, Any]]:
+    if not risk_gate_open or (RISK_CONTROL_BLOCKS_NEW_BUYS and market_regime == "risk_control"):
+        return []
+
     total_eval = float(account.get("deposit", {}).get("total_eval") or 0)
     cash = float(account.get("deposit", {}).get("deposit") or 0)
     bought_today = sum(float(order.get("amount") or 0) for order in state.get("orders", []))
@@ -672,6 +701,62 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         f"- Effective LLM mode: {payload.get('effective_llm_mode', payload.get('llm_mode', 'off'))}",
         f"- Equity: {payload['account_before']['account'].get('deposit', {}).get('total_eval', 0):,}원",
     ]
+    market_risk = payload.get("market_risk") or {}
+    if market_risk:
+        lines.extend([
+            "",
+            "## Market Risk",
+            f"- Risk gate open: {market_risk.get('risk_gate_open', True)}",
+            f"- New buys blocked in risk_control: {market_risk.get('risk_control_blocks_new_buys', False)}",
+            f"- Reasons: {'; '.join(market_risk.get('reasons') or []) or '-'}",
+        ])
+    strategy_orchestration = payload.get("strategy_orchestration") or {}
+    if strategy_orchestration:
+        enabled = strategy_orchestration.get("enabled") or []
+        disabled = strategy_orchestration.get("disabled") or []
+        lines.extend([
+            "",
+            "## Strategy Orchestration",
+            f"- Regime: {strategy_orchestration.get('regime', '-')}",
+            f"- Enabled strategies: {len(enabled)}",
+            f"- Target count: {strategy_orchestration.get('target_strategy_count', {}).get('min', 8)}"
+            f"-{strategy_orchestration.get('target_strategy_count', {}).get('max', 12)}",
+            f"- Symbol limit: {strategy_orchestration.get('symbol_limit', '-')}",
+            f"- Risk gate open: {strategy_orchestration.get('risk_gate_open', True)}",
+            f"- Warnings: {'; '.join(strategy_orchestration.get('warnings') or []) or '-'}",
+            "",
+            "| 전략 | 계열 | 가중치 | 선택 이유 |",
+            "|---|---|---:|---|",
+        ])
+        for item in enabled:
+            lines.append(
+                f"| {item.get('name', item.get('id'))} ({item.get('id')}) | "
+                f"{item.get('family', '-')} | {float(item.get('weight') or 0):.2f} | "
+                f"{item.get('reason', '-')} |"
+            )
+        if disabled:
+            lines.extend(["", "### Disabled Strategy Candidates", "| 전략 | 이유 |", "|---|---|"])
+            for item in disabled:
+                lines.append(f"| {item.get('name', item.get('id'))} ({item.get('id')}) | {item.get('reason', '-')} |")
+
+    strategy_run = payload.get("strategy_run") or {}
+    if strategy_run:
+        lines.extend([
+            "",
+            "## Strategy Run Results",
+            f"- Successful: {strategy_run.get('successful_strategy_count', 0)}",
+            f"- Failed: {strategy_run.get('failed_strategy_count', 0)}",
+            f"- Raw signal rows: {strategy_run.get('raw_result_count', 0)}",
+            f"- Errors: {'; '.join(strategy_run.get('errors') or []) or '-'}",
+            "",
+            "| 전략 | 상태 | 결과 수 | 메시지 |",
+            "|---|---|---:|---|",
+        ])
+        for item in strategy_run.get("runs") or []:
+            lines.append(
+                f"| {item.get('strategy_id')} | {item.get('status')} | "
+                f"{int(item.get('result_count') or 0)} | {item.get('message') or '-'} |"
+            )
     if payload.get("llm_warnings"):
         lines.extend(["", "## LLM Warnings"])
         lines.extend(f"- {warning}" for warning in payload.get("llm_warnings") or [])
@@ -689,6 +774,7 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
             f"- Fallback used: {candidate_selection.get('fallback_used', False)}",
             f"- Generated at: {candidate_selection.get('generated_at', '-')}",
             f"- Errors: {'; '.join(candidate_selection.get('errors') or []) or '-'}",
+            f"- Warnings: {'; '.join(candidate_selection.get('warnings') or []) or '-'}",
             "",
             "| 종목 | 구분 | 점수 | 원천 | 선정 이유 |",
             "|---|---|---:|---|---|",
@@ -718,6 +804,21 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
             f"{float(signal.get('strength') or 0):.2f} | {float(signal.get('target_price') or 0):,.0f} | "
             f"{signal.get('reason', '')} |"
         )
+
+    order_decisions = payload.get("order_decisions") or []
+    if order_decisions:
+        lines.extend([
+            "",
+            "## Order Gate Decisions",
+            "| 종목 | 신호 | 강도 | 상태 | 이유 |",
+            "|---|---:|---:|---|---|",
+        ])
+        for item in order_decisions:
+            lines.append(
+                f"| {item.get('name', item.get('code'))}({item.get('code')}) | {item.get('action')} | "
+                f"{float(item.get('strength') or 0):.2f} | {item.get('status')} | "
+                f"{'; '.join(item.get('reasons') or []) or '-'} |"
+            )
 
     llm_result = payload.get("llm_result")
     if llm_result:
@@ -820,6 +921,11 @@ def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
     errors.extend(
         f"candidate_selection: {item}"
         for item in payload.get("candidate_selection", {}).get("errors", [])
+        if item
+    )
+    errors.extend(
+        f"strategy_run: {item}"
+        for item in payload.get("strategy_run", {}).get("errors", [])
         if item
     )
     for signal in payload.get("signals", []):
@@ -1058,6 +1164,7 @@ def main() -> int:
     parser.add_argument("--slot", required=True, choices=["hourly", "open", "mid", "close", "manual"])
     parser.add_argument("--date", required=True)
     parser.add_argument("--run-id", help="Stable run identifier, normally YYYYMMDD_HHMM_KST.")
+    parser.add_argument("--report-only", action="store_true", help="Generate reports without submitting orders.")
     parser.add_argument("--record-skip", choices=["skipped_overlap", "skipped_duplicate", "skipped_not_scheduled"])
     parser.add_argument(
         "--trade-mode",
@@ -1084,9 +1191,14 @@ def main() -> int:
     monotonic_started = time.monotonic()
     prod_telegram_enabled = prod_telegram_approval_enabled()
     order_block_reasons = []
+    if args.report_only:
+        order_block_reasons.append("report_only")
     if args.trade_mode == "prod" and not prod_confirmed and not prod_telegram_enabled:
         order_block_reasons.append("one_time_prod_approval_missing")
-    can_submit_orders = order_execution_enabled(args.trade_mode, prod_confirmed, prod_telegram_enabled)
+    can_submit_orders = (
+        order_execution_enabled(args.trade_mode, prod_confirmed, prod_telegram_enabled)
+        and not args.report_only
+    )
     strategy_sell_enabled = strategy_sell_execution_enabled(args.trade_mode)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
@@ -1153,8 +1265,29 @@ def main() -> int:
                 "selected": [],
                 "fallback_used": False,
                 "errors": [],
+                "warnings": [],
                 "generated_at": now.isoformat(timespec="seconds"),
             },
+            "market_risk": {
+                "regime": "market_closed",
+                "risk_gate_open": False,
+                "reasons": ["market closed"],
+                "risk_control_blocks_new_buys": RISK_CONTROL_BLOCKS_NEW_BUYS,
+            },
+            "strategy_orchestration": select_strategy_candidates(
+                market="kr",
+                regime="market_closed",
+                risk_gate_open=False,
+            ),
+            "strategy_run": {
+                "runs": [],
+                "raw_result_count": 0,
+                "successful_strategy_count": 0,
+                "failed_strategy_count": 0,
+                "errors": [],
+                "merged_signals": [],
+            },
+            "order_decisions": [],
             "safety": {
                 "mode": args.trade_mode,
                 "total_new_buy_pct": TOTAL_BUY_PCT,
@@ -1164,6 +1297,9 @@ def main() -> int:
                 "min_buy_strength": MIN_BUY_STRENGTH,
                 "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
                 "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
+                "risk_control_blocks_new_buys": RISK_CONTROL_BLOCKS_NEW_BUYS,
+                "risk_gate_open": False,
+                "risk_gate_reasons": ["market closed"],
                 "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
                 "order_block_reasons": order_block_reasons,
                 "prod_telegram_approval_enabled": prod_telegram_enabled,
@@ -1189,6 +1325,7 @@ def main() -> int:
 
     headlines = fetch_headlines()
     news_summary = summarize_news(headlines)
+    market_risk = evaluate_market_risk(news_summary)
     account_before = account_snapshot()
     before_holding_codes = set(holding_by_code(account_before["account"]).keys())
     candidate_selection = select_kr_candidates(
@@ -1197,14 +1334,24 @@ def main() -> int:
         static_candidates=STATIC_CANDIDATES,
     )
 
-    stock_codes = [str(item["code"]) for item in candidate_selection.get("selected", [])]
-    signals_response = api("POST", "/api/strategies/execute", json={
-        "strategy_id": "custom:today_krx_macro_rebound",
-        "stocks": stock_codes,
-        "params": {},
-        "market": "domestic",
-    })
-    signals = signals_response.get("results", [])
+    stock_codes = [
+        str(item["code"])
+        for item in candidate_selection.get("selected", [])[:ORGANIC_STRATEGY_MAX_SYMBOLS]
+    ]
+    strategy_orchestration = select_strategy_candidates(
+        market="kr",
+        regime=market_risk["regime"],
+        risk_gate_open=market_risk["risk_gate_open"],
+    )
+    strategy_orchestration["symbol_limit"] = ORGANIC_STRATEGY_MAX_SYMBOLS
+    strategy_orchestration["symbols"] = stock_codes
+    strategy_run = execute_strategy_pool(
+        api,
+        stock_codes,
+        strategy_orchestration,
+        market="domestic",
+    )
+    signals = strategy_run.get("merged_signals", [])
     groups = signal_groups(signals)
     sells = []
     if can_submit_orders and strategy_sell_enabled:
@@ -1215,7 +1362,22 @@ def main() -> int:
             prod_confirmed,
             prod_telegram_enabled,
         )
-    planned_buys = build_buy_orders(signals, account_before["account"], state)
+    planned_buys = build_buy_orders(
+        signals,
+        account_before["account"],
+        state,
+        market_regime=market_risk["regime"],
+        risk_gate_open=market_risk["risk_gate_open"],
+    )
+    order_decisions = explain_order_decisions(
+        signals,
+        planned_buys,
+        min_buy_strength=MIN_BUY_STRENGTH,
+        risk_gate_open=market_risk["risk_gate_open"],
+        risk_reasons=market_risk["reasons"],
+        order_execution_enabled=can_submit_orders,
+        order_block_reasons=order_block_reasons,
+    )
     llm_context = {
         "run_id": run_id,
         "slot": args.slot,
@@ -1224,9 +1386,17 @@ def main() -> int:
         "scheduled_at_kst": schedule_entry.get("scheduled_at_kst"),
         "headlines": headlines,
         "news_summary": news_summary,
+        "market_risk": market_risk,
+        "strategy_orchestration": strategy_orchestration,
+        "strategy_run": {
+            key: value
+            for key, value in strategy_run.items()
+            if key != "merged_signals"
+        },
         "signals": signals,
         "candidate_selection": candidate_selection,
         "planned_buys": planned_buys,
+        "order_decisions": order_decisions,
         "submitted_sells": sells,
         "account_before": account_before,
         "safety": {
@@ -1235,22 +1405,31 @@ def main() -> int:
             "prod_telegram_approval_enabled": prod_telegram_enabled,
             "order_execution_enabled": can_submit_orders,
             "order_block_reasons": order_block_reasons,
+            "risk_control_blocks_new_buys": RISK_CONTROL_BLOCKS_NEW_BUYS,
+            "risk_gate_open": market_risk["risk_gate_open"],
+            "risk_gate_reasons": market_risk["reasons"],
             "strategy_sell_execution_enabled": strategy_sell_enabled,
             "total_new_buy_pct": TOTAL_BUY_PCT,
             "daily_loss_pct": DAILY_LOSS_PCT,
             "take_profit_pct": TAKE_PROFIT_PCT,
             "stop_loss_pct": STOP_LOSS_PCT,
             "min_buy_strength": MIN_BUY_STRENGTH,
-            "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
-            "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
-            "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
-        },
+                "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
+                "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
+                "organic_strategy_max_symbols": ORGANIC_STRATEGY_MAX_SYMBOLS,
+                "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
+            },
     }
     llm_result = run_llm_decision(effective_llm_mode, llm_context)
     executable_buys = apply_llm_decision(planned_buys, llm_result, effective_llm_mode)
     if not can_submit_orders:
         executable_buys = []
     report_buys = annotate_buys_for_report(planned_buys, executable_buys, effective_llm_mode)
+    if args.report_only:
+        report_buys = [
+            {**order, "order_decision": "리포트 전용/미주문"}
+            for order in report_buys
+        ]
     if not can_submit_orders and args.trade_mode == "prod":
         report_buys = [
             {**order, "order_decision": f"실전 주문 차단({','.join(order_block_reasons)})/미주문"}
@@ -1299,9 +1478,17 @@ def main() -> int:
         "scheduled_at_kst": schedule_entry.get("scheduled_at_kst"),
         "headlines": headlines,
         "news_summary": news_summary,
+        "market_risk": market_risk,
+        "strategy_orchestration": strategy_orchestration,
+        "strategy_run": {
+            key: value
+            for key, value in strategy_run.items()
+            if key != "merged_signals"
+        },
         "signals": signals,
         "signal_groups": groups,
         "candidate_selection": candidate_selection,
+        "order_decisions": order_decisions,
         "planned_buys": report_buys,
         "raw_planned_buys": planned_buys,
         "executable_buys": executable_buys,
@@ -1321,14 +1508,17 @@ def main() -> int:
         "order_block_reasons": order_block_reasons,
         "strategy_sell_execution_enabled": strategy_sell_enabled,
         "trading_day": trading_day,
-        "status": "completed",
-        "report_only": False,
+        "status": "report_only" if args.report_only else "completed",
+        "report_only": args.report_only,
         "safety": {
             "mode": args.trade_mode,
             "prod_auto_confirmed": prod_confirmed,
             "prod_telegram_approval_enabled": prod_telegram_enabled,
             "order_execution_enabled": can_submit_orders,
             "order_block_reasons": order_block_reasons,
+            "risk_control_blocks_new_buys": RISK_CONTROL_BLOCKS_NEW_BUYS,
+            "risk_gate_open": market_risk["risk_gate_open"],
+            "risk_gate_reasons": market_risk["reasons"],
             "strategy_sell_execution_enabled": strategy_sell_enabled,
             "llm_warnings": llm_warnings,
             "total_new_buy_pct": TOTAL_BUY_PCT,
@@ -1338,6 +1528,7 @@ def main() -> int:
             "min_buy_strength": MIN_BUY_STRENGTH,
             "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
             "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
+            "organic_strategy_max_symbols": ORGANIC_STRATEGY_MAX_SYMBOLS,
             "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
         },
     }

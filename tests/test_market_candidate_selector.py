@@ -68,6 +68,15 @@ class FakeUSFetcher:
         return self._result("surge")
 
 
+class FakeUSFetcherWithUnsupportedCap(FakeUSFetcher):
+    def get_overseas_market_cap_rank(self, **kwargs):
+        return FakeRankingResult(
+            [],
+            success=False,
+            message="OPSQ2001 ERROR INPUT FIELD NOT FOUND [CURR_GB]",
+        )
+
+
 class MarketCandidateSelectorTest(unittest.TestCase):
     def test_kr_row_normalizes_multiple_kis_field_names(self):
         row = {
@@ -147,6 +156,27 @@ class MarketCandidateSelectorTest(unittest.TestCase):
         self.assertIn("068270", [item["code"] for item in report["selected"]])
         holding = next(item for item in report["selected"] if item["code"] == "068270")
         self.assertIn("holding", holding["sources"])
+
+    def test_kr_selection_excludes_leveraged_etp_from_ranked_candidates_but_keeps_holdings(self):
+        rows = [
+            {"mksc_shrn_iscd": "252670", "hts_kor_isnm": "KODEX 200선물인버스2X", "rank": "1"},
+            {"mksc_shrn_iscd": "005930", "hts_kor_isnm": "삼성전자", "rank": "2"},
+            {"mksc_shrn_iscd": "000660", "hts_kor_isnm": "SK하이닉스", "rank": "3"},
+            {"mksc_shrn_iscd": "005380", "hts_kor_isnm": "현대차", "rank": "4"},
+            {"mksc_shrn_iscd": "000270", "hts_kor_isnm": "기아", "rank": "5"},
+            {"mksc_shrn_iscd": "105560", "hts_kor_isnm": "KB금융", "rank": "6"},
+        ]
+
+        report = selector.select_kr_candidates(
+            api_get=lambda path: {"status": "success", "items": rows},
+            account={"holdings": [{"stock_code": "252670", "stock_name": "KODEX 200선물인버스2X", "quantity": 1}]},
+            static_candidates=KR_STATIC,
+            limit=20,
+        )
+
+        inverse = next(item for item in report["selected"] if item["code"] == "252670")
+        self.assertEqual(inverse["sources"], ["holding"])
+        self.assertEqual(inverse["category"], "excluded_etp")
 
     def test_kr_holding_survives_limit_cut(self):
         rows = [
@@ -249,6 +279,27 @@ class MarketCandidateSelectorTest(unittest.TestCase):
         )
 
         self.assertNotIn("SOXL", [item["symbol"] for item in report["selected"]])
+
+    def test_us_unsupported_market_cap_rank_is_warning_not_error(self):
+        ranked = [
+            {"symb": symbol, "excd": "NAS", "rank": str(index)}
+            for index, symbol in enumerate(("NVDA", "MSFT", "AVGO", "AMD", "AMZN"), start=1)
+        ]
+
+        report = selector.select_us_candidates(
+            ranking_fetcher=FakeUSFetcherWithUnsupportedCap({
+                "trade": ranked,
+                "power": [],
+                "surge": [],
+            }),
+            holdings=[],
+            static_candidates=US_STATIC,
+            limit=20,
+        )
+
+        self.assertFalse(report["errors"])
+        self.assertTrue(report["warnings"])
+        self.assertTrue(all("market_cap_rank" in item for item in report["warnings"]))
 
 
 if __name__ == "__main__":

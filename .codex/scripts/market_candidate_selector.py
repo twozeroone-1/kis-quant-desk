@@ -21,6 +21,19 @@ US_LEVERAGED_OR_INVERSE_ETFS = {
     "SOXS", "SPXU", "SSO", "SQQQ", "TECL", "TECS", "TNA", "TQQQ", "TZA",
     "UDOW", "UPRO", "UVXY", "VIXY", "YANG", "YINN",
 }
+KR_LEVERAGED_OR_INVERSE_NAME_TOKENS = (
+    "인버스",
+    "레버리지",
+    "곱버스",
+    "2X",
+    "2배",
+    "ETN",
+    "ETC",
+    "선물",
+    "원유",
+    "천연가스",
+    "VIX",
+)
 
 KR_SOURCE_WEIGHTS = {
     "volume_rank": 40.0,
@@ -140,7 +153,12 @@ def normalize_kr_candidate_row(row: dict[str, Any], source: str = "") -> dict[st
         "stock_name",
         "종목명",
     ), code)).strip() or code
-    category = "ETF" if any(token in name.upper() for token in ("ETF", "KODEX", "TIGER", "SOL ", "ACE ")) else "대형주"
+    disallowed_new_buy = is_disallowed_kr_new_buy_name(name)
+    if disallowed_new_buy and source != "holding":
+        return None
+    category = "excluded_etp" if disallowed_new_buy else (
+        "ETF" if any(token in name.upper() for token in ("ETF", "KODEX", "TIGER", "SOL ", "ACE ")) else "대형주"
+    )
     metrics = {
         "rank": _to_float(_first_value(row, ("rank", "data_rank", "hts_rank", "순위"), 0)),
         "volume": _to_float(_first_value(row, ("acml_vol", "vol", "volume", "cntg_vol", "stck_vol", "거래량"), 0)),
@@ -157,6 +175,7 @@ def normalize_kr_candidate_row(row: dict[str, Any], source: str = "") -> dict[st
         "exchange": "KRX",
         "category": category,
         "source": source,
+        "new_buy_disallowed": disallowed_new_buy,
         "metrics": metrics,
     }
 
@@ -169,6 +188,13 @@ def normalize_us_exchange(exchange: Any) -> str | None:
 
 def is_disallowed_us_new_buy_symbol(symbol: Any) -> bool:
     return str(symbol or "").strip().upper() in US_LEVERAGED_OR_INVERSE_ETFS
+
+
+def is_disallowed_kr_new_buy_name(name: Any) -> bool:
+    normalized = str(name or "").strip().upper()
+    if not normalized:
+        return False
+    return any(token in normalized for token in KR_LEVERAGED_OR_INVERSE_NAME_TOKENS)
 
 
 def us_price_exchange(exchange: Any) -> str | None:
@@ -280,14 +306,26 @@ def _holding_us_candidates(holdings: list[dict[str, Any]] | None) -> list[dict[s
     return rows
 
 
-def _candidate_report(mode: str, selected: list[dict[str, Any]], fallback_used: bool, errors: list[str]) -> dict[str, Any]:
+def _candidate_report(
+    mode: str,
+    selected: list[dict[str, Any]],
+    fallback_used: bool,
+    errors: list[str],
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
     return {
         "mode": mode,
         "selected": selected,
         "fallback_used": fallback_used,
         "errors": errors,
+        "warnings": warnings or [],
         "generated_at": _now_iso(),
     }
+
+
+def _is_unsupported_us_market_cap_error(source: str, message: Any) -> bool:
+    text = str(message or "")
+    return source == "market_cap_rank" and "OPSQ2001" in text and "CURR_GB" in text
 
 
 def _append_kr_holdings_to_static(static_selected: list[dict[str, Any]], account: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -349,6 +387,7 @@ def select_kr_candidates(
         return _candidate_report("static", static_selected, False, [])
 
     errors: list[str] = []
+    warnings: list[str] = []
     accumulator: dict[str, dict[str, Any]] = {}
     source_successes = 0
     ranked_symbols: set[str] = set()
@@ -381,9 +420,15 @@ def select_kr_candidates(
     selected = _finalize_selection(accumulator, limit)
     if source_successes == 0 or len(ranked_symbols) < KR_DYNAMIC_MIN_COUNT or len(selected) < KR_DYNAMIC_MIN_COUNT:
         fallback_selected = _append_kr_holdings_to_static(static_selected, account)
-        return _candidate_report("dynamic", fallback_selected, True, errors + [f"dynamic ranked candidate count below minimum: {len(ranked_symbols)}"])
+        return _candidate_report(
+            "dynamic",
+            fallback_selected,
+            True,
+            errors + [f"dynamic ranked candidate count below minimum: {len(ranked_symbols)}"],
+            warnings,
+        )
     selected = _append_required_candidates(selected, holding_candidates)
-    return _candidate_report("dynamic", selected, False, errors)
+    return _candidate_report("dynamic", selected, False, errors, warnings)
 
 
 def select_us_candidates(
@@ -401,6 +446,7 @@ def select_us_candidates(
         return _candidate_report("static", static_selected, False, [])
 
     errors: list[str] = []
+    warnings: list[str] = []
     accumulator: dict[str, dict[str, Any]] = {}
     source_successes = 0
     ranked_symbols: set[str] = set()
@@ -417,7 +463,11 @@ def select_us_candidates(
                 result = getattr(ranking_fetcher, method_name)(exchange=price_exchange, max_depth=1, **kwargs)
                 if not getattr(result, "success", False):
                     display_error = result.display_error() if hasattr(result, "display_error") else "ranking failed"
-                    errors.append(f"{source}/{trading_exchange}: {display_error}")
+                    item = f"{source}/{trading_exchange}: {display_error}"
+                    if _is_unsupported_us_market_cap_error(source, display_error):
+                        warnings.append(item)
+                    else:
+                        errors.append(item)
                     continue
                 source_successes += 1
                 for index, row in enumerate(result.records()):
@@ -429,7 +479,11 @@ def select_us_candidates(
                     ranked_symbols.add(normalized["symbol"])
                     _merge_candidate(accumulator, normalized, source, US_SOURCE_WEIGHTS[source], row, index)
             except Exception as exc:
-                errors.append(f"{source}/{trading_exchange}: {str(exc)[:300]}")
+                item = f"{source}/{trading_exchange}: {str(exc)[:300]}"
+                if _is_unsupported_us_market_cap_error(source, str(exc)):
+                    warnings.append(item)
+                else:
+                    errors.append(item)
 
     core_candidates = []
     for symbol, exchange in US_CORE_ETFS.values():
@@ -444,6 +498,12 @@ def select_us_candidates(
     selected = _finalize_selection(accumulator, limit)
     if source_successes == 0 or len(ranked_symbols) < US_DYNAMIC_MIN_COUNT or len(selected) < US_DYNAMIC_MIN_COUNT:
         fallback_selected = _append_us_holdings_to_static(static_selected, holdings)
-        return _candidate_report("dynamic", fallback_selected, True, errors + [f"dynamic ranked candidate count below minimum: {len(ranked_symbols)}"])
+        return _candidate_report(
+            "dynamic",
+            fallback_selected,
+            True,
+            errors + [f"dynamic ranked candidate count below minimum: {len(ranked_symbols)}"],
+            warnings,
+        )
     selected = _append_required_candidates(selected, core_candidates + holding_candidates)
-    return _candidate_report("dynamic", selected, False, errors)
+    return _candidate_report("dynamic", selected, False, errors, warnings)

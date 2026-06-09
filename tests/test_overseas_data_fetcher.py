@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import os
 import sys
 import unittest
-import os
 from pathlib import Path
 from unittest.mock import patch
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("KIS_CONFIG_ROOT", str(PROJECT_ROOT / "tests" / "fixtures" / "kis_config"))
@@ -45,6 +44,14 @@ class _FakeRankingResponse:
         return type("Header", (), {"tr_cont": ""})()
 
 
+class _FakeOrderResponse:
+    def isOK(self):
+        return True
+
+    def getBody(self):
+        return {"output": [{"ODNO": "000001"}]}
+
+
 @unittest.skipIf(overseas_data_fetcher is None, f"strategy_builder dependencies unavailable: {IMPORT_ERROR}")
 class OverseasDataFetcherTest(unittest.TestCase):
     def test_pending_orders_uses_demo_tr_id_for_vps(self):
@@ -81,6 +88,86 @@ class OverseasDataFetcherTest(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(seen["tr_id"], "TTTS3018R")
+
+    def test_submit_order_uses_demo_us_buy_tr_id_for_vps(self):
+        seen = {}
+
+        def fake_fetch(api_url, tr_id, tr_cont, params, **kwargs):
+            seen["api_url"] = api_url
+            seen["tr_id"] = tr_id
+            seen["params"] = params
+            seen["postFlag"] = kwargs.get("postFlag")
+            return _FakeOrderResponse()
+
+        with patch.object(overseas_data_fetcher, "_assert_trenv_ready", return_value=True), patch.object(
+            overseas_data_fetcher.ka, "getTREnv", return_value=_FakeTREnv()
+        ), patch.object(overseas_data_fetcher.ka, "_url_fetch", side_effect=fake_fetch):
+            result = overseas_data_fetcher.submit_order(
+                symbol="AAPL",
+                action="BUY",
+                quantity=1,
+                price=100.0,
+                env_dv="vps",
+                exchange="NASD",
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(seen["api_url"], "/uapi/overseas-stock/v1/trading/order")
+        self.assertEqual(seen["tr_id"], "VTTT1002U")
+        self.assertEqual(seen["params"]["SLL_TYPE"], "")
+        self.assertTrue(seen["postFlag"])
+
+    def test_submit_order_uses_demo_us_sell_tr_id_for_vps(self):
+        seen = {}
+
+        def fake_fetch(api_url, tr_id, tr_cont, params, **kwargs):
+            seen["api_url"] = api_url
+            seen["tr_id"] = tr_id
+            seen["params"] = params
+            return _FakeOrderResponse()
+
+        with patch.object(overseas_data_fetcher, "_assert_trenv_ready", return_value=True), patch.object(
+            overseas_data_fetcher.ka, "getTREnv", return_value=_FakeTREnv()
+        ), patch.object(overseas_data_fetcher.ka, "_url_fetch", side_effect=fake_fetch):
+            result = overseas_data_fetcher.submit_order(
+                symbol="AAPL",
+                action="SELL",
+                quantity=1,
+                price=100.0,
+                env_dv="vps",
+                exchange="NASD",
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(seen["api_url"], "/uapi/overseas-stock/v1/trading/order")
+        self.assertEqual(seen["tr_id"], "VTTT1001U")
+        self.assertEqual(seen["params"]["SLL_TYPE"], "00")
+
+    def test_submit_order_keeps_real_us_sell_tr_id_for_prod(self):
+        seen = {}
+
+        def fake_fetch(api_url, tr_id, tr_cont, params, **kwargs):
+            seen["api_url"] = api_url
+            seen["tr_id"] = tr_id
+            return _FakeOrderResponse()
+
+        with patch.object(overseas_data_fetcher, "_assert_trenv_ready", return_value=True), patch.object(
+            overseas_data_fetcher.ka, "getTREnv", return_value=_FakeTREnv()
+        ), patch.object(overseas_data_fetcher, "is_us_daytime_session", return_value=False), patch.object(
+            overseas_data_fetcher.ka, "_url_fetch", side_effect=fake_fetch
+        ):
+            result = overseas_data_fetcher.submit_order(
+                symbol="AAPL",
+                action="SELL",
+                quantity=1,
+                price=100.0,
+                env_dv="prod",
+                exchange="NASD",
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(seen["api_url"], "/uapi/overseas-stock/v1/trading/order")
+        self.assertEqual(seen["tr_id"], "TTTT1006U")
 
     def test_get_deposit_keeps_usd_total_eval_separate_from_krw_asset_fields(self):
         balance_raw = {
@@ -171,7 +258,7 @@ class OverseasDataFetcherTest(unittest.TestCase):
         self.assertEqual(deposit["total_eval"], 105672.33)
         self.assertEqual(deposit["total_asset_krw"], 393505227.0)
 
-    def test_overseas_market_cap_rank_sends_required_currency_field(self):
+    def test_overseas_market_cap_rank_sends_runtime_required_currency_division(self):
         seen = {}
 
         def fake_fetch(api_url, tr_id, tr_cont, params):
@@ -189,7 +276,26 @@ class OverseasDataFetcherTest(unittest.TestCase):
         self.assertEqual(seen["api_url"], "/uapi/overseas-stock/v1/ranking/market-cap")
         self.assertEqual(seen["tr_id"], "HHDFS76350100")
         self.assertEqual(seen["params"]["EXCD"], "NAS")
-        self.assertEqual(seen["params"]["CURR_GB"], "USD")
+        self.assertEqual(seen["params"]["CURR_GB"], "1")
+
+    def test_overseas_market_cap_rank_allows_explicit_currency_override(self):
+        seen = {}
+
+        def fake_fetch(api_url, tr_id, tr_cont, params):
+            seen["params"] = params
+            return _FakeRankingResponse()
+
+        with patch.object(overseas_data_fetcher, "_assert_trenv_ready", return_value=True), patch.object(
+            overseas_data_fetcher.ka, "_url_fetch", side_effect=fake_fetch
+        ):
+            result = overseas_data_fetcher.get_overseas_market_cap_rank(
+                exchange="NASD",
+                curr_gb="2",
+                max_depth=1,
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(seen["params"]["CURR_GB"], "2")
 
 
 if __name__ == "__main__":

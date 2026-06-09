@@ -11,7 +11,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PROJECT_ROOT / ".codex" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -116,6 +115,28 @@ class _FakeIndicators:
 
 @unittest.skipIf(us_market_auto_run is None, f"us_market_auto_run unavailable: {IMPORT_ERROR}")
 class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
+    def test_strategy_api_base_prefers_vps_endpoint(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "KIS_STRATEGY_API": "http://127.0.0.1:8083",
+                "KIS_VPS_STRATEGY_API": "http://127.0.0.1:8081/",
+            },
+            clear=False,
+        ):
+            self.assertEqual(us_market_auto_run.strategy_api_base(), "http://127.0.0.1:8081")
+
+    def test_collect_payload_errors_includes_strategy_run_errors(self):
+        payload = {
+            "strategy_run": {"errors": ["momentum: rate limited"]},
+            "signals": [],
+            "submitted_sells": [],
+            "orders": [],
+            "account_after": {},
+        }
+
+        self.assertIn("strategy_run: momentum: rate limited", us_market_auto_run.collect_payload_errors(payload))
+
     def test_live_llm_mode_is_shadow_alias_not_order_gate(self):
         planned = [{"symbol": "AMZN", "quantity": 1, "notional": 100.0}]
 
@@ -318,6 +339,32 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status["reservations"]["status"], "not_applicable")
         self.assertEqual(status["reservations"]["policy"], "vps_app_reservations_only")
+
+    async def test_account_status_refreshes_stale_protective_monitor_once(self):
+        calls = {"protective": 0, "refresh": 0}
+
+        async def protective():
+            calls["protective"] += 1
+            if calls["protective"] == 1:
+                return {"orders": [], "settings": {}, "health": {"status": "stale", "stale": True}}
+            return {"orders": [], "settings": {}, "health": {"status": "healthy", "stale": False}}
+
+        async def app_reservations(**kwargs):
+            return []
+
+        async def refresh():
+            calls["refresh"] += 1
+
+        with patch.object(us_market_auto_run.time, "sleep", return_value=None):
+            status = await us_market_auto_run.account_status(
+                _FakeEquityFetcher(),
+                protective,
+                app_reservations,
+                refresh,
+            )
+
+        self.assertEqual(calls, {"protective": 2, "refresh": 1})
+        self.assertEqual(status["protective"]["health"]["status"], "healthy")
 
     async def test_outside_hours_buy_uses_app_reservation(self):
         class BuyableFetcher:

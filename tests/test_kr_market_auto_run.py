@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PROJECT_ROOT / ".codex" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -62,6 +61,29 @@ class KrMarketAutoRunTest(unittest.TestCase):
         })
         self.assertLessEqual(sum(order["amount"] for order in orders), 10_000_000)
         self.assertLessEqual(max(order["amount"] for order in orders), 1_000_000)
+
+    def test_build_buy_orders_blocks_new_buys_in_risk_control(self):
+        results = [
+            {"code": "105560", "name": "KB금융", "action": "BUY", "strength": 0.95, "target_price": 400000},
+        ]
+        account = {"deposit": {"total_eval": 100_000_000, "deposit": 100_000_000}}
+
+        orders = kr_market_auto_run.build_buy_orders(
+            results,
+            account,
+            {"orders": []},
+            market_regime="risk_control",
+            risk_gate_open=False,
+        )
+
+        self.assertEqual(orders, [])
+
+    def test_evaluate_market_risk_blocks_news_risk_control(self):
+        risk = kr_market_auto_run.evaluate_market_risk({"regime": "risk_control"})
+
+        self.assertFalse(risk["risk_gate_open"])
+        self.assertTrue(risk["risk_control_blocks_new_buys"])
+        self.assertTrue(risk["reasons"])
 
     def test_build_buy_orders_uses_signal_order_when_only_one_share_fits(self):
         results = [

@@ -405,8 +405,28 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
         self.assertFalse(protective_orders._is_us_regular_session_now(holiday))
         self.assertEqual(
             protective_orders._next_us_regular_session_retry_at(holiday),
-            datetime(2026, 7, 6, 22, 30),
+            datetime(2026, 7, 6, 13, 30),
         )
+
+    def test_us_regular_session_retry_time_matches_runtime_utc_clock(self):
+        pre_open_kst = datetime(2026, 6, 9, 22, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        self.assertEqual(
+            protective_orders._next_us_regular_session_retry_at(pre_open_kst),
+            datetime(2026, 6, 9, 13, 30),
+        )
+
+    def test_legacy_kst_us_retry_time_is_due_on_runtime_utc_clock(self):
+        order = {
+            "status": "active",
+            "env_dv": "vps",
+            "market": "us",
+            "next_retry_at": (datetime.now() + timedelta(hours=8)).isoformat(timespec="seconds"),
+            "app_exit_reservation": {"status": "waiting_retry"},
+        }
+
+        self.assertTrue(protective_orders._exit_submit_retry_due(order))
+        self.assertLess(datetime.fromisoformat(order["next_retry_at"]), datetime.now())
 
     def test_us_paper_error_policy_tracks_code_cooldown_and_unsupported_path(self):
         order = {
