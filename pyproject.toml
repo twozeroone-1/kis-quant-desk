@@ -13,3 +13,85 @@ dependencies = [
     "requests>=2.32.4",
     "websockets>=15.0.1",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "detect-secrets>=1.5.0",
+    "import-linter>=2.3",
+    "mypy>=1.18.0",
+    "pip-audit>=2.9.0",
+    "pytest>=9.0.0",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.14.0",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [
+    "MCP/Kis Trading MCP",
+    "MCP/KIS Code Assistant MCP",
+    "legacy",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]
+"examples_llm/**/*.py" = ["B008"]
+"examples_user/**/*.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+ignore_missing_imports = true
+check_untyped_defs = true
+no_implicit_optional = true
+exclude = [
+    "^legacy/",
+    "^MCP/Kis Trading MCP/",
+    "^MCP/KIS Code Assistant MCP/",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--strict-markers --strict-config"
+
+[tool.coverage.run]
+branch = true
+source = ["tests", "strategy_builder", "backtester"]
+omit = [
+    "*/__pycache__/*",
+    "*/frontend/*",
+    "legacy/*",
+]
+
+[tool.coverage.report]
+skip_covered = true
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.",
+]
+
+[tool.importlinter]
+root_packages = ["backtester", "strategy_builder", "tests"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Backtester must not depend on Strategy Builder runtime backend"
+type = "forbidden"
+source_modules = ["backtester.kis_backtest", "backtester.backend"]
+forbidden_modules = ["strategy_builder.backend"]
+
+[[tool.importlinter.contracts]]
+name = "Tests must not import legacy implementation directly"
+type = "forbidden"
+source_modules = ["tests"]
+forbidden_modules = ["legacy"]

@@ -1,0 +1,48 @@
+name: quality-security-safety
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  python-quality:
+    name: Python quality and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install local quality dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install ruff mypy pytest pytest-cov import-linter
+      - name: Ruff lint
+        run: python -m ruff check .
+      - name: MyPy typecheck
+        run: python -m mypy .
+      - name: Import architecture gate
+        run: python -m lint_imports
+      - name: Trading safety gate
+        run: python scripts/trading_safety_gate.py
+      - name: Unit tests
+        run: python -m pytest tests --cov --cov-report=term-missing
+
+  dependency-audit:
+    name: Dependency and secret audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install audit tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install detect-secrets pip-audit
+      - name: Secret baseline-free scan
+        run: detect-secrets scan --all-files --exclude-files '(^uv.lock$|^tests/fixtures/)'
+      - name: Python dependency audit
+        run: pip-audit --progress-spinner off -r requirements.txt

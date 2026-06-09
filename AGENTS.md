@@ -85,6 +85,20 @@
 
 ---
 
+## Quality / Architecture / Safety Gates
+
+완료 조건은 기능 동작뿐 아니라 아래 로컬 게이트를 통과하는 것이다. 특히 주문·인증·토큰·MCP·백테스터 경로는 코드 품질보다 실전 주문 보호와 secret 보호를 우선한다.
+
+- Python 품질 게이트: `ruff`, `mypy`, `pytest`, `pytest-cov`를 기본 완료 조건으로 둔다.
+- Import architecture gate: `import-linter`로 `backtester`가 Strategy Builder 런타임 backend에 의존하지 않도록 막고, 새 테스트가 `legacy` 구현을 직접 import하지 않도록 한다.
+- Trading safety gate: `python scripts/trading_safety_gate.py`를 실행해 AGENTS 안전 규칙, secret/account literal, prod-mode confirmation marker를 점검한다.
+- Security gate: `detect-secrets` 또는 `gitleaks` 계열 스캔을 사용하고, `appkey`, `appsecret`, access token, approval key, 계좌번호를 코드·로그·fixture에 넣지 않는다.
+- Dependency audit: `pip-audit` 또는 `osv-scanner`를 사용한다.
+- 실전 주문/인증/MCP 변경은 fail-closed를 기본값으로 하며, mock/sandbox/모의투자 테스트가 먼저 통과해야 한다.
+- ECC 전체 설치는 선택이지만, ECC식 원칙(기존 구현 검색, 설계 선작성, 안전 게이트 통과)을 이 파일과 CI에서 강제한다.
+
+---
+
 ## Hooks (에이전트별)
 
 보안 훅은 에이전트별로 분리되어 있다.
