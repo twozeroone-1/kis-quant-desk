@@ -24,7 +24,7 @@ jobs:
       - name: MyPy typecheck safety gate
         run: python -m mypy --explicit-package-bases scripts/trading_safety_gate.py tests/test_trading_safety_gate.py
       - name: Import architecture gate
-        run: python -m lint_imports
+        run: lint-imports
       - name: Trading safety gate
         run: python scripts/trading_safety_gate.py
       - name: Safety gate tests
