@@ -1,16 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertTriangle, Download, RefreshCw } from "lucide-react";
+import { Activity, AlertTriangle, BookOpen, Download, RefreshCw } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useAuth } from "@/hooks";
 import {
+  getAutomationMonthlyRecord,
   getAutomationRun,
   getAutomationSession,
   getAutomationSessions,
   type AutomationMarket,
+  type AutomationMonthlyRecord,
   type AutomationRunDetail,
   type AutomationSession,
 } from "@/lib/api";
+
+type AutomationView = "execution" | "record";
 
 const marketConfig: Record<
   AutomationMarket,
@@ -57,6 +62,11 @@ const moneyFormatters = {
   }),
 };
 
+const viewTabs: Array<{ key: AutomationView; Icon: LucideIcon; label: string }> = [
+  { key: "execution", Icon: Activity, label: "실행" },
+  { key: "record", Icon: BookOpen, label: "기록" },
+];
+
 function statusClass(status: string) {
   if (status === "completed") return "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300";
   if (status === "report_only" || status === "market_closed") return "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300";
@@ -74,8 +84,56 @@ function marketTime(value: string | undefined, market: AutomationMarket) {
   }).format(new Date(value));
 }
 
+function sessionDateToMonth(sessionDate: string | undefined) {
+  if (!sessionDate || sessionDate.length < 6) return "";
+  return `${sessionDate.slice(0, 4)}-${sessionDate.slice(4, 6)}`;
+}
+
+function sessionDateToIso(sessionDate: string | undefined) {
+  if (!sessionDate || sessionDate.length !== 8) return "";
+  return `${sessionDate.slice(0, 4)}-${sessionDate.slice(4, 6)}-${sessionDate.slice(6, 8)}`;
+}
+
+function dayLabel(value: string) {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("ko-KR", {
+    month: "numeric",
+    day: "numeric",
+  }).format(new Date(`${value}T00:00:00+09:00`));
+}
+
+function monthLabel(value: string) {
+  if (!value) return "-";
+  const [year, month] = value.split("-");
+  return `${year}년 ${Number(month)}월`;
+}
+
+function signedMoney(formatter: Intl.NumberFormat, value: number) {
+  if (!Number.isFinite(value) || value === 0) return formatter.format(0);
+  return value > 0 ? `+${formatter.format(value)}` : formatter.format(value);
+}
+
+function signedPercent(value: number) {
+  if (!Number.isFinite(value) || value === 0) return "0.00%";
+  return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function valueTone(value: number) {
+  if (value > 0) return "text-green-700 dark:text-green-300";
+  if (value < 0) return "text-red-700 dark:text-red-300";
+  return "text-slate-700 dark:text-slate-300";
+}
+
 function orderSymbol(item: Record<string, unknown>) {
   return String(item.symbol ?? item.code ?? item.stock_code ?? "-");
+}
+
+function orderNotional(item: Record<string, unknown>) {
+  const explicit = Number(item.notional ?? item.amount ?? 0);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const price = Number(item.limit_price ?? item.target_price ?? item.price ?? 0);
+  const quantity = Number(item.quantity ?? 0);
+  return Number.isFinite(price) && Number.isFinite(quantity) ? price * quantity : 0;
 }
 
 function textList(value: unknown) {
@@ -90,12 +148,26 @@ export default function AutomationPage() {
   const [sessions, setSessions] = useState<AutomationSession[]>([]);
   const [session, setSession] = useState<AutomationSession | null>(null);
   const [run, setRun] = useState<AutomationRunDetail | null>(null);
+  const [view, setView] = useState<AutomationView>("execution");
+  const [selectedMonth, setSelectedMonth] = useState("");
+  const [monthlyRecord, setMonthlyRecord] = useState<AutomationMonthlyRecord | null>(null);
+  const [monthlyLoading, setMonthlyLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const money = moneyFormatters[marketConfig[market].currency];
   const config = marketConfig[market];
   const latestCash = Number(session?.latest_account?.cash ?? 0);
+  const dailyRecord = session?.daily_record ?? null;
+  const monthOptions = useMemo(
+    () =>
+      Array.from(
+        new Set(sessions.map((item) => sessionDateToMonth(item.session_date)).filter(Boolean))
+      )
+        .sort()
+        .reverse(),
+    [sessions]
+  );
 
   const loadSessions = useCallback(async () => {
     setLoading(true);
@@ -106,8 +178,17 @@ export default function AutomationPage() {
       if (response.sessions.length) {
         const selected = await getAutomationSession(market, response.sessions[0].session_date);
         setSession(selected.data);
+        const defaultMonth = sessionDateToMonth(response.sessions[0].session_date);
+        setSelectedMonth((current) =>
+          current &&
+          response.sessions.some((item) => sessionDateToMonth(item.session_date) === current)
+            ? current
+            : defaultMonth
+        );
       } else {
         setSession(null);
+        setSelectedMonth("");
+        setMonthlyRecord(null);
       }
       setRun(null);
     } catch (err) {
@@ -117,9 +198,27 @@ export default function AutomationPage() {
     }
   }, [market]);
 
+  const loadMonthlyRecord = useCallback(async () => {
+    if (!selectedMonth) return;
+    setMonthlyLoading(true);
+    setError(null);
+    try {
+      const response = await getAutomationMonthlyRecord(market, selectedMonth);
+      setMonthlyRecord(response.data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "월간 기록을 불러오지 못했습니다.");
+    } finally {
+      setMonthlyLoading(false);
+    }
+  }, [market, selectedMonth]);
+
   useEffect(() => {
     if (status.mode === "vps") void loadSessions();
   }, [loadSessions, status.mode]);
+
+  useEffect(() => {
+    if (status.mode === "vps" && view === "record" && selectedMonth) void loadMonthlyRecord();
+  }, [loadMonthlyRecord, selectedMonth, status.mode, view]);
 
   const selectMarket = (nextMarket: AutomationMarket) => {
     if (nextMarket === market) return;
@@ -127,6 +226,8 @@ export default function AutomationPage() {
     setSessions([]);
     setSession(null);
     setRun(null);
+    setSelectedMonth("");
+    setMonthlyRecord(null);
   };
 
   const selectSession = async (sessionDate: string) => {
@@ -135,13 +236,20 @@ export default function AutomationPage() {
     try {
       const response = await getAutomationSession(market, sessionDate);
       setSession(response.data);
+      setSelectedMonth(sessionDateToMonth(sessionDate));
     } catch (err) {
       setError(err instanceof Error ? err.message : "세션을 불러오지 못했습니다.");
     }
   };
 
+  const selectMonthlyDay = async (sessionDate: string) => {
+    setView("record");
+    await selectSession(sessionDate);
+  };
+
   const selectRun = async (runId: string) => {
     setError(null);
+    setView("execution");
     try {
       const response = await getAutomationRun(market, runId);
       setRun(response.data);
@@ -215,6 +323,33 @@ export default function AutomationPage() {
         </div>
       </div>
 
+      <div
+        className="inline-flex rounded-md border border-slate-300 dark:border-slate-700 overflow-hidden"
+        role="tablist"
+        aria-label="자동매매 보기"
+      >
+        {viewTabs.map(({ key, Icon, label }) => (
+          <button
+            key={key}
+            type="button"
+            role="tab"
+            aria-selected={view === key}
+            onClick={() => {
+              setView(key);
+              if (key === "record") setRun(null);
+            }}
+            className={`h-9 px-4 inline-flex items-center gap-2 text-sm font-medium ${
+              view === key
+                ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-950"
+                : "bg-white text-slate-700 hover:bg-slate-100 dark:bg-slate-950 dark:text-slate-300 dark:hover:bg-slate-800"
+            }`}
+          >
+            <Icon className="w-4 h-4" />
+            {label}
+          </button>
+        ))}
+      </div>
+
       {error && (
         <div className="flex items-start gap-2 border border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300 rounded-md p-3 text-sm">
           <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
@@ -224,10 +359,13 @@ export default function AutomationPage() {
 
       {session && (
         <>
-          <section className="grid grid-cols-2 lg:grid-cols-6 gap-3" aria-label="세션 요약">
+          {view === "execution" && (
+            <>
+          <section className="grid grid-cols-2 lg:grid-cols-7 gap-3" aria-label="세션 요약">
             {[
               ["실행", `${session.run_count}회`],
-              ["누적 매수", money.format(session.cumulative_buy_notional)],
+              ["누적 매수", money.format(session.cumulative_buy_notional ?? 0)],
+              ["누적 매도", money.format(session.cumulative_sell_notional ?? 0)],
               ["리포트 기준 주문가능", money.format(latestCash)],
               ["남은 자동매수 한도", money.format(session.remaining_buy_budget)],
               ["남은 손실 한도", money.format(session.remaining_loss_budget)],
@@ -245,7 +383,7 @@ export default function AutomationPage() {
               <h3 className="text-subheading">시간별 타임라인</h3>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[820px] text-sm">
+              <table className="w-full min-w-[920px] text-sm">
                 <thead className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
                   <tr>
                     <th className="text-left px-3 py-2">{config.timeLabel}</th>
@@ -253,6 +391,7 @@ export default function AutomationPage() {
                     <th className="text-right px-3 py-2">BUY/SELL/HOLD</th>
                     <th className="text-right px-3 py-2">제출/체결/실패</th>
                     <th className="text-right px-3 py-2">매수금액</th>
+                    <th className="text-right px-3 py-2">매도금액</th>
                     <th className="text-right px-3 py-2">대기/보호</th>
                     <th className="text-right px-3 py-2">리포트</th>
                   </tr>
@@ -278,7 +417,8 @@ export default function AutomationPage() {
                         <td className="px-3 py-3 text-right tabular-nums">
                           {item.order_counts.submitted}/{item.order_counts.filled}/{item.order_counts.failed}
                         </td>
-                        <td className="px-3 py-3 text-right tabular-nums">{money.format(item.buy_notional)}</td>
+                        <td className="px-3 py-3 text-right tabular-nums">{money.format(item.buy_notional ?? 0)}</td>
+                        <td className="px-3 py-3 text-right tabular-nums">{money.format(item.sell_notional ?? 0)}</td>
                         <td className="px-3 py-3 text-right tabular-nums">
                           {item.pending_count}/{item.protective_count}
                         </td>
@@ -394,12 +534,13 @@ export default function AutomationPage() {
                 <div>
                   <h4 className="text-sm font-semibold mb-2">주문 결과</h4>
                   <div className="border border-slate-200 dark:border-slate-800 rounded-md overflow-x-auto">
-                    <table className="w-full min-w-[440px] text-sm">
+                    <table className="w-full min-w-[540px] text-sm">
                       <thead className="bg-slate-100 dark:bg-slate-800">
                         <tr>
                           <th className="text-left px-3 py-2">종목</th>
                           <th className="text-left px-3 py-2">방향</th>
                           <th className="text-right px-3 py-2">수량</th>
+                          <th className="text-right px-3 py-2">금액</th>
                           <th className="text-left px-3 py-2">상태</th>
                         </tr>
                       </thead>
@@ -409,11 +550,12 @@ export default function AutomationPage() {
                             <td className="px-3 py-2">{orderSymbol(item)}</td>
                             <td className="px-3 py-2">{String(item.action ?? "-")}</td>
                             <td className="px-3 py-2 text-right">{String(item.quantity ?? 0)}</td>
+                            <td className="px-3 py-2 text-right tabular-nums">{money.format(orderNotional(item))}</td>
                             <td className="px-3 py-2">{String(item.order_status ?? item.status ?? "-")}</td>
                           </tr>
                         ))}
                         {!run.orders?.length && !run.submitted_sells?.length && (
-                          <tr><td colSpan={4} className="px-3 py-5 text-center text-slate-500">제출 주문 없음</td></tr>
+                          <tr><td colSpan={5} className="px-3 py-5 text-center text-slate-500">제출 주문 없음</td></tr>
                         )}
                       </tbody>
                     </table>
@@ -434,6 +576,229 @@ export default function AutomationPage() {
                 </div>
               </div>
             </section>
+          )}
+            </>
+          )}
+
+          {view === "record" && (
+            <div className="space-y-8">
+              <section className="space-y-4" aria-label="월간 기록">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-subheading">월간 기록</h3>
+                    <p className="text-caption text-slate-500 mt-1">자동매매 일일 리포트 합계</p>
+                  </div>
+                  <select
+                    aria-label="월 선택"
+                    value={selectedMonth}
+                    onChange={(event) => {
+                      setMonthlyRecord(null);
+                      setSelectedMonth(event.target.value);
+                    }}
+                    className="h-10 border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 rounded-md px-3 text-sm"
+                  >
+                    {monthOptions.map((month) => (
+                      <option key={month} value={month}>
+                        {monthLabel(month)}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {monthlyRecord && monthlyRecord.month === selectedMonth ? (
+                  <>
+                    <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+                      {[
+                        ["월 손익 합계", signedMoney(money, monthlyRecord.summary.pnl), valueTone(monthlyRecord.summary.pnl)],
+                        ["계좌 평가 변화", signedMoney(money, monthlyRecord.summary.account_pnl), valueTone(monthlyRecord.summary.account_pnl)],
+                        ["승/패/보합", `${monthlyRecord.summary.win_days}/${monthlyRecord.summary.loss_days}/${monthlyRecord.summary.flat_days}`, ""],
+                        ["누적 매수", money.format(monthlyRecord.summary.buy_notional), ""],
+                        ["누적 매도", money.format(monthlyRecord.summary.sell_notional), ""],
+                        ["데이터 이상", `${monthlyRecord.summary.anomaly_days}일`, monthlyRecord.summary.anomaly_days ? "text-amber-700 dark:text-amber-300" : ""],
+                      ].map(([label, value, tone]) => (
+                        <div key={label} className="card min-w-0">
+                          <span className="text-caption text-slate-500">{label}</span>
+                          <strong className={`block text-lg mt-1 break-words ${tone}`}>{value}</strong>
+                        </div>
+                      ))}
+                    </div>
+
+                    <section className="border-y border-slate-200 dark:border-slate-800">
+                      <div className="py-4 flex flex-wrap items-center justify-between gap-2">
+                        <h4 className="text-sm font-semibold">{monthLabel(monthlyRecord.month)} 일별 손익</h4>
+                        <span className="text-caption text-slate-500">
+                          {monthlyRecord.summary.day_count}일 · 계좌 수익률 {signedPercent(monthlyRecord.summary.account_pnl_pct)}
+                        </span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full min-w-[980px] text-sm">
+                          <thead className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
+                            <tr>
+                              <th className="text-left px-3 py-2">날짜</th>
+                              <th className="text-right px-3 py-2">평가손익</th>
+                              <th className="text-right px-3 py-2">수익률</th>
+                              <th className="text-right px-3 py-2">평가액</th>
+                              <th className="text-right px-3 py-2">매수</th>
+                              <th className="text-right px-3 py-2">매도</th>
+                              <th className="text-right px-3 py-2">현금 변화</th>
+                              <th className="text-right px-3 py-2">실행/오류</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                            {monthlyRecord.days.map((day) => (
+                              <tr
+                                key={day.session_date}
+                                className={
+                                  day.session_date === session.session_date
+                                    ? "bg-slate-50 dark:bg-slate-900/70"
+                                    : "hover:bg-slate-50 dark:hover:bg-slate-900/60"
+                                }
+                              >
+                                <td className="px-3 py-3 font-medium">
+                                  <button
+                                    type="button"
+                                    onClick={() => void selectMonthlyDay(day.session_date)}
+                                    className="hover:text-primary"
+                                  >
+                                    {dayLabel(day.date)}
+                                  </button>
+                                </td>
+                                <td className={`px-3 py-3 text-right tabular-nums ${valueTone(day.pnl)}`}>
+                                  {day.valid ? signedMoney(money, day.pnl) : "데이터 이상"}
+                                </td>
+                                <td className={`px-3 py-3 text-right tabular-nums ${valueTone(day.pnl_pct)}`}>
+                                  {day.valid ? signedPercent(day.pnl_pct) : "-"}
+                                </td>
+                                <td className="px-3 py-3 text-right tabular-nums">
+                                  {day.valid
+                                    ? `${money.format(day.start_equity)} → ${money.format(day.end_equity)}`
+                                    : "-"}
+                                </td>
+                                <td className="px-3 py-3 text-right tabular-nums">{money.format(day.buy_notional)}</td>
+                                <td className="px-3 py-3 text-right tabular-nums">{money.format(day.sell_notional)}</td>
+                                <td className={`px-3 py-3 text-right tabular-nums ${valueTone(day.cash_delta)}`}>
+                                  {signedMoney(money, day.cash_delta)}
+                                </td>
+                                <td className="px-3 py-3 text-right tabular-nums">
+                                  {day.run_count}/{day.error_count}
+                                </td>
+                              </tr>
+                            ))}
+                            {!monthlyRecord.days.length && (
+                              <tr>
+                                <td colSpan={8} className="px-3 py-8 text-center text-slate-500">
+                                  이 달의 기록이 없습니다.
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+                  </>
+                ) : (
+                  <div className="border border-slate-200 dark:border-slate-800 rounded-md p-6 text-center text-slate-500">
+                    {monthlyLoading ? "월간 기록을 불러오는 중입니다." : "이 달의 기록이 없습니다."}
+                  </div>
+                )}
+              </section>
+
+              {dailyRecord ? (
+              <section className="space-y-6" aria-label="일일 기록">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-subheading">선택일 기록</h3>
+                  <span className={`text-caption ${dailyRecord.valid ? "text-slate-500" : "text-amber-700 dark:text-amber-300"}`}>
+                    {dayLabel(sessionDateToIso(session.session_date))}
+                    {dailyRecord.valid ? "" : " · 데이터 이상"}
+                  </span>
+                </div>
+                {!dailyRecord.valid && (
+                  <div className="border border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-300 rounded-md p-3 text-sm">
+                    계좌 스냅샷이 비정상적으로 튀어 이 날짜는 월간 손익 합계에서 제외했습니다.
+                  </div>
+                )}
+                <div className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+                  {[
+                    ["일일 평가손익", dailyRecord.valid ? signedMoney(money, dailyRecord.pnl) : "데이터 이상", dailyRecord.valid ? valueTone(dailyRecord.pnl) : "text-amber-700 dark:text-amber-300"],
+                    ["수익률", dailyRecord.valid ? signedPercent(dailyRecord.pnl_pct) : "-", dailyRecord.valid ? valueTone(dailyRecord.pnl_pct) : ""],
+                    ["평가액", dailyRecord.valid ? `${money.format(dailyRecord.start_equity)} → ${money.format(dailyRecord.end_equity)}` : "-", ""],
+                    ["현금 변화", signedMoney(money, dailyRecord.cash_delta), valueTone(dailyRecord.cash_delta)],
+                    ["보유평가 변화", signedMoney(money, dailyRecord.holdings_value_delta), valueTone(dailyRecord.holdings_value_delta)],
+                    ["순거래 현금흐름", signedMoney(money, dailyRecord.net_trade_cashflow), valueTone(dailyRecord.net_trade_cashflow)],
+                  ].map(([label, value, tone]) => (
+                    <div key={label} className="card min-w-0">
+                      <span className="text-caption text-slate-500">{label}</span>
+                      <strong className={`block text-lg mt-1 break-words ${tone}`}>{value}</strong>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid lg:grid-cols-4 gap-3">
+                  {[
+                    ["시작 현금", money.format(dailyRecord.start_cash)],
+                    ["매수", signedMoney(money, -dailyRecord.buy_notional)],
+                    ["매도", signedMoney(money, dailyRecord.sell_notional)],
+                    ["종료 현금", money.format(dailyRecord.end_cash)],
+                  ].map(([label, value]) => (
+                    <div
+                      key={label}
+                      className="border-y border-slate-200 dark:border-slate-800 py-4 min-w-0"
+                    >
+                      <span className="text-caption text-slate-500">{label}</span>
+                      <strong className="block text-xl mt-1 break-words">{value}</strong>
+                    </div>
+                  ))}
+                </div>
+
+                <section className="border-y border-slate-200 dark:border-slate-800">
+                  <div className="py-4 flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-subheading">돈의 흐름</h3>
+                    <span className="text-caption text-slate-500">
+                      리포트 스냅샷 기준 추정치 · 차이 {signedMoney(money, dailyRecord.cash_reconciliation_delta)}
+                    </span>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[860px] text-sm">
+                      <thead className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
+                        <tr>
+                          <th className="text-left px-3 py-2">{config.timeLabel}</th>
+                          <th className="text-right px-3 py-2">평가액</th>
+                          <th className="text-right px-3 py-2">현금</th>
+                          <th className="text-right px-3 py-2">보유평가</th>
+                          <th className="text-right px-3 py-2">매수</th>
+                          <th className="text-right px-3 py-2">매도</th>
+                          <th className="text-right px-3 py-2">순거래</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                        {dailyRecord.points.map((point) => (
+                          <tr key={`${point.run_id}-${point.time}`} className="hover:bg-slate-50 dark:hover:bg-slate-900/60">
+                            <td className="px-3 py-3 font-medium">
+                              <button type="button" onClick={() => void selectRun(point.run_id)} className="hover:text-primary">
+                                {marketTime(point.time, market)}
+                              </button>
+                            </td>
+                            <td className="px-3 py-3 text-right tabular-nums">{money.format(point.equity)}</td>
+                            <td className="px-3 py-3 text-right tabular-nums">{money.format(point.cash)}</td>
+                            <td className="px-3 py-3 text-right tabular-nums">{money.format(point.holdings_value)}</td>
+                            <td className="px-3 py-3 text-right tabular-nums">{money.format(point.buy_notional)}</td>
+                            <td className="px-3 py-3 text-right tabular-nums">{money.format(point.sell_notional)}</td>
+                            <td className={`px-3 py-3 text-right tabular-nums ${valueTone(point.net_trade_cashflow)}`}>
+                              {signedMoney(money, point.net_trade_cashflow)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              </section>
+            ) : (
+              <div className="border border-slate-200 dark:border-slate-800 rounded-md p-8 text-center text-slate-500">
+                기록 가능한 계좌 스냅샷이 없습니다.
+              </div>
+              )}
+            </div>
           )}
         </>
       )}

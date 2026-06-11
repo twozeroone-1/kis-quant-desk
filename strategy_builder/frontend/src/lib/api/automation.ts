@@ -20,10 +20,95 @@ export interface AutomationRunSummary {
     skipped: number;
   };
   buy_notional: number;
+  sell_notional?: number;
   pending_count: number;
   app_reservation_count: number;
   protective_count: number;
   errors: string[];
+}
+
+export interface AutomationDailyRecordPoint {
+  run_id: string;
+  time: string;
+  equity: number;
+  cash: number;
+  holdings_value: number;
+  buy_notional: number;
+  sell_notional: number;
+  net_trade_cashflow: number;
+}
+
+export interface AutomationDailyRecord {
+  source: "automation_report";
+  estimate: boolean;
+  valid: boolean;
+  anomalies: string[];
+  start_equity: number;
+  end_equity: number;
+  pnl: number;
+  pnl_pct: number;
+  start_cash: number;
+  end_cash: number;
+  cash_delta: number;
+  start_holdings_value: number;
+  end_holdings_value: number;
+  holdings_value_delta: number;
+  buy_notional: number;
+  sell_notional: number;
+  net_trade_cashflow: number;
+  cash_reconciliation_delta: number;
+  points: AutomationDailyRecordPoint[];
+}
+
+export interface AutomationMonthlyRecordDay {
+  date: string;
+  session_date: string;
+  valid: boolean;
+  anomalies: string[];
+  run_count: number;
+  pnl: number;
+  pnl_pct: number;
+  start_equity: number;
+  end_equity: number;
+  start_cash: number;
+  end_cash: number;
+  cash_delta: number;
+  start_holdings_value: number;
+  end_holdings_value: number;
+  holdings_value_delta: number;
+  buy_notional: number;
+  sell_notional: number;
+  net_trade_cashflow: number;
+  cash_reconciliation_delta: number;
+  error_count: number;
+}
+
+export interface AutomationMonthlyRecord {
+  market: AutomationMarket;
+  month: string;
+  source: "automation_report";
+  estimate: boolean;
+  summary: {
+    day_count: number;
+    trading_days: number;
+    anomaly_days: number;
+    win_days: number;
+    loss_days: number;
+    flat_days: number;
+    pnl: number;
+    pnl_pct: number;
+    account_pnl: number;
+    account_pnl_pct: number;
+    start_equity: number;
+    end_equity: number;
+    buy_notional: number;
+    sell_notional: number;
+    net_trade_cashflow: number;
+    cash_delta: number;
+    cash_reconciliation_delta: number;
+    error_count: number;
+  };
+  days: AutomationMonthlyRecordDay[];
 }
 
 export interface AutomationSession {
@@ -33,6 +118,8 @@ export interface AutomationSession {
   run_count: number;
   runs: AutomationRunSummary[];
   cumulative_buy_notional: number;
+  cumulative_sell_notional?: number;
+  daily_record?: AutomationDailyRecord | null;
   session_buy_limit: number;
   remaining_buy_budget: number;
   session_loss_limit: number;
@@ -100,6 +187,12 @@ export async function getAutomationSession(market: AutomationMarket, sessionDate
 export async function getAutomationRun(market: AutomationMarket, runId: string) {
   return apiGet<{ status: "success"; data: AutomationRunDetail }>(
     `/api/automation/${market}/runs/${runId}`
+  );
+}
+
+export async function getAutomationMonthlyRecord(market: AutomationMarket, month: string) {
+  return apiGet<{ status: "success"; data: AutomationMonthlyRecord }>(
+    `/api/automation/${market}/records/monthly?month=${encodeURIComponent(month)}`
   );
 }
 
