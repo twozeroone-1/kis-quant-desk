@@ -76,6 +76,9 @@ MIN_BUY_STRENGTH = 0.70
 MAX_NEW_BUY_SYMBOLS = env_int("KR_MARKET_MAX_NEW_BUY_SYMBOLS", 2)
 MAX_PER_SYMBOL_BUY_PCT = env_fraction("KR_MARKET_MAX_PER_SYMBOL_BUY_PCT", 0.01)
 ORGANIC_STRATEGY_MAX_SYMBOLS = env_int("KR_MARKET_ORGANIC_MAX_SYMBOLS", 3)
+ALLOW_SAME_SYMBOL_ADD = env_truthy("KR_MARKET_ALLOW_SAME_SYMBOL_ADD")
+BLOCK_DISPARITY_SELL_STRENGTH = env_fraction("KR_MARKET_BLOCK_DISPARITY_SELL_STRENGTH", 0.8)
+BLOCK_BOLLINGER_SELL_STRENGTH = env_fraction("KR_MARKET_BLOCK_BOLLINGER_SELL_STRENGTH", 0.6)
 RISK_CONTROL_BLOCKS_NEW_BUYS = True
 LLM_DECIDER_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_llm_decider.py"
 CALENDAR_PATH = PROJECT_ROOT / ".codex" / "scripts" / "kr_market_calendar.py"
@@ -275,6 +278,92 @@ def evaluate_market_risk(news_summary: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def held_codes(account: dict[str, Any]) -> set[str]:
+    return {
+        str(row.get("stock_code") or "")
+        for row in account.get("holdings", [])
+        if int(float(row.get("quantity") or 0)) > 0
+    }
+
+
+def successful_buy_codes(state: dict[str, Any]) -> set[str]:
+    return {
+        str(order.get("code") or order.get("stock_code") or "")
+        for order in state.get("orders", [])
+        if order.get("order_status") == "success"
+    }
+
+
+def strategy_vote_strength(signal: dict[str, Any], strategy_id: str, action: str) -> float:
+    for vote in signal.get("strategy_votes") or []:
+        if (
+            str(vote.get("strategy_id") or "") == strategy_id
+            and str(vote.get("action") or "").upper() == action.upper()
+        ):
+            return float(vote.get("strength") or 0)
+    return 0.0
+
+
+def buy_block_reasons(
+    signal: dict[str, Any],
+    account: dict[str, Any],
+    state: dict[str, Any],
+) -> list[str]:
+    code = str(signal.get("code") or signal.get("symbol") or "")
+    reasons: list[str] = []
+    if not ALLOW_SAME_SYMBOL_ADD:
+        if code in held_codes(account):
+            reasons.append("same symbol already held")
+        if code in successful_buy_codes(state):
+            reasons.append("already bought today")
+    disparity_sell = strategy_vote_strength(signal, "disparity", "SELL")
+    if disparity_sell >= BLOCK_DISPARITY_SELL_STRENGTH:
+        reasons.append(
+            f"overbought disparity sell warning {disparity_sell:.2f}"
+        )
+    bollinger_sell = strategy_vote_strength(signal, "bollinger_rsi_mean_reversion", "SELL")
+    if bollinger_sell >= BLOCK_BOLLINGER_SELL_STRENGTH:
+        reasons.append(
+            f"bollinger/rsi mean-reversion sell warning {bollinger_sell:.2f}"
+        )
+    return reasons
+
+
+def buy_block_reasons_by_code(
+    signals: list[dict[str, Any]],
+    account: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, list[str]]:
+    blocked: dict[str, list[str]] = {}
+    for signal in signals:
+        if str(signal.get("action") or "").upper() != "BUY":
+            continue
+        code = str(signal.get("code") or signal.get("symbol") or "")
+        reasons = buy_block_reasons(signal, account, state)
+        if code and reasons:
+            blocked[code] = reasons
+    return blocked
+
+
+def apply_buy_block_reasons(
+    decisions: list[dict[str, Any]],
+    blocked_reasons: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    normalized = []
+    for decision in decisions:
+        code = str(decision.get("code") or "")
+        reasons = blocked_reasons.get(code)
+        if not reasons:
+            normalized.append(decision)
+            continue
+        normalized.append({
+            **decision,
+            "status": "blocked",
+            "reasons": reasons,
+        })
+    return normalized
+
+
 def build_buy_orders(
     results: list[dict[str, Any]],
     account: dict[str, Any],
@@ -298,6 +387,7 @@ def build_buy_orders(
         if row.get("action") == "BUY"
         and float(row.get("strength") or 0) >= MIN_BUY_STRENGTH
         and float(row.get("target_price") or 0) > 0
+        and not buy_block_reasons(row, account, state)
     ]
     candidates.sort(key=lambda row: float(row.get("strength") or 0), reverse=True)
     selected_candidates = candidates[:MAX_NEW_BUY_SYMBOLS]
@@ -493,6 +583,7 @@ def place_sells(
             signal["order_status"] = "skipped_no_holding"
             submitted.append(signal)
             continue
+        estimated_amount = float(signal.get("target_price") or 0) * qty
         payload = {
             "stock_code": signal["code"],
             "stock_name": signal.get("name") or signal["code"],
@@ -503,6 +594,8 @@ def place_sells(
             "signal_reason": signal.get("reason") or "SELL signal",
             "market": "domestic",
         }
+        signal["quantity"] = qty
+        signal["amount"] = estimated_amount
         approval_details = {
             "market_label": "국내",
             "action": "SELL",
@@ -963,6 +1056,15 @@ def compact_account(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def order_filled_or_completed(order: dict[str, Any]) -> bool:
+    if float(order.get("filled_quantity") or 0) > 0:
+        return True
+    if order.get("order_status") == "success":
+        return True
+    result = order.get("order_result") if isinstance(order.get("order_result"), dict) else {}
+    return result.get("status") == "success"
+
+
 def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
     signals = payload.get("signals") or []
     orders = [*payload.get("submitted_sells", []), *payload.get("submitted_buys", [])]
@@ -983,13 +1085,23 @@ def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
         },
         "order_counts": {
             "submitted": sum(1 for order in orders if order.get("order_status") in success_statuses),
-            "filled": sum(1 for order in orders if float(order.get("filled_quantity") or 0) > 0),
+            "filled": sum(1 for order in orders if order_filled_or_completed(order)),
             "failed": sum(1 for order in orders if order.get("order_status") in failed_statuses),
             "skipped": sum(1 for order in orders if str(order.get("order_status") or "").startswith("skipped")),
         },
         "buy_notional": round(sum(
             float(order.get("amount") or order.get("notional") or 0)
             for order in payload.get("submitted_buys", [])
+            if order.get("order_status") in success_statuses
+        ), 2),
+        "sell_notional": round(sum(
+            float(
+                order.get("amount")
+                or order.get("notional")
+                or float(order.get("target_price") or order.get("price") or 0)
+                * float(order.get("quantity") or 0)
+            )
+            for order in payload.get("submitted_sells", [])
             if order.get("order_status") in success_statuses
         ), 2),
         "account_before": compact_account(payload.get("account_before", {})),
@@ -1021,6 +1133,7 @@ def normalize_summary_run(run: dict[str, Any]) -> dict[str, Any]:
         "signal_counts": {"BUY": 0, "SELL": 0, "HOLD": 0, "ERROR": 0},
         "order_counts": {"submitted": 0, "filled": 0, "failed": 0, "skipped": 0},
         "buy_notional": 0.0,
+        "sell_notional": 0.0,
         "account_before": {},
         "account_after": {},
         "pending_count": 0,
@@ -1035,6 +1148,7 @@ def normalize_summary_run(run: dict[str, Any]) -> dict[str, Any]:
 def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str, Any]:
     runs = [normalize_summary_run(run) for run in state.get("runs", []) if isinstance(run, dict)]
     cumulative_buy = round(sum(float(run.get("buy_notional") or 0) for run in runs), 2)
+    cumulative_sell = round(sum(float(run.get("sell_notional") or 0) for run in runs), 2)
     latest_account = next((run.get("account_after") for run in reversed(runs) if run.get("account_after")), {})
     risk_equity = float((latest_account or {}).get("risk_equity") or 0)
     summary = {
@@ -1045,6 +1159,7 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
         "runs": runs,
         "events": state.get("events", []),
         "cumulative_buy_notional": cumulative_buy,
+        "cumulative_sell_notional": cumulative_sell,
         "session_buy_limit": round(risk_equity * TOTAL_BUY_PCT, 2),
         "remaining_buy_budget": round(max(0.0, risk_equity * TOTAL_BUY_PCT - cumulative_buy), 2),
         "session_loss_limit": round(risk_equity * DAILY_LOSS_PCT, 2),
@@ -1068,12 +1183,13 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
         f"- Updated: {summary['updated_at']}",
         f"- Runs: {summary['run_count']}",
         f"- Cumulative buys: {cumulative_buy:,.0f}원",
+        f"- Cumulative sells: {cumulative_sell:,.0f}원",
         f"- Remaining buy budget: {summary['remaining_buy_budget']:,.0f}원",
         f"- Remaining loss budget: {summary['remaining_loss_budget']:,.0f}원",
         "",
         "## Timeline",
-        "| KST Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Errors |",
-        "|---|---|---|---:|---|---|---:|",
+        "| KST Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Buy | Sell | Errors |",
+        "|---|---|---|---:|---|---|---:|---:|---:|",
     ]
     for run in runs:
         counts = run.get("signal_counts", {})
@@ -1083,6 +1199,8 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
             f"{float(run.get('duration_seconds') or 0):.1f}s | "
             f"{counts.get('BUY', 0)}/{counts.get('SELL', 0)}/{counts.get('HOLD', 0)} | "
             f"{order_counts.get('submitted', 0)}/{order_counts.get('filled', 0)}/{order_counts.get('failed', 0)} | "
+            f"{float(run.get('buy_notional') or 0):,.0f}원 | "
+            f"{float(run.get('sell_notional') or 0):,.0f}원 | "
             f"{len(run.get('errors') or [])} |"
         )
     (RUNTIME_DIR / f"{session_date}_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1106,12 +1224,14 @@ def telegram_message(payload: dict[str, Any], summary: dict[str, Any] | None = N
         f"Signals B/S/H {counts['BUY']}/{counts['SELL']}/{counts['HOLD']}\n"
         f"Orders submitted/filled/failed "
         f"{order_counts['submitted']}/{order_counts['filled']}/{order_counts['failed']}\n"
-        f"Buy {run['buy_notional']:,.0f}원, errors {len(run['errors'])}{link}"
+        f"Buy {run['buy_notional']:,.0f}원, Sell {run['sell_notional']:,.0f}원, "
+        f"errors {len(run['errors'])}{link}"
     )
     if summary is not None:
         text += (
             f"\nSession total: {summary['run_count']} runs, "
             f"buys {summary['cumulative_buy_notional']:,.0f}원, "
+            f"sells {summary.get('cumulative_sell_notional', 0):,.0f}원, "
             f"remaining risk {summary['remaining_loss_budget']:,.0f}원"
         )
     return text
@@ -1130,6 +1250,7 @@ def session_telegram_message(summary: dict[str, Any]) -> str:
         f"Runs {summary.get('run_count', 0)}, submitted/filled/failed "
         f"{totals.get('submitted', 0)}/{totals.get('filled', 0)}/{totals.get('failed', 0)}\n"
         f"Buys {float(summary.get('cumulative_buy_notional') or 0):,.0f}원, "
+        f"Sells {float(summary.get('cumulative_sell_notional') or 0):,.0f}원, "
         f"remaining loss budget {float(summary.get('remaining_loss_budget') or 0):,.0f}원, "
         f"errors {totals.get('errors', 0)}{link}"
     )
@@ -1369,14 +1490,18 @@ def main() -> int:
         market_regime=market_risk["regime"],
         risk_gate_open=market_risk["risk_gate_open"],
     )
-    order_decisions = explain_order_decisions(
-        signals,
-        planned_buys,
-        min_buy_strength=MIN_BUY_STRENGTH,
-        risk_gate_open=market_risk["risk_gate_open"],
-        risk_reasons=market_risk["reasons"],
-        order_execution_enabled=can_submit_orders,
-        order_block_reasons=order_block_reasons,
+    buy_blockers = buy_block_reasons_by_code(signals, account_before["account"], state)
+    order_decisions = apply_buy_block_reasons(
+        explain_order_decisions(
+            signals,
+            planned_buys,
+            min_buy_strength=MIN_BUY_STRENGTH,
+            risk_gate_open=market_risk["risk_gate_open"],
+            risk_reasons=market_risk["reasons"],
+            order_execution_enabled=can_submit_orders,
+            order_block_reasons=order_block_reasons,
+        ),
+        buy_blockers,
     )
     llm_context = {
         "run_id": run_id,
@@ -1414,11 +1539,15 @@ def main() -> int:
             "take_profit_pct": TAKE_PROFIT_PCT,
             "stop_loss_pct": STOP_LOSS_PCT,
             "min_buy_strength": MIN_BUY_STRENGTH,
-                "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
-                "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
-                "organic_strategy_max_symbols": ORGANIC_STRATEGY_MAX_SYMBOLS,
-                "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
-            },
+            "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
+            "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
+            "organic_strategy_max_symbols": ORGANIC_STRATEGY_MAX_SYMBOLS,
+            "allow_same_symbol_add": ALLOW_SAME_SYMBOL_ADD,
+            "block_disparity_sell_strength": BLOCK_DISPARITY_SELL_STRENGTH,
+            "block_bollinger_sell_strength": BLOCK_BOLLINGER_SELL_STRENGTH,
+            "buy_blockers": buy_blockers,
+            "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
+        },
     }
     llm_result = run_llm_decision(effective_llm_mode, llm_context)
     executable_buys = apply_llm_decision(planned_buys, llm_result, effective_llm_mode)
@@ -1529,6 +1658,10 @@ def main() -> int:
             "max_new_buy_symbols": MAX_NEW_BUY_SYMBOLS,
             "max_per_symbol_buy_pct": MAX_PER_SYMBOL_BUY_PCT,
             "organic_strategy_max_symbols": ORGANIC_STRATEGY_MAX_SYMBOLS,
+            "allow_same_symbol_add": ALLOW_SAME_SYMBOL_ADD,
+            "block_disparity_sell_strength": BLOCK_DISPARITY_SELL_STRENGTH,
+            "block_bollinger_sell_strength": BLOCK_BOLLINGER_SELL_STRENGTH,
+            "buy_blockers": buy_blockers,
             "bought_today_before": sum(float(order.get("amount") or 0) for order in state.get("orders", [])),
         },
     }

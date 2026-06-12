@@ -278,6 +278,17 @@ KIS Quant Desk는 모의투자와 실전투자를 동시에 검증할 수 있도
 | 보호주문 한계 | KIS 서버 OCO가 아니라 앱 레벨 감시입니다. 백엔드, 인증, 네트워크가 중단되면 자동 감시도 중단될 수 있습니다. |
 | 세션 리포트 | 실행별 JSON/Markdown과 일별 `_summary.json`/`_summary.md`를 `.codex/runtime/kr_market_auto/`에 저장합니다. `/automation` 화면은 이 파일을 읽는 read-only 대시보드입니다. |
 
+**신규 매수 안전 게이트**
+
+한국장 자동매매는 단일 종목을 여러 시간대에 계속 누적 매수하는 상황을 줄이기 위해 아래 조건에서는 신규 BUY 신호가 있어도 매수 주문을 만들지 않습니다. 차단 사유는 세션 JSON의 `order_decisions`와 `safety.buy_blockers`에 기록되어 `/automation`에서 추적할 수 있습니다.
+
+| 조건 | 기본 동작 | 조정 변수 |
+|------|-----------|-----------|
+| 같은 종목 보유 중 | 추가 매수 차단 | `KR_MARKET_ALLOW_SAME_SYMBOL_ADD=1`이면 허용 |
+| 같은 날 이미 성공 매수 | 재매수 차단 | 고정 정책 |
+| 괴리율 전략 과열 경고 | `disparity` SELL 강도 `0.80` 이상이면 차단 | `KR_MARKET_BLOCK_DISPARITY_SELL_STRENGTH` |
+| 볼린저/RSI 역추세 경고 | `bollinger_rsi_mean_reversion` SELL 강도 `0.60` 이상이면 차단 | `KR_MARKET_BLOCK_BOLLINGER_SELL_STRENGTH` |
+
 **국내 모의투자(vps) 일일 실행**
 
 ```bash
@@ -322,7 +333,7 @@ Telegram 알림은 `.codex/local/kr_market_auto.env`의 `TELEGRAM_BOT_TOKEN`, `T
 |------|------|
 | 시장 탭 | `미국장 자동매매`와 `한국장 자동매매` 탭을 제공합니다. |
 | 세션 요약 | 실행 횟수, 누적 매수, 리포트 기준 주문가능금액, 남은 자동매수 한도, 남은 손실 한도, 오류 건수를 표시합니다. |
-| 시간별 타임라인 | 각 실행의 BUY/SELL/HOLD, 제출/체결/실패, 매수금액, 미체결/보호주문 수를 표시합니다. |
+| 시간별 타임라인 | 각 실행의 BUY/SELL/HOLD, 제출/체결/실패, 매수금액/매도금액, 미체결/보호주문 수를 표시합니다. |
 | 상세 리포트 | 실행별 주문 결과, 오류, 원본 Markdown/JSON 다운로드 링크를 제공합니다. |
 | 유지보수 포인트 | 화면의 오류 건수는 자동화 판단 실패, 주문 실패, 예약/보호주문 health 오류를 합산합니다. 원인 분석은 해당 run의 JSON/Markdown을 먼저 보고, 필요하면 백엔드 로그와 보호주문 상태를 확인합니다. |
 

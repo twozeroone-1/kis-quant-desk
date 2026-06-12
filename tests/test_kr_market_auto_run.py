@@ -78,6 +78,82 @@ class KrMarketAutoRunTest(unittest.TestCase):
 
         self.assertEqual(orders, [])
 
+    def test_build_buy_orders_blocks_current_holding_same_symbol_add(self):
+        results = [
+            {"code": "105560", "name": "KB금융", "action": "BUY", "strength": 0.95, "target_price": 100000},
+        ]
+        account = {
+            "deposit": {"total_eval": 100_000_000, "deposit": 100_000_000},
+            "holdings": [{"stock_code": "105560", "quantity": 3}],
+        }
+
+        orders = kr_market_auto_run.build_buy_orders(results, account, {"orders": []})
+        blockers = kr_market_auto_run.buy_block_reasons_by_code(results, account, {"orders": []})
+
+        self.assertEqual(orders, [])
+        self.assertEqual(blockers["105560"], ["same symbol already held"])
+
+    def test_build_buy_orders_blocks_already_bought_today(self):
+        results = [
+            {"code": "105560", "name": "KB금융", "action": "BUY", "strength": 0.95, "target_price": 100000},
+        ]
+        account = {"deposit": {"total_eval": 100_000_000, "deposit": 100_000_000}}
+        state = {"orders": [{"code": "105560", "amount": 100000, "order_status": "success"}]}
+
+        orders = kr_market_auto_run.build_buy_orders(results, account, state)
+        blockers = kr_market_auto_run.buy_block_reasons_by_code(results, account, state)
+
+        self.assertEqual(orders, [])
+        self.assertEqual(blockers["105560"], ["already bought today"])
+
+    def test_build_buy_orders_blocks_overbought_sell_votes(self):
+        results = [
+            {
+                "code": "105560",
+                "name": "KB금융",
+                "action": "BUY",
+                "strength": 0.95,
+                "target_price": 100000,
+                "strategy_votes": [
+                    {"strategy_id": "disparity", "action": "SELL", "strength": 1.0},
+                    {"strategy_id": "bollinger_rsi_mean_reversion", "action": "SELL", "strength": 0.7},
+                ],
+            },
+        ]
+        account = {"deposit": {"total_eval": 100_000_000, "deposit": 100_000_000}}
+
+        orders = kr_market_auto_run.build_buy_orders(results, account, {"orders": []})
+        blockers = kr_market_auto_run.buy_block_reasons_by_code(results, account, {"orders": []})
+
+        self.assertEqual(orders, [])
+        self.assertEqual(
+            blockers["105560"],
+            [
+                "overbought disparity sell warning 1.00",
+                "bollinger/rsi mean-reversion sell warning 0.70",
+            ],
+        )
+
+    def test_apply_buy_block_reasons_updates_order_decisions(self):
+        decisions = [
+            {
+                "code": "105560",
+                "name": "KB금융",
+                "action": "BUY",
+                "strength": 0.95,
+                "status": "blocked",
+                "reasons": ["budget, max symbol count, or per-symbol cap blocked the order"],
+            }
+        ]
+
+        updated = kr_market_auto_run.apply_buy_block_reasons(
+            decisions,
+            {"105560": ["same symbol already held"]},
+        )
+
+        self.assertEqual(updated[0]["status"], "blocked")
+        self.assertEqual(updated[0]["reasons"], ["same symbol already held"])
+
     def test_evaluate_market_risk_blocks_news_risk_control(self):
         risk = kr_market_auto_run.evaluate_market_risk({"regime": "risk_control"})
 
@@ -365,7 +441,12 @@ class KrMarketAutoRunTest(unittest.TestCase):
                 {"code": "005380", "action": "HOLD"},
             ],
             "submitted_buys": [{"code": "005930", "amount": 140000, "order_status": "success"}],
-            "submitted_sells": [],
+            "submitted_sells": [{
+                "code": "000660",
+                "quantity": 1,
+                "target_price": 120000,
+                "order_status": "success",
+            }],
             "account_before": {"account": {"deposit": {"total_eval": 10_000_000, "deposit": 5_000_000}}},
             "account_after": {"account": {"deposit": {"total_eval": 10_000_000, "deposit": 4_860_000}}},
         }
@@ -376,10 +457,13 @@ class KrMarketAutoRunTest(unittest.TestCase):
         self.assertEqual(summary["signal_counts"]["BUY"], 1)
         self.assertEqual(summary["signal_counts"]["SELL"], 1)
         self.assertEqual(summary["signal_counts"]["HOLD"], 1)
-        self.assertEqual(summary["order_counts"]["submitted"], 1)
+        self.assertEqual(summary["order_counts"]["submitted"], 2)
+        self.assertEqual(summary["order_counts"]["filled"], 2)
         self.assertEqual(summary["buy_notional"], 140000)
+        self.assertEqual(summary["sell_notional"], 120000)
         self.assertIn("KR paper 20260609_0910_KST completed", message)
         self.assertIn("Buy 140,000원", message)
+        self.assertIn("Sell 120,000원", message)
 
     def test_write_session_summary_persists_kr_summary_files(self):
         original_runtime = kr_market_auto_run.RUNTIME_DIR
@@ -396,6 +480,7 @@ class KrMarketAutoRunTest(unittest.TestCase):
                         "signal_counts": {"BUY": 1, "SELL": 0, "HOLD": 1, "ERROR": 0},
                         "order_counts": {"submitted": 1, "filled": 0, "failed": 0, "skipped": 0},
                         "buy_notional": 140000,
+                        "sell_notional": 120000,
                         "account_after": {"risk_equity": 10_000_000},
                         "errors": [],
                     }]
@@ -404,6 +489,7 @@ class KrMarketAutoRunTest(unittest.TestCase):
                 summary = kr_market_auto_run.write_session_summary("20260609", state)
 
                 self.assertEqual(summary["remaining_buy_budget"], 860000)
+                self.assertEqual(summary["cumulative_sell_notional"], 120000)
                 self.assertTrue((Path(tmpdir) / "20260609_summary.json").is_file())
                 self.assertTrue((Path(tmpdir) / "20260609_summary.md").is_file())
         finally:
