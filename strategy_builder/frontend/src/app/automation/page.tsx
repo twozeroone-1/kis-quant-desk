@@ -124,6 +124,32 @@ function valueTone(value: number) {
   return "text-slate-700 dark:text-slate-300";
 }
 
+function positionStatusClass(status: string) {
+  if (status === "closed") return "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300";
+  if (status === "exiting") return "bg-amber-100 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300";
+  if (status === "unknown") return "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300";
+  return "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300";
+}
+
+function compactDateTime(value: string | null | undefined, market: AutomationMarket) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("ko-KR", {
+    timeZone: marketConfig[market].timezone,
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function holdingPeriod(days: number) {
+  if (!Number.isFinite(days) || days <= 0) return "당일";
+  return `${days}일`;
+}
+
 function orderSymbol(item: Record<string, unknown>) {
   return String(item.symbol ?? item.code ?? item.stock_code ?? "-");
 }
@@ -159,6 +185,11 @@ export default function AutomationPage() {
   const config = marketConfig[market];
   const latestCash = Number(session?.latest_account?.cash ?? 0);
   const dailyRecord = session?.daily_record ?? null;
+  const positionJournal = session?.position_journal ?? [];
+  const warningCount = (session?.runs ?? []).reduce(
+    (total, item) => total + (item.warnings?.length ?? 0),
+    0
+  );
   const monthOptions = useMemo(
     () =>
       Array.from(
@@ -258,11 +289,6 @@ export default function AutomationPage() {
     }
   };
 
-  const selectedRunSummary = useMemo(
-    () => session?.runs.find((item) => item.run_id === run?.run_id),
-    [run?.run_id, session?.runs]
-  );
-
   if (status.mode !== "vps") {
     return (
       <div className="max-w-7xl mx-auto px-4 py-8">
@@ -361,7 +387,7 @@ export default function AutomationPage() {
         <>
           {view === "execution" && (
             <>
-          <section className="grid grid-cols-2 lg:grid-cols-7 gap-3" aria-label="세션 요약">
+          <section className="grid grid-cols-2 lg:grid-cols-8 gap-3" aria-label="세션 요약">
             {[
               ["실행", `${session.run_count}회`],
               ["누적 매수", money.format(session.cumulative_buy_notional ?? 0)],
@@ -370,6 +396,7 @@ export default function AutomationPage() {
               ["남은 자동매수 한도", money.format(session.remaining_buy_budget)],
               ["남은 손실 한도", money.format(session.remaining_loss_budget)],
               ["오류", `${session.totals.errors}건`],
+              ["주의", `${warningCount}건`],
             ].map(([label, value]) => (
               <div key={label} className="card min-w-0">
                 <span className="text-caption text-slate-500">{label}</span>
@@ -389,7 +416,7 @@ export default function AutomationPage() {
                     <th className="text-left px-3 py-2">{config.timeLabel}</th>
                     <th className="text-left px-3 py-2">상태</th>
                     <th className="text-right px-3 py-2">BUY/SELL/HOLD</th>
-                    <th className="text-right px-3 py-2">제출/체결/실패</th>
+                    <th className="text-right px-3 py-2">제출/체결/실패/보류</th>
                     <th className="text-right px-3 py-2">매수금액</th>
                     <th className="text-right px-3 py-2">매도금액</th>
                     <th className="text-right px-3 py-2">대기/보호</th>
@@ -415,7 +442,7 @@ export default function AutomationPage() {
                           {item.signal_counts.BUY}/{item.signal_counts.SELL}/{item.signal_counts.HOLD}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums">
-                          {item.order_counts.submitted}/{item.order_counts.filled}/{item.order_counts.failed}
+                          {item.order_counts.submitted}/{item.order_counts.filled}/{item.order_counts.failed}/{item.order_counts.deferred ?? 0}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums">{money.format(item.buy_notional ?? 0)}</td>
                         <td className="px-3 py-3 text-right tabular-nums">{money.format(item.sell_notional ?? 0)}</td>
@@ -450,7 +477,7 @@ export default function AutomationPage() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h3 className="text-subheading">{run.run_id}</h3>
                 <span className="text-caption text-slate-500">
-                  {run.duration_seconds.toFixed(1)}초 · {selectedRunSummary?.errors.length ?? 0} errors
+                  {run.duration_seconds.toFixed(1)}초 · {run.errors?.length ?? 0} errors · {run.warnings?.length ?? 0} warnings
                 </span>
               </div>
 
@@ -530,7 +557,7 @@ export default function AutomationPage() {
                 </div>
               )}
 
-              <div className="grid lg:grid-cols-2 gap-6">
+              <div className="grid lg:grid-cols-3 gap-6">
                 <div>
                   <h4 className="text-sm font-semibold mb-2">주문 결과</h4>
                   <div className="border border-slate-200 dark:border-slate-800 rounded-md overflow-x-auto">
@@ -571,6 +598,18 @@ export default function AutomationPage() {
                       </ul>
                     ) : (
                       <p className="text-sm text-slate-500">기록된 오류 없음</p>
+                    )}
+                  </div>
+                </div>
+                <div>
+                  <h4 className="text-sm font-semibold mb-2">주의</h4>
+                  <div className="border border-amber-200 dark:border-amber-900 rounded-md min-h-28 p-3">
+                    {run.warnings?.length ? (
+                      <ul className="space-y-2 text-sm text-amber-700 dark:text-amber-300">
+                        {run.warnings.map((item, index) => <li key={index} className="break-words">{item}</li>)}
+                      </ul>
+                    ) : (
+                      <p className="text-sm text-slate-500">기록된 주의 없음</p>
                     )}
                   </div>
                 </div>
@@ -788,6 +827,94 @@ export default function AutomationPage() {
                             </td>
                           </tr>
                         ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+
+                <section className="border-y border-slate-200 dark:border-slate-800">
+                  <div className="py-4 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-subheading">포지션 추적</h3>
+                      <p className="text-caption text-slate-500 mt-1">
+                        매수 주문과 보호주문/전략 매도 기록을 연결한 추정 생애
+                      </p>
+                    </div>
+                    {session.position_journal_summary && (
+                      <span className="text-caption text-slate-500">
+                        보유 {session.position_journal_summary.active} · 익절 {session.position_journal_summary.take_profit} · 손절 {session.position_journal_summary.stop_loss} · 추적끊김 {session.position_journal_summary.unknown ?? 0} · 2일+ {session.position_journal_summary.held_over_2_days}
+                      </span>
+                    )}
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[1080px] text-sm">
+                      <thead className="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300">
+                        <tr>
+                          <th className="text-left px-3 py-2">종목</th>
+                          <th className="text-right px-3 py-2">수량</th>
+                          <th className="text-right px-3 py-2">진입</th>
+                          <th className="text-left px-3 py-2">진입 시각</th>
+                          <th className="text-left px-3 py-2">상태</th>
+                          <th className="text-left px-3 py-2">청산 사유</th>
+                          <th className="text-right px-3 py-2">청산가</th>
+                          <th className="text-left px-3 py-2">청산 시각</th>
+                          <th className="text-right px-3 py-2">보유</th>
+                          <th className="text-left px-3 py-2">보호상태</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                        {positionJournal.map((position, index) => (
+                          <tr
+                            key={`${position.opened_run_id}-${position.symbol}-${index}`}
+                            className={position.held_over_2_days ? "bg-amber-50/70 dark:bg-amber-950/20" : "hover:bg-slate-50 dark:hover:bg-slate-900/60"}
+                          >
+                            <td className="px-3 py-3 font-medium">
+                              <span className="block">{position.name || position.symbol}</span>
+                              <span className="text-caption text-slate-500">{position.symbol}</span>
+                            </td>
+                            <td className="px-3 py-3 text-right tabular-nums">{position.quantity}</td>
+                            <td className="px-3 py-3 text-right tabular-nums">
+                              {money.format(position.entry_notional || position.entry_price * position.quantity)}
+                            </td>
+                            <td className="px-3 py-3">
+                              <button
+                                type="button"
+                                onClick={() => void selectRun(position.opened_run_id)}
+                                className="hover:text-primary"
+                              >
+                                {compactDateTime(position.opened_at, market)}
+                              </button>
+                            </td>
+                            <td className="px-3 py-3">
+                              <span className={`inline-flex px-2 py-1 rounded text-xs font-medium ${positionStatusClass(position.status)}`}>
+                                {position.status_label || position.status}
+                              </span>
+                            </td>
+                            <td className="px-3 py-3">
+                              <span className={position.exit_reason === "take_profit" ? "text-green-700 dark:text-green-300" : position.exit_reason === "stop_loss" ? "text-red-700 dark:text-red-300" : ""}>
+                                {position.exit_reason_label || "-"}
+                              </span>
+                            </td>
+                            <td className="px-3 py-3 text-right tabular-nums">
+                              {position.exit_price ? money.format(position.exit_price) : "-"}
+                            </td>
+                            <td className="px-3 py-3">{compactDateTime(position.exit_at, market)}</td>
+                            <td className={`px-3 py-3 text-right tabular-nums ${position.held_over_2_days ? "text-amber-700 dark:text-amber-300 font-semibold" : ""}`}>
+                              {holdingPeriod(position.held_days)}
+                            </td>
+                            <td className="px-3 py-3 break-words">
+                              {position.protection_status || "-"}
+                              {position.last_error ? ` · ${position.last_error}` : ""}
+                            </td>
+                          </tr>
+                        ))}
+                        {!positionJournal.length && (
+                          <tr>
+                            <td colSpan={10} className="px-3 py-8 text-center text-slate-500">
+                              추적 가능한 매수 포지션이 없습니다.
+                            </td>
+                          </tr>
+                        )}
                       </tbody>
                     </table>
                   </div>

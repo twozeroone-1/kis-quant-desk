@@ -18,6 +18,7 @@ export interface AutomationRunSummary {
     filled: number;
     failed: number;
     skipped: number;
+    deferred?: number;
   };
   buy_notional: number;
   sell_notional?: number;
@@ -25,6 +26,7 @@ export interface AutomationRunSummary {
   app_reservation_count: number;
   protective_count: number;
   errors: string[];
+  warnings?: string[];
 }
 
 export interface AutomationDailyRecordPoint {
@@ -111,6 +113,31 @@ export interface AutomationMonthlyRecord {
   days: AutomationMonthlyRecordDay[];
 }
 
+export interface AutomationPositionJournalEntry {
+  symbol: string;
+  name: string;
+  market?: string | null;
+  quantity: number;
+  entry_price: number;
+  entry_notional: number;
+  opened_at: string;
+  opened_run_id: string;
+  status: "active" | "closed" | "exiting" | string;
+  status_label: string;
+  exit_reason?: string | null;
+  exit_reason_label?: string | null;
+  exit_at?: string | null;
+  exit_run_id?: string | null;
+  exit_price?: number | null;
+  exit_notional?: number | null;
+  exit_order_type?: string | null;
+  protection_id?: string | null;
+  protection_status?: string | null;
+  last_error?: string | null;
+  held_days: number;
+  held_over_2_days: boolean;
+}
+
 export interface AutomationSession {
   session_date: string;
   mode: "vps";
@@ -120,6 +147,18 @@ export interface AutomationSession {
   cumulative_buy_notional: number;
   cumulative_sell_notional?: number;
   daily_record?: AutomationDailyRecord | null;
+  position_journal?: AutomationPositionJournalEntry[];
+  position_journal_summary?: {
+    total: number;
+    active: number;
+    closed: number;
+    exiting: number;
+    unknown?: number;
+    take_profit: number;
+    stop_loss: number;
+    strategy_sell: number;
+    held_over_2_days: number;
+  };
   session_buy_limit: number;
   remaining_buy_budget: number;
   session_loss_limit: number;
@@ -136,6 +175,7 @@ export interface AutomationSession {
     submitted: number;
     filled: number;
     failed: number;
+    deferred?: number;
     errors: number;
   };
 }
@@ -168,6 +208,7 @@ export interface AutomationRunDetail {
   orders: Array<Record<string, unknown>>;
   submitted_sells: Array<Record<string, unknown>>;
   errors: string[];
+  warnings?: string[];
   account_before: Record<string, unknown>;
   account_after: Record<string, unknown>;
 }

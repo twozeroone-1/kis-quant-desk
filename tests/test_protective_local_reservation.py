@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 import sys
 import unittest
-import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("KIS_CONFIG_ROOT", str(PROJECT_ROOT / "tests" / "fixtures" / "kis_config"))
@@ -329,6 +328,39 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
 
         price_mock.assert_not_called()
         self.assertEqual(snapshot["api_calls"], 2)
+
+    def test_monitor_snapshot_reports_holdings_query_failure(self):
+        orders = [
+            {
+                "status": "active",
+                "env_dv": "vps",
+                "market": "domestic",
+                "stock_code": "005930",
+            }
+        ]
+
+        with patch.object(
+            protective_orders,
+            "PROTECTIVE_KIS_CALL_INTERVAL_SECONDS",
+            0,
+        ), patch.object(
+            protective_orders,
+            "_get_holding_map",
+            return_value=None,
+        ), patch.object(
+            protective_orders,
+            "_get_pending_order_state",
+            return_value=({}, True),
+        ), patch.object(
+            protective_orders,
+            "_is_order_market_open",
+            return_value=False,
+        ):
+            snapshot = protective_orders._build_monitor_snapshot_sync(orders)
+
+        key = protective_orders._snapshot_key("vps", "domestic")
+        self.assertIsNone(snapshot["holdings"][key])
+        self.assertIn("holdings vps/domestic: query failed", snapshot["errors"])
 
     def test_us_paper_waiting_retry_is_due_after_cooldown(self):
         old = (datetime.now() - timedelta(seconds=61)).isoformat(timespec="seconds")
@@ -707,6 +739,204 @@ class ProtectiveLocalReservationTest(unittest.TestCase):
         self.assertEqual(third["status"], "closed")
         self.assertEqual(third["events"][-1]["type"], "position_closed_after_exit_submit")
         self.assertEqual(third["app_exit_reservation_status"], "filled")
+
+    def test_active_order_closes_after_confirmed_empty_holdings(self):
+        order = {
+            "id": "order-1",
+            "status": "active",
+            "env_dv": "vps",
+            "market": "domestic",
+            "stock_code": "000270",
+            "stock_name": "기아",
+            "quantity": 1,
+            "take_profit_enabled": True,
+            "take_profit_submit_mode": "on_trigger",
+            "stop_loss_enabled": True,
+            "stop_loss_price": 155000.0,
+            "events": [],
+        }
+        snapshot = {
+            "holdings": {
+                protective_orders._snapshot_key("vps", "domestic"): {},
+            },
+            "pending": {
+                protective_orders._snapshot_key("vps", "domestic", None): {"orders": {}, "ok": True},
+            },
+            "prices": {},
+        }
+
+        first = copy.deepcopy(protective_orders._check_order_sync(order, "vps", snapshot))
+        second = copy.deepcopy(protective_orders._check_order_sync(copy.deepcopy(first), "vps", snapshot))
+        third = copy.deepcopy(protective_orders._check_order_sync(copy.deepcopy(second), "vps", snapshot))
+
+        self.assertEqual(first["status"], "active")
+        self.assertEqual(second["status"], "active")
+        self.assertEqual(third["status"], "closed")
+        self.assertEqual(third["events"][-1]["type"], "position_closed")
+
+    def test_active_order_preserves_state_when_holdings_query_failed(self):
+        order = {
+            "id": "order-1",
+            "status": "active",
+            "env_dv": "vps",
+            "market": "domestic",
+            "stock_code": "000270",
+            "stock_name": "기아",
+            "quantity": 1,
+            "take_profit_enabled": True,
+            "take_profit_submit_mode": "on_trigger",
+            "stop_loss_enabled": True,
+            "stop_loss_price": 155000.0,
+            "events": [],
+        }
+        snapshot = {
+            "holdings": {
+                protective_orders._snapshot_key("vps", "domestic"): None,
+            },
+            "pending": {
+                protective_orders._snapshot_key("vps", "domestic", None): {"orders": {}, "ok": True},
+            },
+            "prices": {},
+        }
+
+        updated = protective_orders._check_order_sync(order, "vps", snapshot)
+
+        self.assertEqual(updated["status"], "active")
+        self.assertNotIn("position_missing_count", updated)
+        self.assertIn("holdings query failed", updated["last_error"])
+
+    def test_submitted_exit_preserves_state_when_holdings_query_failed(self):
+        order = {
+            "id": "order-1",
+            "status": "exit_submitted",
+            "env_dv": "vps",
+            "market": "domestic",
+            "stock_code": "005930",
+            "quantity": 1,
+            "position_missing_count": 1,
+            "events": [],
+        }
+        snapshot = {
+            "holdings": {
+                protective_orders._snapshot_key("vps", "domestic"): None,
+            },
+        }
+
+        updated = protective_orders._reconcile_exit_submitted_sync(order, "vps", snapshot)
+
+        self.assertEqual(updated["status"], "exit_submitted")
+        self.assertEqual(updated["position_missing_count"], 1)
+        self.assertIn("reconciliation deferred", updated["last_error"])
+
+    def test_domestic_holding_map_returns_none_when_balance_query_failed(self):
+        with patch.object(
+            protective_orders,
+            "get_holdings",
+            return_value=protective_orders.pd.DataFrame(),
+        ), patch.object(
+            protective_orders.data_fetcher,
+            "get_balance_cache_error",
+            return_value="timeout",
+        ):
+            holdings = protective_orders._get_holding_map("vps", "domestic")
+
+        self.assertIsNone(holdings)
+
+    def test_closed_market_position_reconciliation_closes_missing_holding(self):
+        order = {
+            "id": "order-1",
+            "status": "active",
+            "env_dv": "vps",
+            "market": "domestic",
+            "stock_code": "000270",
+            "stock_name": "기아",
+            "quantity": 1,
+            "position_missing_count": 2,
+            "last_error": "position not found in holdings (2/3)",
+            "events": [],
+        }
+        snapshot = {
+            "holdings": {
+                protective_orders._snapshot_key("vps", "domestic"): {},
+            },
+        }
+
+        updated = protective_orders._reconcile_active_position_only_sync(order, "vps", snapshot)
+
+        self.assertEqual(updated["status"], "closed")
+        self.assertEqual(updated["events"][-1]["type"], "position_closed")
+
+    def test_domestic_empty_sell_result_preserves_error_detail(self):
+        class EmptyOrderExecutor:
+            def __init__(self, env_dv):
+                self.env_dv = env_dv
+
+            def execute_signal(self, signal):
+                return protective_orders.pd.DataFrame()
+
+        with patch.object(protective_orders, "OrderExecutor", EmptyOrderExecutor):
+            order_no, org_no, ok, error = protective_orders._submit_exit_order(
+                env_dv="vps",
+                stock_code="000270",
+                stock_name="기아",
+                quantity=1,
+                reason="test",
+                order_type="market",
+                market="domestic",
+            )
+
+        self.assertIsNone(order_no)
+        self.assertIsNone(org_no)
+        self.assertFalse(ok)
+        self.assertEqual(error, "domestic sell returned empty order result")
+
+    def test_legacy_submit_failed_events_get_error_detail(self):
+        order = {
+            "status": "closed",
+            "market": "domestic",
+            "env_dv": "vps",
+            "last_error": "position not found in holdings (3/3)",
+            "events": [
+                {"type": "created", "at": "2026-06-10T00:00:00"},
+                {"type": "stop_loss_submit_failed", "at": "2026-06-10T00:01:00", "error": None},
+            ],
+        }
+
+        protective_orders._normalize_runtime_order(order)
+
+        self.assertEqual(
+            order["events"][-1]["error"],
+            protective_orders.LEGACY_SUBMIT_FAILURE_ERROR,
+        )
+
+    def test_triggered_exit_without_error_detail_records_fallback(self):
+        order = {
+            "id": "order-1",
+            "status": "active",
+            "env_dv": "vps",
+            "market": "domestic",
+            "stock_code": "000270",
+            "stock_name": "기아",
+            "quantity": 1,
+            "events": [],
+        }
+
+        with patch.object(protective_orders, "_submit_exit_order", return_value=(None, None, False, None)):
+            updated = protective_orders._submit_triggered_exit(
+                order,
+                "vps",
+                reason="test",
+                exit_reason="stop_loss",
+                order_type="market",
+                price=None,
+                current_price=1000.0,
+            )
+
+        self.assertIn(protective_orders.MISSING_SUBMIT_FAILURE_ERROR, updated["last_error"])
+        self.assertEqual(
+            updated["events"][-1]["error"],
+            protective_orders.MISSING_SUBMIT_FAILURE_ERROR,
+        )
 
     def test_protective_app_reservation_is_visible_in_reservation_list(self):
         state = {

@@ -12,9 +12,9 @@ import time
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 
+import kis_auth as ka
 import pandas as pd
 
-import kis_auth as ka
 from core import overseas_data_fetcher
 
 logging.basicConfig(level=logging.INFO)
@@ -133,6 +133,8 @@ def _get_balance_cached(env_dv: str = "real"):
         logging.error(f"잔고 원본 조회 에러: {exc}")
         error = str(exc)
         data = None
+    if data is None and error is None:
+        error = "KIS balance query returned no data"
 
     with _balance_cache_lock:
         _balance_cache = {

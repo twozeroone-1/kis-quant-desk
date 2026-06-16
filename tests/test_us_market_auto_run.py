@@ -96,6 +96,11 @@ class _FakeSignalFetcher:
         return {"price": self.price}
 
 
+class _FakeShortDailySignalFetcher(_FakeSignalFetcher):
+    def get_daily_prices(self, *args, **kwargs):
+        return pd.DataFrame({"close": [100.0]})
+
+
 class _FakeIndicators:
     roc = 10.0
 
@@ -175,6 +180,55 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(us_market_auto_run.collect_payload_warnings(payload), [])
 
+    def test_signal_for_skips_candidates_with_insufficient_daily_data(self):
+        signal = us_market_auto_run.signal_for(
+            "SPCX",
+            "NASD",
+            _FakeShortDailySignalFetcher(167.9),
+            _FakeIndicators,
+        )
+
+        self.assertEqual(signal["action"], "SKIP")
+        self.assertIn("일봉 데이터 부족: 1 rows", signal["reason"])
+        self.assertEqual(signal["price"], 167.9)
+
+    async def test_account_status_refreshes_degraded_overdue_protective_monitor(self):
+        protective_snapshots = iter([
+            {
+                "orders": [],
+                "health": {
+                    "status": "degraded",
+                    "stale": False,
+                    "overdue_exit_count": 1,
+                },
+            },
+            {
+                "orders": [],
+                "health": {
+                    "status": "healthy",
+                    "stale": False,
+                    "overdue_exit_count": 0,
+                },
+            },
+        ])
+        refresh_count = 0
+
+        async def list_protective_orders():
+            return next(protective_snapshots)
+
+        async def refresh_monitor():
+            nonlocal refresh_count
+            refresh_count += 1
+
+        status = await us_market_auto_run.account_status(
+            _FakeEquityFetcher(),
+            list_protective_orders,
+            run_protective_monitor_cycle=refresh_monitor,
+        )
+
+        self.assertEqual(refresh_count, 1)
+        self.assertEqual(status["protective"]["health"]["status"], "healthy")
+
     def test_live_llm_mode_is_shadow_alias_not_order_gate(self):
         planned = [{"symbol": "AMZN", "quantity": 1, "notional": 100.0}]
 
@@ -206,6 +260,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(submitted), 1)
         self.assertEqual(odf.submitted[0]["price"], 98.0)
         self.assertEqual(submitted[0]["limit_price"], 98.0)
+        self.assertEqual(submitted[0]["notional"], 196.0)
         self.assertEqual(submitted[0]["order_status"], "submitted")
 
     def test_strategy_sell_skips_existing_pending_sell(self):
@@ -528,6 +583,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
                     "signal_counts": {"BUY": 1, "SELL": 0, "HOLD": 2, "ERROR": 0},
                     "order_counts": {"submitted": 1, "filled": 0, "failed": 0, "skipped": 0},
                     "buy_notional": 100.0,
+                    "sell_notional": 196.0,
                     "account_after": {"risk_equity": 10_000},
                     "errors": [],
                 }],
@@ -540,6 +596,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(us_market_auto_run.load_today_state(state_path)["runs"][0]["run_id"], "20260605_0945_ET")
             self.assertEqual(summary["remaining_buy_budget"], 900.0)
+            self.assertEqual(summary["cumulative_sell_notional"], 196.0)
             self.assertTrue((Path(tempdir) / "20260605_summary.json").is_file())
             self.assertTrue((Path(tempdir) / "20260605_summary.md").is_file())
 
@@ -555,7 +612,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
                 {"symbol": "IBM", "action": "HOLD"},
             ],
             "orders": [{"symbol": "AAPL", "notional": 100.0, "order_status": "submitted"}],
-            "submitted_sells": [],
+            "submitted_sells": [{"symbol": "IBM", "quantity": 2, "limit_price": 98.0, "order_status": "submitted"}],
             "account_before": {},
             "account_after": {},
         }
@@ -564,6 +621,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
             message = us_market_auto_run.telegram_message(payload)
 
         self.assertIn("2026-06-05 22:45 UTC+09:00", message)
+        self.assertIn("Sell $196.00", message)
         self.assertIn("http://ww.tailea9a3f.ts.net:8081/automation", message)
         self.assertNotIn("0945_ET", message)
 
@@ -573,6 +631,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
             "updated_at": "2026-06-09T04:46:12+09:00",
             "run_count": 7,
             "cumulative_buy_notional": 1788.9,
+            "cumulative_sell_notional": 196.0,
             "remaining_loss_budget": 481.65,
             "totals": {"submitted": 2, "filled": 2, "failed": 0, "errors": 28},
         }
@@ -581,6 +640,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
             message = us_market_auto_run.session_telegram_message(summary)
 
         self.assertIn("Updated 2026-06-09 04:46 UTC+09:00", message)
+        self.assertIn("Sells $196.00", message)
         self.assertIn("http://ww.tailea9a3f.ts.net:8081/automation", message)
 
     def test_cleanup_removes_only_old_detail_reports(self):

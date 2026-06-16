@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +32,18 @@ class AutomationReportsApiTest(unittest.TestCase):
         self.kr_report_patch.stop()
         self.us_report_patch.stop()
         self.tempdir.cleanup()
+
+    def test_report_date_helpers_use_kst(self):
+        class FakeDateTime:
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return datetime(2026, 6, 15, 22, 30)
+                return datetime(2026, 6, 16, 7, 30, tzinfo=tz)
+
+        with patch.object(automation, "datetime", FakeDateTime):
+            self.assertEqual(automation._today_session_date(), "20260616")
+            self.assertEqual(automation._current_month(), "2026-06")
 
     def test_lists_session_and_reads_run(self):
         summary = {"session_date": "20260605", "runs": [], "run_count": 0}
@@ -131,6 +144,301 @@ class AutomationReportsApiTest(unittest.TestCase):
         self.assertEqual(record["sell_notional"], 50)
         self.assertEqual(record["net_trade_cashflow"], -50)
         self.assertEqual(len(record["points"]), 2)
+
+    def test_us_session_downgrades_insufficient_daily_data_errors_to_warnings(self):
+        summary = {
+            "session_date": "20260612",
+            "mode": "vps",
+            "updated_at": "2026-06-13T04:46:28+09:00",
+            "run_count": 1,
+            "runs": [
+                {
+                    "run_id": "20260612_1245_ET",
+                    "started_at": "2026-06-13T01:45:00+09:00",
+                    "finished_at": "2026-06-13T01:46:00+09:00",
+                    "status": "completed",
+                    "report_only": False,
+                    "signal_counts": {"BUY": 1, "SELL": 0, "HOLD": 2, "ERROR": 1},
+                    "order_counts": {"submitted": 1, "filled": 1, "failed": 0, "skipped": 0},
+                    "buy_notional": 997.6,
+                    "sell_notional": 0.0,
+                    "account_before": {"equity": 1000, "cash": 1000, "holdings_value": 0},
+                    "account_after": {"equity": 1000, "cash": 0, "holdings_value": 1000},
+                    "errors": [
+                        "SPCX: 일봉 데이터 부족: 1 rows; organic missing confirmation",
+                        "protective monitor: degraded, rate limits=0, overdue exits=1",
+                    ],
+                }
+            ],
+            "cumulative_buy_notional": 997.6,
+            "cumulative_sell_notional": 0.0,
+            "totals": {"submitted": 1, "filled": 1, "failed": 0, "errors": 2},
+        }
+        (self.report_dir / "20260612_summary.json").write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+
+        session = asyncio.run(automation.get_us_session("20260612"))["data"]
+
+        run = session["runs"][0]
+        self.assertEqual(
+            run["errors"],
+            ["protective monitor: degraded, rate limits=0, overdue exits=1"],
+        )
+        self.assertEqual(
+            run["warnings"],
+            ["SPCX: 일봉 데이터 부족: 1 rows; organic missing confirmation"],
+        )
+        self.assertEqual(session["totals"]["errors"], 1)
+
+    def test_kr_session_reclassifies_partial_ranking_timeouts_and_false_missing_sells(self):
+        summary = {
+            "session_date": "20260615",
+            "mode": "vps",
+            "run_count": 1,
+            "runs": [
+                {
+                    "run_id": "20260615_1510_KST",
+                    "status": "completed",
+                    "signal_counts": {"BUY": 0, "SELL": 1, "HOLD": 0, "ERROR": 0},
+                    "order_counts": {"submitted": 0, "filled": 0, "failed": 1, "skipped": 0},
+                    "buy_notional": 0,
+                    "sell_notional": 0,
+                    "errors": [
+                        "candidate_selection: volume_rank: ranking timeout",
+                        "005930: 미보유 종목입니다. 삼성전자을(를) 보유하고 있지 않습니다.",
+                    ],
+                }
+            ],
+            "totals": {"submitted": 0, "filled": 0, "failed": 1, "errors": 2},
+        }
+        detail = {
+            "run_id": "20260615_1510_KST",
+            "signals": [{"code": "005930", "action": "SELL"}],
+            "submitted_buys": [],
+            "submitted_sells": [
+                {
+                    "code": "005930",
+                    "action": "SELL",
+                    "order_status": "error",
+                    "order_result": {
+                        "status": "error",
+                        "message": "미보유 종목입니다. 삼성전자을(를) 보유하고 있지 않습니다.",
+                    },
+                }
+            ],
+            "candidate_selection": {
+                "fallback_used": False,
+                "errors": ["volume_rank: ranking timeout"],
+                "warnings": [],
+            },
+            "account_before": {
+                "account": {"holdings": [{"stock_code": "005930", "quantity": 1}]}
+            },
+            "account_after": {
+                "account": {"holdings": [{"stock_code": "005930", "quantity": 1}]}
+            },
+            "errors": summary["runs"][0]["errors"],
+        }
+        (self.kr_report_dir / "20260615_summary.json").write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+        (self.kr_report_dir / "20260615_1510_KST.json").write_text(
+            json.dumps(detail), encoding="utf-8"
+        )
+
+        session = asyncio.run(automation.get_kr_session("20260615"))["data"]
+        run = session["runs"][0]
+        run_detail = asyncio.run(automation.get_kr_run("20260615_1510_KST"))["data"]
+
+        self.assertEqual(run["order_counts"]["failed"], 0)
+        self.assertEqual(run["order_counts"]["deferred"], 1)
+        self.assertEqual(run["errors"], [])
+        self.assertEqual(
+            run["warnings"],
+            ["candidate_selection: volume_rank: ranking timeout"],
+        )
+        self.assertEqual(session["totals"]["errors"], 0)
+        self.assertEqual(session["totals"]["deferred"], 1)
+        self.assertEqual(run_detail["submitted_sells"][0]["order_status"], "deferred")
+
+    def test_adds_position_journal_from_protective_exit(self):
+        summary = {
+            "session_date": "20260605",
+            "mode": "vps",
+            "updated_at": "2026-06-06T01:00:00+09:00",
+            "run_count": 2,
+            "runs": [
+                {
+                    "run_id": "20260605_0945_ET",
+                    "started_at": "2026-06-05T22:45:00+09:00",
+                    "finished_at": "2026-06-05T22:46:00+09:00",
+                    "buy_notional": 100,
+                    "sell_notional": 0,
+                    "order_counts": {"submitted": 1, "filled": 1, "failed": 0},
+                    "account_before": {"equity": 1000, "cash": 1000, "holdings_value": 0},
+                    "account_after": {"equity": 1000, "cash": 900, "holdings_value": 100},
+                    "errors": [],
+                },
+                {
+                    "run_id": "20260605_1045_ET",
+                    "started_at": "2026-06-05T23:45:00+09:00",
+                    "finished_at": "2026-06-05T23:46:00+09:00",
+                    "buy_notional": 0,
+                    "sell_notional": 0,
+                    "order_counts": {"submitted": 0, "filled": 0, "failed": 0},
+                    "account_before": {"equity": 1000, "cash": 900, "holdings_value": 100},
+                    "account_after": {"equity": 1010, "cash": 1010, "holdings_value": 0},
+                    "errors": [],
+                },
+            ],
+            "totals": {"submitted": 1, "filled": 1, "failed": 0, "errors": 0},
+        }
+        first_detail = {
+            "run_id": "20260605_0945_ET",
+            "orders": [
+                {
+                    "symbol": "JPM",
+                    "action": "BUY",
+                    "quantity": 1,
+                    "filled_avg_price": 100,
+                    "notional": 100,
+                    "order_status": "submitted",
+                    "filled_quantity": 1,
+                    "protection_id": "protect-1",
+                }
+            ],
+            "account_after": {
+                "protective": {
+                    "orders": [
+                        {
+                            "id": "protect-1",
+                            "status": "active",
+                            "market": "us",
+                            "stock_code": "JPM",
+                            "stock_name": "JPM",
+                            "quantity": 1,
+                            "entry_price": 100,
+                        }
+                    ]
+                }
+            },
+        }
+        second_detail = {
+            "run_id": "20260605_1045_ET",
+            "orders": [],
+            "account_after": {
+                "protective": {
+                    "orders": [
+                        {
+                            "id": "protect-1",
+                            "status": "closed",
+                            "market": "us",
+                            "stock_code": "JPM",
+                            "stock_name": "JPM",
+                            "quantity": 1,
+                            "entry_price": 100,
+                            "exit_reason": "take_profit",
+                            "exit_order_type": "limit",
+                            "exit_order_price": 110,
+                            "closed_at": "2026-06-05T23:50:00+09:00",
+                        }
+                    ]
+                }
+            },
+        }
+        (self.report_dir / "20260605_summary.json").write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+        (self.report_dir / "20260605_0945_ET.json").write_text(
+            json.dumps(first_detail), encoding="utf-8"
+        )
+        (self.report_dir / "20260605_1045_ET.json").write_text(
+            json.dumps(second_detail), encoding="utf-8"
+        )
+
+        session = asyncio.run(automation.get_us_session("20260605"))["data"]
+
+        self.assertEqual(session["position_journal_summary"]["take_profit"], 1)
+        position = session["position_journal"][0]
+        self.assertEqual(position["symbol"], "JPM")
+        self.assertEqual(position["status"], "closed")
+        self.assertEqual(position["exit_reason"], "take_profit")
+        self.assertEqual(position["exit_reason_label"], "익절")
+        self.assertEqual(position["exit_price"], 110)
+
+    def test_position_journal_tracks_strategy_sell(self):
+        summary = {
+            "session_date": "20260605",
+            "runs": [
+                {
+                    "run_id": "20260605_0945_ET",
+                    "started_at": "2026-06-05T22:45:00+09:00",
+                    "finished_at": "2026-06-05T22:46:00+09:00",
+                    "buy_notional": 100,
+                    "sell_notional": 0,
+                    "order_counts": {"submitted": 1, "filled": 1, "failed": 0},
+                    "account_before": {"equity": 1000, "cash": 1000, "holdings_value": 0},
+                    "account_after": {"equity": 1000, "cash": 900, "holdings_value": 100},
+                    "errors": [],
+                },
+                {
+                    "run_id": "20260605_1045_ET",
+                    "started_at": "2026-06-05T23:45:00+09:00",
+                    "finished_at": "2026-06-05T23:46:00+09:00",
+                    "buy_notional": 0,
+                    "sell_notional": 105,
+                    "order_counts": {"submitted": 1, "filled": 1, "failed": 0},
+                    "account_before": {"equity": 1000, "cash": 900, "holdings_value": 100},
+                    "account_after": {"equity": 1005, "cash": 1005, "holdings_value": 0},
+                    "errors": [],
+                },
+            ],
+            "totals": {"submitted": 2, "filled": 2, "failed": 0, "errors": 0},
+        }
+        first_detail = {
+            "run_id": "20260605_0945_ET",
+            "orders": [
+                {
+                    "symbol": "JPM",
+                    "action": "BUY",
+                    "quantity": 1,
+                    "filled_avg_price": 100,
+                    "notional": 100,
+                    "filled_quantity": 1,
+                    "order_status": "submitted",
+                }
+            ],
+        }
+        second_detail = {
+            "run_id": "20260605_1045_ET",
+            "submitted_sells": [
+                {
+                    "symbol": "JPM",
+                    "action": "SELL",
+                    "quantity": 1,
+                    "price": 105,
+                    "order_status": "submitted",
+                    "filled_quantity": 1,
+                }
+            ],
+        }
+        (self.report_dir / "20260605_summary.json").write_text(
+            json.dumps(summary), encoding="utf-8"
+        )
+        (self.report_dir / "20260605_0945_ET.json").write_text(
+            json.dumps(first_detail), encoding="utf-8"
+        )
+        (self.report_dir / "20260605_1045_ET.json").write_text(
+            json.dumps(second_detail), encoding="utf-8"
+        )
+
+        session = asyncio.run(automation.get_us_session("20260605"))["data"]
+
+        position = session["position_journal"][0]
+        self.assertEqual(position["exit_reason"], "strategy_sell")
+        self.assertEqual(position["exit_reason_label"], "전략 매도")
+        self.assertEqual(session["position_journal_summary"]["strategy_sell"], 1)
 
     def test_builds_monthly_record_from_daily_records(self):
         summaries = [

@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -22,7 +23,18 @@ US_RUN_RE = re.compile(rf"^\d{{8}}_(?:\d{{4}}_ET{REPORT_TAG_RE}|closed|\d{{6}}_(
 KR_RUN_RE = re.compile(rf"^\d{{8}}_(?:\d{{4}}_KST{REPORT_TAG_RE}|closed|\d{{6}}_(?:hourly|open|mid|close|manual))$")
 SUCCESS_ORDER_STATUSES = {"success", "submitted", "reservation_submitted"}
 FAILED_ORDER_STATUSES = {"failed", "error", "reservation_failed"}
+DEFERRED_ORDER_STATUSES = {"deferred"}
 MAX_DAILY_EQUITY_DEVIATION_PCT = 0.5
+EXIT_REASON_LABELS = {
+    "take_profit": "익절",
+    "stop_loss": "손절",
+    "strategy_sell": "전략 매도",
+    "manual_or_external": "수동/외부 청산",
+}
+NONCRITICAL_US_ERROR_MARKERS = (
+    "일봉 데이터 부족",
+    "organic missing confirmation",
+)
 
 
 def _number(value: Any) -> float:
@@ -31,6 +43,10 @@ def _number(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return number if number == number and abs(number) != float("inf") else 0.0
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _require_vps() -> None:
@@ -81,15 +97,344 @@ def _order_notional(order: dict[str, Any]) -> float:
     return price * _order_quantity(order)
 
 
+def _is_noncritical_us_error(message: Any) -> bool:
+    text = str(message or "")
+    return any(marker in text for marker in NONCRITICAL_US_ERROR_MARKERS)
+
+
+def _order_symbol(order: dict[str, Any]) -> str:
+    return str(order.get("stock_code") or order.get("code") or order.get("symbol") or "").upper()
+
+
+def _order_name(order: dict[str, Any]) -> str:
+    return str(order.get("stock_name") or order.get("name") or _order_symbol(order) or "-")
+
+
+def _run_time(run: dict[str, Any]) -> str:
+    return str(
+        run.get("finished_at")
+        or run.get("started_at")
+        or run.get("scheduled_at_kst")
+        or run.get("scheduled_at_et")
+        or ""
+    )
+
+
+def _date_from_text(value: Any):
+    if not value:
+        return None
+    text = str(value)
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        match = re.search(r"(\d{4})-?(\d{2})-?(\d{2})", text)
+        if not match:
+            return None
+        try:
+            return datetime(
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+            ).date()
+        except ValueError:
+            return None
+
+
+def _held_days(opened_at: str, reference_at: str) -> int:
+    opened = _date_from_text(opened_at)
+    reference = _date_from_text(reference_at)
+    if opened is None or reference is None:
+        return 0
+    return max(0, (reference - opened).days)
+
+
 def _sell_notional(payload: dict[str, Any]) -> float:
     return round(
         sum(
             _order_notional(order)
-            for order in payload.get("submitted_sells", [])
+            for order in _list(payload.get("submitted_sells"))
+            if isinstance(order, dict)
             if order.get("order_status") in SUCCESS_ORDER_STATUSES
         ),
         2,
     )
+
+
+def _protective_orders(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    protective = payload.get("account_after", {}).get("protective", {})
+    orders = _list(protective.get("orders")) if isinstance(protective, dict) else []
+    return [order for order in orders if isinstance(order, dict)]
+
+
+def _match_protective_order(
+    buy: dict[str, Any],
+    protective_orders: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    protection_id = buy.get("protection_id") or buy.get("protective_order_id")
+    if protection_id:
+        for order in protective_orders:
+            if order.get("id") == protection_id:
+                return order
+
+    symbol = _order_symbol(buy)
+    quantity = _order_quantity(buy)
+    matches = [order for order in protective_orders if _order_symbol(order) == symbol]
+    if not matches:
+        return None
+
+    def score(order: dict[str, Any]) -> tuple[int, float, str]:
+        active_score = 0 if order.get("status") == "active" else 1
+        order_quantity = _number(order.get("quantity"))
+        quantity_delta = abs(order_quantity - quantity) if quantity and order_quantity else 999999.0
+        return (active_score, quantity_delta, str(order.get("created_at") or ""))
+
+    return sorted(matches, key=score)[0]
+
+
+def _position_journal(
+    runs: list[dict[str, Any]],
+    details_by_run: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    positions: list[dict[str, Any]] = []
+    open_positions: dict[str, list[dict[str, Any]]] = {}
+    latest_protective_by_id: dict[str, dict[str, Any]] = {}
+    all_protective_orders: list[dict[str, Any]] = []
+    latest_protective_ids: set[str] = set()
+    latest_seen_at = ""
+
+    for run in runs:
+        run_id = str(run.get("run_id") or "")
+        detail = details_by_run.get(run_id, {})
+        run_time = _run_time(run) or _run_time(detail)
+        latest_seen_at = run_time or latest_seen_at
+        protective_orders = _protective_orders(detail)
+        all_protective_orders.extend(protective_orders)
+        if protective_orders:
+            latest_protective_ids = {
+                str(order.get("id") or "") for order in protective_orders if order.get("id")
+            }
+        for order in protective_orders:
+            order_id = str(order.get("id") or "")
+            if order_id:
+                latest_protective_by_id[order_id] = order
+
+        buy_orders = [
+            order
+            for order in [
+                *_list(detail.get("submitted_buys")),
+                *_list(detail.get("orders")),
+            ]
+            if isinstance(order, dict)
+            and str(order.get("action") or "").upper() == "BUY"
+            and _is_filled_or_completed_order(order)
+        ]
+        for order in buy_orders:
+            symbol = _order_symbol(order)
+            if not symbol:
+                continue
+            protective_order = _match_protective_order(order, protective_orders)
+            protection_id = (
+                order.get("protection_id")
+                or order.get("protective_order_id")
+                or (protective_order or {}).get("id")
+            )
+            entry_price = _number(
+                order.get("filled_avg_price")
+                or order.get("avg_price")
+                or order.get("entry_price")
+                or order.get("limit_price")
+                or order.get("target_price")
+                or order.get("price")
+            )
+            position = {
+                "symbol": symbol,
+                "name": _order_name(order),
+                "market": (protective_order or {}).get("market"),
+                "quantity": _order_quantity(order),
+                "entry_price": round(entry_price, 4),
+                "entry_notional": round(_order_notional(order), 2),
+                "opened_at": run_time,
+                "opened_run_id": run_id,
+                "status": "active",
+                "status_label": "보유중",
+                "exit_reason": None,
+                "exit_reason_label": None,
+                "exit_at": None,
+                "exit_run_id": None,
+                "exit_price": None,
+                "exit_notional": None,
+                "exit_order_type": None,
+                "protection_id": protection_id,
+                "protection_status": (protective_order or {}).get("status"),
+                "last_error": None,
+                "held_days": 0,
+                "held_over_2_days": False,
+            }
+            positions.append(position)
+            open_positions.setdefault(symbol, []).append(position)
+
+        sell_orders = [
+            order
+            for order in [
+                *_list(detail.get("submitted_sells")),
+                *_list(detail.get("orders")),
+            ]
+            if isinstance(order, dict)
+            and str(order.get("action") or "").upper() == "SELL"
+            and _is_filled_or_completed_order(order)
+        ]
+        for order in sell_orders:
+            symbol = _order_symbol(order)
+            candidates = [item for item in open_positions.get(symbol, []) if item["status"] == "active"]
+            if not candidates:
+                continue
+            position = candidates[0]
+            exit_price = _number(
+                order.get("filled_avg_price")
+                or order.get("limit_price")
+                or order.get("target_price")
+                or order.get("price")
+            )
+            position.update(
+                {
+                    "status": "closed",
+                    "status_label": "청산",
+                    "exit_reason": "strategy_sell",
+                    "exit_reason_label": EXIT_REASON_LABELS["strategy_sell"],
+                    "exit_at": run_time,
+                    "exit_run_id": run_id,
+                    "exit_price": round(exit_price, 4),
+                    "exit_notional": round(_order_notional(order), 2),
+                    "exit_order_type": order.get("order_type") or order.get("order_method"),
+                    "held_days": _held_days(str(position.get("opened_at") or ""), run_time),
+                }
+            )
+            position["held_over_2_days"] = int(position["held_days"]) >= 2
+
+    for position in positions:
+        protection_id = str(position.get("protection_id") or "")
+        protective_order = latest_protective_by_id.get(protection_id)
+        reference_at = latest_seen_at
+        if protective_order:
+            position["protection_status"] = protective_order.get("status")
+            position["last_error"] = protective_order.get("last_error")
+            exit_reason = protective_order.get("exit_reason") or protective_order.get(
+                "app_exit_reason"
+            )
+            exit_at = protective_order.get("closed_at") or protective_order.get("exit_submitted_at")
+            exit_price = _number(
+                protective_order.get("exit_order_price") or protective_order.get("last_price")
+            )
+            if exit_reason or protective_order.get("status") in {"closed", "filled"}:
+                position.update(
+                    {
+                        "status": "closed",
+                        "status_label": "청산",
+                        "exit_reason": exit_reason or "manual_or_external",
+                        "exit_reason_label": EXIT_REASON_LABELS.get(
+                            str(exit_reason or "manual_or_external"),
+                            str(exit_reason or "수동/외부 청산"),
+                        ),
+                        "exit_at": exit_at,
+                        "exit_price": round(exit_price, 4) if exit_price else None,
+                        "exit_notional": round(exit_price * _number(position.get("quantity")), 2)
+                        if exit_price
+                        else position.get("exit_notional"),
+                        "exit_order_type": protective_order.get("exit_order_type"),
+                    }
+                )
+                reference_at = str(exit_at or reference_at)
+            elif protective_order.get("status") in {"exit_submitted", "submitted_unconfirmed"}:
+                position.update({"status": "exiting", "status_label": "매도 확인중"})
+                reference_at = str(protective_order.get("exit_submitted_at") or reference_at)
+            elif protection_id and protection_id not in latest_protective_ids:
+                position.update(
+                    {
+                        "status": "unknown",
+                        "status_label": "추적 끊김",
+                        "protection_status": "missing_from_latest_snapshot",
+                    }
+                )
+
+        position["held_days"] = _held_days(str(position.get("opened_at") or ""), reference_at)
+        position["held_over_2_days"] = int(position["held_days"]) >= 2
+
+    unresolved_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for position in positions:
+        if position.get("status") in {"active", "unknown"}:
+            unresolved_by_symbol.setdefault(str(position.get("symbol") or ""), []).append(position)
+
+    for symbol, unresolved in unresolved_by_symbol.items():
+        if not symbol:
+            continue
+        unresolved_quantity = sum(_number(position.get("quantity")) for position in unresolved)
+        aggregate_exits = [
+            order
+            for order in all_protective_orders
+            if _order_symbol(order) == symbol
+            and order.get("status") in {"closed", "filled"}
+            and (order.get("exit_reason") or order.get("app_exit_reason"))
+            and _number(order.get("quantity")) >= unresolved_quantity
+        ]
+        if not aggregate_exits:
+            continue
+        aggregate_exit = sorted(
+            aggregate_exits,
+            key=lambda order: str(order.get("closed_at") or order.get("exit_submitted_at") or ""),
+        )[-1]
+        exit_reason = aggregate_exit.get("exit_reason") or aggregate_exit.get("app_exit_reason")
+        exit_at = aggregate_exit.get("closed_at") or aggregate_exit.get("exit_submitted_at")
+        exit_price = _number(aggregate_exit.get("exit_order_price") or aggregate_exit.get("last_price"))
+        for position in unresolved:
+            position.update(
+                {
+                    "status": "closed",
+                    "status_label": "청산",
+                    "exit_reason": exit_reason,
+                    "exit_reason_label": EXIT_REASON_LABELS.get(str(exit_reason), str(exit_reason)),
+                    "exit_at": exit_at,
+                    "exit_price": round(exit_price, 4) if exit_price else None,
+                    "exit_notional": round(exit_price * _number(position.get("quantity")), 2)
+                    if exit_price
+                    else None,
+                    "exit_order_type": aggregate_exit.get("exit_order_type"),
+                    "protection_id": aggregate_exit.get("id"),
+                    "protection_status": "closed_aggregate",
+                    "last_error": aggregate_exit.get("last_error"),
+                }
+            )
+            position["held_days"] = _held_days(str(position.get("opened_at") or ""), str(exit_at or ""))
+            position["held_over_2_days"] = int(position["held_days"]) >= 2
+
+    return positions
+
+
+def _position_journal_summary(positions: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "total": len(positions),
+        "active": sum(1 for item in positions if item.get("status") == "active"),
+        "closed": sum(1 for item in positions if item.get("status") == "closed"),
+        "exiting": sum(1 for item in positions if item.get("status") == "exiting"),
+        "unknown": sum(1 for item in positions if item.get("status") == "unknown"),
+        "take_profit": sum(1 for item in positions if item.get("exit_reason") == "take_profit"),
+        "stop_loss": sum(1 for item in positions if item.get("exit_reason") == "stop_loss"),
+        "strategy_sell": sum(1 for item in positions if item.get("exit_reason") == "strategy_sell"),
+        "held_over_2_days": sum(1 for item in positions if item.get("held_over_2_days")),
+    }
+
+
+def _with_position_journal(
+    summary: dict[str, Any],
+    details_by_run: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    normalized = dict(summary)
+    positions = _position_journal(
+        [run for run in normalized.get("runs", []) if isinstance(run, dict)],
+        details_by_run,
+    )
+    normalized["position_journal"] = positions
+    normalized["position_journal_summary"] = _position_journal_summary(positions)
+    return normalized
 
 
 def _account_snapshot(value: Any) -> dict[str, float] | None:
@@ -302,9 +647,24 @@ def _normalize_session_sell_notionals(
     *,
     report_dir: Path,
     run_pattern: re.Pattern[str],
+    include_position_journal: bool = False,
+    downgrade_noncritical_us_errors: bool = False,
+    normalize_kr_runtime: bool = False,
 ) -> dict[str, Any]:
     runs = []
     changed = False
+    details_by_run: dict[str, dict[str, Any]] = {}
+
+    def read_detail(run_id: str) -> dict[str, Any]:
+        if not run_pattern.fullmatch(run_id):
+            return {}
+        if run_id not in details_by_run:
+            try:
+                details_by_run[run_id] = _read_json(report_dir / f"{run_id}.json")
+            except HTTPException:
+                details_by_run[run_id] = {}
+        return details_by_run[run_id]
+
     for run in summary.get("runs", []):
         if not isinstance(run, dict):
             runs.append(run)
@@ -315,16 +675,37 @@ def _normalize_session_sell_notionals(
         needs_detail = (
             "sell_notional" not in normalized_run
             or int(normalized_run.get("order_counts", {}).get("filled") or 0) == 0
+            or include_position_journal
+            or normalize_kr_runtime
         )
-        if needs_detail and run_pattern.fullmatch(run_id):
-            try:
-                detail = _read_json(report_dir / f"{run_id}.json")
-            except HTTPException:
-                detail = {}
+        if needs_detail:
+            detail = read_detail(run_id)
         if "sell_notional" not in normalized_run:
             normalized_run["sell_notional"] = 0.0
             normalized_run["sell_notional"] = _sell_notional(detail) if detail else 0.0
             changed = True
+        if downgrade_noncritical_us_errors:
+            raw_errors = _list(normalized_run.get("errors"))
+            critical_errors = [
+                item for item in raw_errors if not _is_noncritical_us_error(item)
+            ]
+            if len(critical_errors) != len(raw_errors):
+                noncritical_errors = [
+                    item for item in raw_errors if _is_noncritical_us_error(item)
+                ]
+                normalized_run["errors"] = critical_errors
+                normalized_run["warnings"] = list(dict.fromkeys([
+                    *_list(normalized_run.get("warnings")),
+                    *noncritical_errors,
+                ]))
+                changed = True
+        if normalize_kr_runtime and detail:
+            normalized_detail = _normalize_kr_detail(detail, run_id)
+            rebuilt = _kr_run_summary(normalized_detail, run_id)
+            for key in ("order_counts", "errors", "warnings"):
+                if normalized_run.get(key) != rebuilt.get(key):
+                    normalized_run[key] = rebuilt.get(key)
+                    changed = True
         order_counts = (
             normalized_run.get("order_counts")
             if isinstance(normalized_run.get("order_counts"), dict)
@@ -363,17 +744,25 @@ def _normalize_session_sell_notionals(
                 for run in runs
                 if isinstance(run, dict)
             ),
+            "deferred": sum(
+                int(run.get("order_counts", {}).get("deferred") or 0)
+                for run in runs
+                if isinstance(run, dict)
+            ),
             "errors": sum(len(run.get("errors") or []) for run in runs if isinstance(run, dict)),
         }
-    return _with_daily_record(normalized)
+    normalized = _with_daily_record(normalized)
+    if include_position_journal:
+        normalized = _with_position_journal(normalized, details_by_run)
+    return normalized
 
 
 def _today_session_date() -> str:
-    return datetime.now().strftime("%Y%m%d")
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
 
 
 def _current_month() -> str:
-    return datetime.now().strftime("%Y-%m")
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m")
 
 
 def _normalize_month(month: str | None) -> str:
@@ -448,7 +837,88 @@ def _kr_errors(payload: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
+def _holding_codes(snapshot: Any) -> set[str]:
+    if not isinstance(snapshot, dict):
+        return set()
+    account = snapshot.get("account")
+    if not isinstance(account, dict):
+        return set()
+    return {
+        str(row.get("stock_code") or "")
+        for row in _list(account.get("holdings"))
+        if isinstance(row, dict) and _number(row.get("quantity")) > 0
+    }
+
+
+def _normalize_kr_runtime_detail(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    warnings = [str(item) for item in _list(normalized.get("warnings")) if item]
+    raw_errors = [str(item) for item in _list(normalized.get("errors")) if item]
+
+    candidate = normalized.get("candidate_selection")
+    if isinstance(candidate, dict) and not candidate.get("fallback_used"):
+        candidate = dict(candidate)
+        warnings.extend(
+            f"candidate_selection: {item}"
+            for item in _list(candidate.get("warnings"))
+            if item
+        )
+        candidate_errors = [str(item) for item in _list(candidate.get("errors")) if item]
+        if candidate_errors:
+            candidate["errors"] = []
+            candidate["warnings"] = list(dict.fromkeys([
+                *[str(item) for item in _list(candidate.get("warnings")) if item],
+                *candidate_errors,
+            ]))
+            warnings.extend(f"candidate_selection: {item}" for item in candidate_errors)
+            removable = {f"candidate_selection: {item}" for item in candidate_errors}
+            raw_errors = [item for item in raw_errors if item not in removable]
+        normalized["candidate_selection"] = candidate
+
+    before_codes = _holding_codes(normalized.get("account_before"))
+    after_codes = _holding_codes(normalized.get("account_after"))
+    normalized_sells = []
+    for order in _list(normalized.get("submitted_sells")):
+        if not isinstance(order, dict):
+            normalized_sells.append(order)
+            continue
+        normalized_order = dict(order)
+        raw_result = order.get("order_result")
+        result = dict(raw_result) if isinstance(raw_result, dict) else {}
+        code = _order_symbol(order)
+        message = str(result.get("message") or order.get("message") or "")
+        transient_false_missing = (
+            order.get("order_status") in FAILED_ORDER_STATUSES
+            and message.startswith("미보유 종목입니다.")
+            and code in before_codes
+            and code in after_codes
+        )
+        if transient_false_missing:
+            normalized_order["original_order_status"] = order.get("order_status")
+            normalized_order["order_status"] = "deferred"
+            normalized_order["deferred_reason"] = "holdings_unavailable"
+            result.update({
+                "status": "deferred",
+                "message": "KIS 잔고 조회 지연으로 매도 주문을 보류했습니다",
+                "data": {
+                    "reason_code": "holdings_unavailable",
+                    "retryable": True,
+                    "original_message": message,
+                },
+            })
+            normalized_order["order_result"] = result
+            original_error = f"{code}: {message}"
+            raw_errors = [item for item in raw_errors if item != original_error]
+        normalized_sells.append(normalized_order)
+
+    normalized["submitted_sells"] = normalized_sells
+    normalized["errors"] = list(dict.fromkeys(raw_errors))
+    normalized["warnings"] = list(dict.fromkeys(warnings))
+    return normalized
+
+
 def _kr_run_summary(payload: dict[str, Any], run_id: str) -> dict[str, Any]:
+    payload = _normalize_kr_runtime_detail(payload)
     signals = payload.get("signals", [])
     orders = [*payload.get("submitted_sells", []), *payload.get("submitted_buys", [])]
     return {
@@ -475,6 +945,9 @@ def _kr_run_summary(payload: dict[str, Any], run_id: str) -> dict[str, Any]:
             "skipped": sum(
                 1 for order in orders if str(order.get("order_status") or "").startswith("skipped")
             ),
+            "deferred": sum(
+                1 for order in orders if order.get("order_status") in DEFERRED_ORDER_STATUSES
+            ),
         },
         "buy_notional": round(
             sum(
@@ -497,6 +970,7 @@ def _kr_run_summary(payload: dict[str, Any], run_id: str) -> dict[str, Any]:
             payload.get("account_after", {}).get("protective", {}).get("orders") or []
         ),
         "errors": _kr_errors(payload),
+        "warnings": [str(item) for item in _list(payload.get("warnings")) if item],
         "json_report": f"{run_id}.json",
         "markdown_report": f"{run_id}.md",
     }
@@ -514,6 +988,7 @@ def _kr_run_id_from_state_run(run: dict[str, Any]) -> str | None:
 
 
 def _normalize_kr_detail(payload: dict[str, Any], run_id: str) -> dict[str, Any]:
+    payload = _normalize_kr_runtime_detail(payload)
     payload.setdefault("run_id", run_id)
     payload.setdefault("status", "completed")
     payload.setdefault("report_only", False)
@@ -523,6 +998,7 @@ def _normalize_kr_detail(payload: dict[str, Any], run_id: str) -> dict[str, Any]
     payload.setdefault("orders", payload.get("submitted_buys", []))
     payload.setdefault("submitted_sells", [])
     payload.setdefault("errors", _kr_errors(payload))
+    payload.setdefault("warnings", [])
     payload.setdefault("account_before", {})
     payload.setdefault("account_after", {})
     return payload
@@ -535,15 +1011,18 @@ def _read_kr_detail(run_id: str) -> dict[str, Any] | None:
     return _read_json(path)
 
 
-def _synthesize_kr_session(session_date: str) -> dict[str, Any]:
+def _synthesize_kr_session(session_date: str, *, include_position_journal: bool = False) -> dict[str, Any]:
     state = _read_json(KR_REPORT_DIR / f"{session_date}.json")
     runs = []
+    details_by_run: dict[str, dict[str, Any]] = {}
     for run in state.get("runs", []):
         if not isinstance(run, dict):
             continue
         run_id = _kr_run_id_from_state_run(run)
         if run_id:
             detail = _read_kr_detail(run_id)
+            if detail:
+                details_by_run[run_id] = detail
             summary = _kr_run_summary(detail, run_id) if detail else None
             if summary:
                 summary.setdefault("status", run.get("status", summary.get("status")))
@@ -560,7 +1039,13 @@ def _synthesize_kr_session(session_date: str) -> dict[str, Any]:
                 "status": run.get("status", "legacy"),
                 "report_only": False,
                 "signal_counts": {"BUY": 0, "SELL": 0, "HOLD": 0, "ERROR": 0},
-                "order_counts": {"submitted": 0, "filled": 0, "failed": 0, "skipped": 0},
+                "order_counts": {
+                    "submitted": 0,
+                    "filled": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "deferred": 0,
+                },
                 "buy_notional": 0.0,
                 "sell_notional": 0.0,
                 "account_before": {},
@@ -569,6 +1054,7 @@ def _synthesize_kr_session(session_date: str) -> dict[str, Any]:
                 "app_reservation_count": 0,
                 "protective_count": 0,
                 "errors": [],
+                "warnings": [],
                 "json_report": f"{run_id}.json" if run_id else None,
                 "markdown_report": f"{run_id}.md" if run_id else None,
             }
@@ -579,7 +1065,7 @@ def _synthesize_kr_session(session_date: str) -> dict[str, Any]:
         (run.get("account_after") for run in reversed(runs) if run.get("account_after")), {}
     )
     risk_equity = float((latest_account or {}).get("risk_equity") or 0)
-    return _with_daily_record(
+    normalized = _with_daily_record(
         {
             "session_date": session_date,
             "mode": "vps",
@@ -602,10 +1088,16 @@ def _synthesize_kr_session(session_date: str) -> dict[str, Any]:
                 ),
                 "filled": sum(int(run.get("order_counts", {}).get("filled") or 0) for run in runs),
                 "failed": sum(int(run.get("order_counts", {}).get("failed") or 0) for run in runs),
+                "deferred": sum(
+                    int(run.get("order_counts", {}).get("deferred") or 0) for run in runs
+                ),
                 "errors": sum(len(run.get("errors") or []) for run in runs),
             },
         }
     )
+    if include_position_journal:
+        normalized = _with_position_journal(normalized, details_by_run)
+    return normalized
 
 
 def _list_us_session_summaries() -> list[dict[str, Any]]:
@@ -622,6 +1114,7 @@ def _list_us_session_summaries() -> list[dict[str, Any]]:
                     _read_json(path),
                     report_dir=US_REPORT_DIR,
                     run_pattern=US_RUN_RE,
+                    downgrade_noncritical_us_errors=True,
                 )
             )
         except HTTPException:
@@ -651,6 +1144,7 @@ def _list_kr_session_summaries() -> list[dict[str, Any]]:
                         _read_json(summary_paths[session_date]),
                         report_dir=KR_REPORT_DIR,
                         run_pattern=KR_RUN_RE,
+                        normalize_kr_runtime=True,
                     )
                 )
             else:
@@ -694,6 +1188,8 @@ async def get_us_session(session_date: str) -> dict[str, Any]:
             _read_json(US_REPORT_DIR / f"{session_date}_summary.json"),
             report_dir=US_REPORT_DIR,
             run_pattern=US_RUN_RE,
+            include_position_journal=True,
+            downgrade_noncritical_us_errors=True,
         ),
     }
 
@@ -758,9 +1254,14 @@ async def get_kr_session(session_date: str) -> dict[str, Any]:
                 _read_json(summary_path),
                 report_dir=KR_REPORT_DIR,
                 run_pattern=KR_RUN_RE,
+                include_position_journal=True,
+                normalize_kr_runtime=True,
             ),
         }
-    return {"status": "success", "data": _synthesize_kr_session(session_date)}
+    return {
+        "status": "success",
+        "data": _synthesize_kr_session(session_date, include_position_journal=True),
+    }
 
 
 @router.get("/kr/runs/{run_id}")

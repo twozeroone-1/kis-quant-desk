@@ -8,25 +8,32 @@ Account Information and Pending Orders API:
 - POST /account/clear-cache: 캐시 삭제
 """
 
-import logging
 import asyncio
+import logging
+import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
+from core import data_fetcher, overseas_data_fetcher, reserved_orders
+from core.data_fetcher import (
+    cancel_order,
+    clear_balance_cache,
+    get_deposit,
+    get_holdings,
+    get_pending_orders,
+)
+from core.order_executor import OrderExecutor
+from core.signal import Action, Signal
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from core import data_fetcher, overseas_data_fetcher, reserved_orders
-from core.order_executor import OrderExecutor
-from core.signal import Action, Signal
-from core.data_fetcher import get_deposit, get_holdings, get_pending_orders, cancel_order, clear_balance_cache
-from backend import is_authenticated, get_current_mode
-from backend.services.audit_log import write_order_audit
+from backend import get_current_mode, is_authenticated
 from backend.services.app_reservations import (
     cancel_app_reservation,
     create_app_reservation,
     list_app_reservations,
 )
+from backend.services.audit_log import write_order_audit
 from backend.services.protective_orders import (
     list_protective_app_reservations,
     list_protective_orders,
@@ -47,6 +54,7 @@ router = APIRouter()
 
 _account_cache: Optional[dict] = None
 _account_cache_time: Optional[datetime] = None
+_last_good_account: Optional[dict] = None
 CACHE_TTL_SECONDS = 30
 
 # 미체결 주문 캐시 (5초)
@@ -63,7 +71,7 @@ PROTECTIVE_API_EVENT_LIMIT = 10
 
 def _get_cached_account(force_refresh: bool = False) -> dict:
     """캐시된 계좌 정보 반환 (30초 TTL)"""
-    global _account_cache, _account_cache_time
+    global _account_cache, _account_cache_time, _last_good_account
     
     now = datetime.now()
     
@@ -86,13 +94,24 @@ def _get_cached_account(force_refresh: bool = False) -> dict:
 
         balance_error = data_fetcher.get_balance_cache_error(env_dv)
         
-        _account_cache = {
+        fresh_account = {
             "deposit": deposit,
             "holdings": holdings,
             "holdings_count": len(holdings),
             "cached_at": now.isoformat(),
-            "error": "KIS 계좌 API 응답 지연으로 계좌 정보를 확인할 수 없습니다" if balance_error else None,
+            "stale": False,
+            "error": None,
         }
+        if balance_error:
+            fallback = dict(_last_good_account or fresh_account)
+            fallback.update({
+                "stale": True,
+                "error": "KIS 계좌 API 응답 지연으로 계좌 정보를 확인할 수 없습니다",
+            })
+            _account_cache = fallback
+        else:
+            _account_cache = fresh_account
+            _last_good_account = dict(fresh_account)
         _account_cache_time = now
         
         return _account_cache
@@ -106,10 +125,17 @@ def _get_cached_account(force_refresh: bool = False) -> dict:
                 "stale": True,
                 "error": str(e)
             }
+        if _last_good_account is not None:
+            return {
+                **_last_good_account,
+                "stale": True,
+                "error": str(e),
+            }
         return {
             "deposit": {},
             "holdings": [],
             "holdings_count": 0,
+            "stale": True,
             "error": str(e)
         }
 
@@ -124,6 +150,32 @@ def _clear_account_cache():
     _account_cache = None
     _account_cache_time = None
     clear_balance_cache()
+
+
+def _domestic_sell_holding_quantity(
+    env_dv: str,
+    stock_code: str,
+    *,
+    retry_delay_seconds: float = 1.0,
+) -> tuple[int | None, str | None]:
+    """Return None when holdings are unavailable, and 0 only for confirmed absence."""
+    last_error = None
+    for attempt in range(2):
+        holdings_df = get_holdings(env_dv)
+        last_error = data_fetcher.get_balance_cache_error(env_dv)
+        if not last_error:
+            if holdings_df.empty:
+                return 0, None
+            matching = holdings_df[
+                holdings_df["stock_code"].astype(str) == str(stock_code)
+            ]
+            if matching.empty:
+                return 0, None
+            return int(float(matching.iloc[0].get("quantity") or 0)), None
+        if attempt == 0:
+            clear_balance_cache()
+            time.sleep(retry_delay_seconds)
+    return None, str(last_error or "KIS balance query failed")
 
 
 def _compact_protective_order_for_api(order: dict) -> dict:
@@ -465,7 +517,7 @@ async def execute_order(request: OrderRequest, http_request: Request):
 
             result = order_result.dataframe
             order_id = str(result.iloc[0].get("ODNO", result.iloc[0].get("odno", "")))
-            order_data = {
+            order_data: dict[str, Any] = {
                 "order_id": order_id,
                 "status": "submitted",
                 "message": "해외주식 주문이 접수되었습니다",
@@ -516,6 +568,56 @@ async def execute_order(request: OrderRequest, http_request: Request):
             })
             return response
 
+        if request.action == "SELL":
+            holding_quantity, holdings_error = await asyncio.to_thread(
+                _domestic_sell_holding_quantity,
+                env_dv,
+                request.stock_code,
+            )
+            if holding_quantity is None:
+                message = "KIS 잔고 조회 지연으로 매도 주문을 보류했습니다"
+                add_log("warning", message)
+                response = OrderResponse(
+                    status="deferred",
+                    message=message,
+                    data={
+                        "reason_code": "holdings_unavailable",
+                        "retryable": True,
+                        "detail": holdings_error,
+                    },
+                    logs=logs,
+                )
+                write_order_audit({
+                    "authenticated_user": authenticated_user,
+                    "mode": env_dv,
+                    "action": "execute",
+                    "stock_code": request.stock_code,
+                    "quantity": request.quantity,
+                    "price": request.price,
+                    "order_type": request.order_type,
+                    "result": "deferred",
+                    "order_id": None,
+                    "error_message": message,
+                })
+                return response
+            if holding_quantity <= 0:
+                message = f"미보유 종목입니다. {request.stock_name}을(를) 보유하고 있지 않습니다."
+                add_log("error", message)
+                response = OrderResponse(status="error", message=message, logs=logs)
+                write_order_audit({
+                    "authenticated_user": authenticated_user,
+                    "mode": env_dv,
+                    "action": "execute",
+                    "stock_code": request.stock_code,
+                    "quantity": request.quantity,
+                    "price": request.price,
+                    "order_type": request.order_type,
+                    "result": "error",
+                    "order_id": None,
+                    "error_message": message,
+                })
+                return response
+
         # 3. Signal 객체 생성
         # 지정가 주문: strength < 0.8 → order_executor가 target_price 사용
         # 시장가 주문: strength >= 0.8 → order_executor가 시장가 사용
@@ -543,19 +645,30 @@ async def execute_order(request: OrderRequest, http_request: Request):
         # 5. 결과 처리
         if result.empty:
             error_reason = "주문 실행 실패"
+            response_status = "error"
+            response_data = None
 
             if request.action == "SELL":
-                quantity = executor.position_manager.get_holding_quantity(request.stock_code)
-                if quantity <= 0:
+                balance_error = data_fetcher.get_balance_cache_error(env_dv)
+                if balance_error:
+                    response_status = "deferred"
+                    response_data = {
+                        "reason_code": "holdings_unavailable",
+                        "retryable": True,
+                        "detail": balance_error,
+                    }
+                    error_reason = "KIS 잔고 조회 지연으로 매도 주문을 보류했습니다"
+                elif executor.position_manager.get_holding_quantity(request.stock_code) <= 0:
                     error_reason = f"미보유 종목입니다. {request.stock_name}을(를) 보유하고 있지 않습니다."
             elif request.action == "BUY":
                 error_reason = "주문이 거부되었습니다. 서버 로그를 확인하세요."
 
-            add_log("error", error_reason)
+            add_log("warning" if response_status == "deferred" else "error", error_reason)
 
             response = OrderResponse(
-                status="error",
+                status=response_status,
                 message=error_reason,
+                data=response_data,
                 logs=logs
             )
             write_order_audit({
@@ -566,7 +679,7 @@ async def execute_order(request: OrderRequest, http_request: Request):
                 "quantity": request.quantity,
                 "price": request.price,
                 "order_type": request.order_type,
-                "result": "error",
+                "result": response_status,
                 "order_id": None,
                 "error_message": response.message,
             })
@@ -577,7 +690,7 @@ async def execute_order(request: OrderRequest, http_request: Request):
         order_time = result.iloc[0].get("ORD_TMD", datetime.now().strftime("%H%M%S"))
         order_org_no = result.iloc[0].get("KRX_FWDG_ORD_ORGNO", "")
 
-        order_data = {
+        order_data: dict[str, Any] = {
             "order_id": order_id,
             "status": "submitted",
             "message": "주문이 접수되었습니다"

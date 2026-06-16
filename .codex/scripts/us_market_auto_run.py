@@ -110,6 +110,7 @@ def env_int(name: str, default: int) -> int:
 
 
 US_ORGANIC_STRATEGY_MAX_SYMBOLS = env_int("US_MARKET_ORGANIC_MAX_SYMBOLS", 3)
+INSUFFICIENT_DAILY_DATA_REASON = "일봉 데이터 부족"
 
 
 def normalize_llm_mode(mode: str | None) -> tuple[str, list[str]]:
@@ -410,9 +411,9 @@ def signal_for(symbol: str, exchange: str, odf, indicators) -> dict[str, Any]:
         return {
             "symbol": symbol,
             "exchange": exchange,
-            "action": "ERROR",
+            "action": "SKIP",
             "strength": 0.0,
-            "reason": f"일봉 데이터 부족: {len(df)} rows",
+            "reason": f"{INSUFFICIENT_DAILY_DATA_REASON}: {len(df)} rows",
             "price": float(price_info.get("price") or 0),
         }
 
@@ -782,11 +783,18 @@ async def account_status(
             app_reservations = {"status": "error", "orders": [], "total_count": 0, "errors": [str(exc)]}
     protective = compact_protective_payload(await list_protective_orders())
     health = protective.get("health") if isinstance(protective, dict) else {}
-    if (
-        callable(run_protective_monitor_cycle)
-        and isinstance(health, dict)
-        and (health.get("stale") or health.get("status") == "stale")
-    ):
+    should_refresh_protective = (
+        isinstance(health, dict)
+        and (
+            health.get("stale")
+            or health.get("status") == "stale"
+            or (
+                health.get("status") == "degraded"
+                and int(health.get("overdue_exit_count") or 0) > 0
+            )
+        )
+    )
+    if callable(run_protective_monitor_cycle) and should_refresh_protective:
         try:
             await run_protective_monitor_cycle()
             protective = compact_protective_payload(await list_protective_orders())
@@ -975,6 +983,7 @@ def place_sells(
             **signal,
             "quantity": qty,
             "limit_price": price,
+            "notional": round(qty * price, 2),
             "order_status": "submitted" if result.success else "failed",
             "order_no": str(row.get("ODNO") or row.get("odno") or ""),
             "last_error": None if result.success else result.display_error(),
@@ -1321,7 +1330,7 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
                     f"| {item.get('symbol')} | {', '.join(item.get('sources') or [])} | "
                     f"{item.get('quality_reason', '-')} |"
                 )
-    for action in ("BUY", "SELL", "HOLD", "ERROR"):
+    for action in ("BUY", "SELL", "HOLD", "SKIP", "ERROR"):
         rows = [signal for signal in payload["signals"] if signal.get("action") == action]
         if not rows:
             continue
@@ -1542,6 +1551,15 @@ def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
             for order in payload.get("orders", [])
             if order.get("order_status") in submitted_statuses
         ), 2),
+        "sell_notional": round(sum(
+            float(
+                order.get("notional")
+                or float(order.get("limit_price") or order.get("price") or 0)
+                * float(order.get("quantity") or 0)
+            )
+            for order in payload.get("submitted_sells", [])
+            if order.get("order_status") in submitted_statuses
+        ), 2),
         "account_before": compact_account(payload.get("account_before", {})),
         "account_after": compact_account(payload.get("account_after", {})),
         "pending_count": int(payload.get("account_after", {}).get("pending", {}).get("total_count") or 0),
@@ -1557,6 +1575,7 @@ def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
 def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str, Any]:
     runs = [normalize_summary_run(run) for run in state.get("runs", []) if isinstance(run, dict)]
     cumulative_buy = round(sum(float(run.get("buy_notional") or 0) for run in runs), 2)
+    cumulative_sell = round(sum(float(run.get("sell_notional") or 0) for run in runs), 2)
     latest_account = next(
         (run.get("account_after") for run in reversed(runs) if run.get("account_after")),
         {},
@@ -1570,6 +1589,7 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
         "runs": runs,
         "events": state.get("events", []),
         "cumulative_buy_notional": cumulative_buy,
+        "cumulative_sell_notional": cumulative_sell,
         "session_buy_limit": round(risk_equity * TOTAL_BUY_PCT, 2),
         "remaining_buy_budget": round(max(0.0, risk_equity * TOTAL_BUY_PCT - cumulative_buy), 2),
         "session_loss_limit": round(risk_equity * DAILY_LOSS_PCT, 2),
@@ -1591,12 +1611,13 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
         f"- Updated: {summary['updated_at']}",
         f"- Runs: {summary['run_count']}",
         f"- Cumulative buys: ${cumulative_buy:,.2f}",
+        f"- Cumulative sells: ${cumulative_sell:,.2f}",
         f"- Remaining buy budget: ${summary['remaining_buy_budget']:,.2f}",
         f"- Remaining loss budget: ${summary['remaining_loss_budget']:,.2f}",
         "",
         "## Timeline",
-        "| UTC+09:00 Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Errors |",
-        "|---|---|---|---:|---|---|---:|",
+        "| UTC+09:00 Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Buy | Sell | Errors |",
+        "|---|---|---|---:|---|---|---:|---:|---:|",
     ]
     for run in runs:
         counts = run.get("signal_counts", {})
@@ -1606,6 +1627,8 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
             f"{float(run.get('duration_seconds') or 0):.1f}s | "
             f"{counts.get('BUY', 0)}/{counts.get('SELL', 0)}/{counts.get('HOLD', 0)} | "
             f"{order_counts.get('submitted', 0)}/{order_counts.get('filled', 0)}/{order_counts.get('failed', 0)} | "
+            f"${float(run.get('buy_notional') or 0):,.2f} | "
+            f"${float(run.get('sell_notional') or 0):,.2f} | "
             f"{len(run.get('errors') or [])} |"
         )
     atomic_write_text(RUNTIME_DIR / f"{session_date}_summary.md", "\n".join(lines) + "\n")
@@ -1649,6 +1672,7 @@ def normalize_summary_run(run: dict[str, Any]) -> dict[str, Any]:
             for order in legacy_orders
             if order.get("order_status") in {"submitted", "reservation_submitted"}
         ), 2),
+        "sell_notional": 0.0,
         "account_before": {},
         "account_after": {},
         "pending_count": 0,
@@ -1690,7 +1714,8 @@ def telegram_message(payload: dict[str, Any], summary: dict[str, Any] | None = N
         f"Signals B/S/H {counts['BUY']}/{counts['SELL']}/{counts['HOLD']}\n"
         f"Orders submitted/filled/failed "
         f"{order_counts['submitted']}/{order_counts['filled']}/{order_counts['failed']}\n"
-        f"Buy ${run['buy_notional']:,.2f}, errors {len(run['errors'])}{link}"
+        f"Buy ${run['buy_notional']:,.2f}, Sell ${run['sell_notional']:,.2f}, "
+        f"errors {len(run['errors'])}{link}"
     )
     market_risk = payload.get("market_risk") or {}
     if market_risk.get("reasons"):
@@ -1699,6 +1724,7 @@ def telegram_message(payload: dict[str, Any], summary: dict[str, Any] | None = N
         text += (
             f"\nSession total: {summary['run_count']} runs, "
             f"buys ${summary['cumulative_buy_notional']:,.2f}, "
+            f"sells ${summary.get('cumulative_sell_notional', 0):,.2f}, "
             f"remaining risk ${summary['remaining_loss_budget']:,.2f}"
         )
     return text
@@ -1713,6 +1739,7 @@ def session_telegram_message(summary: dict[str, Any]) -> str:
         f"Runs {summary.get('run_count', 0)}, submitted/filled/failed "
         f"{totals.get('submitted', 0)}/{totals.get('filled', 0)}/{totals.get('failed', 0)}\n"
         f"Buys ${float(summary.get('cumulative_buy_notional') or 0):,.2f}, "
+        f"Sells ${float(summary.get('cumulative_sell_notional') or 0):,.2f}, "
         f"remaining loss budget ${float(summary.get('remaining_loss_budget') or 0):,.2f}, "
         f"errors {totals.get('errors', 0)}{link}"
     )

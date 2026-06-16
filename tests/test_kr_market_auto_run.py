@@ -38,6 +38,52 @@ class KrMarketAutoRunTest(unittest.TestCase):
         self.assertEqual(effective, "shadow")
         self.assertTrue(warnings)
 
+    def test_account_snapshot_with_error_is_not_available_for_orders(self):
+        snapshot = {
+            "account": {
+                "deposit": {"total_eval": 10_000_000},
+                "holdings": [{"stock_code": "005930", "quantity": 1}],
+                "stale": True,
+                "error": "KIS 계좌 API 응답 지연",
+            }
+        }
+
+        self.assertFalse(kr_market_auto_run.account_snapshot_available(snapshot))
+
+    def test_run_summary_counts_deferred_orders_separately(self):
+        payload = {
+            "run_id": "20260615_1510_KST",
+            "signals": [{"code": "005930", "action": "SELL"}],
+            "submitted_sells": [
+                {
+                    "code": "005930",
+                    "action": "SELL",
+                    "order_status": "deferred",
+                    "order_result": {
+                        "status": "deferred",
+                        "message": "KIS 잔고 조회 지연으로 매도 주문을 보류했습니다",
+                    },
+                }
+            ],
+            "submitted_buys": [],
+            "candidate_selection": {
+                "warnings": ["volume_rank: ranking timeout"],
+                "errors": [],
+            },
+            "account_before": {},
+            "account_after": {},
+        }
+
+        summary = kr_market_auto_run.run_summary(payload)
+
+        self.assertEqual(summary["order_counts"]["failed"], 0)
+        self.assertEqual(summary["order_counts"]["deferred"], 1)
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(
+            summary["warnings"],
+            ["candidate_selection: volume_rank: ranking timeout"],
+        )
+
     def test_prod_order_gate_uses_only_prod_confirmation(self):
         self.assertFalse(kr_market_auto_run.order_execution_enabled("prod", False))
         self.assertTrue(kr_market_auto_run.order_execution_enabled("prod", True))

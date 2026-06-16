@@ -25,10 +25,9 @@ from typing import Any, Optional
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 import exchange_calendars as xcals
+import pandas as pd
 import requests
-
 from core import data_fetcher, overseas_data_fetcher
 from core.data_fetcher import cancel_order, get_holdings, get_pending_orders
 from core.order_executor import OrderExecutor
@@ -118,6 +117,31 @@ def _normalize_unsupported_paths(value: Any) -> list[str]:
     return []
 
 
+LEGACY_SUBMIT_FAILURE_ERROR = "legacy submit failure missing error detail"
+MISSING_SUBMIT_FAILURE_ERROR = "order executor returned failure without error detail"
+
+
+def _submit_failure_error_detail(error: Optional[str]) -> str:
+    detail = str(error or "").strip()
+    return detail or MISSING_SUBMIT_FAILURE_ERROR
+
+
+def _normalize_failed_event_errors(order: dict[str, Any]) -> None:
+    events = order.get("events")
+    if not isinstance(events, list):
+        return
+    last_error = str(order.get("last_error") or "")
+    fallback = last_error if "sell submit failed" in last_error else LEGACY_SUBMIT_FAILURE_ERROR
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        if not event_type.endswith("_submit_failed"):
+            continue
+        if not str(event.get("error") or "").strip():
+            event["error"] = fallback
+
+
 def _normalize_runtime_order(order: dict[str, Any]) -> dict[str, Any]:
     order["retry_count"] = max(0, int(order.get("retry_count") or 0))
     order["exit_reprice_count"] = max(0, int(order.get("exit_reprice_count") or 0))
@@ -142,6 +166,7 @@ def _normalize_runtime_order(order: dict[str, Any]) -> dict[str, Any]:
         reservation.setdefault("last_error_code", order["last_error_code"])
         reservation.setdefault("next_retry_at", order["next_retry_at"])
         reservation.setdefault("unsupported_paths", list(order["unsupported_paths"]))
+    _normalize_failed_event_errors(order)
     return order
 
 
@@ -775,10 +800,13 @@ def _build_monitor_snapshot_sync(orders: list[dict[str, Any]]) -> dict[str, Any]
     for key in sorted(holding_keys):
         env_dv, market, _, _ = key.split("|", 3)
         try:
-            snapshot["holdings"][key] = _paced_monitor_call(
+            holdings = _paced_monitor_call(
                 snapshot,
                 lambda env_dv=env_dv, market=market: _get_holding_map(env_dv, market),
             )
+            snapshot["holdings"][key] = holdings
+            if holdings is None:
+                snapshot["errors"].append(f"holdings {env_dv}/{market}: query failed")
         except Exception as exc:
             snapshot["holdings"][key] = None
             snapshot["errors"].append(f"holdings {env_dv}/{market}: {exc}")
@@ -1015,7 +1043,9 @@ def _reconcile_exit_submitted_sync(
     market = str(order.get("market") or "domestic")
     holdings = _snapshot_holdings(snapshot, env_dv, market)
     if holdings is None:
-        return _mark_submitted_exit_missing_position(order, "holdings unavailable or empty")
+        order["last_checked_at"] = _now()
+        order["last_error"] = "holdings query failed; exit reconciliation deferred"
+        return order
 
     holding = holdings.get(str(order.get("stock_code")))
     if not holding or int(holding.get("quantity") or 0) <= 0:
@@ -1226,8 +1256,13 @@ async def _sync_realtime_subscriptions(state: dict[str, Any] | None = None) -> N
         logger.exception("realtime subscription sync failed")
 
 
-def _get_holding_map(env_dv: str, market: str = "domestic") -> dict[str, dict[str, Any]]:
+def _get_holding_map(
+    env_dv: str,
+    market: str = "domestic",
+) -> Optional[dict[str, dict[str, Any]]]:
     df = overseas_data_fetcher.get_holdings(env_dv) if market == "us" else get_holdings(env_dv)
+    if market != "us" and data_fetcher.get_balance_cache_error(env_dv):
+        return None
     if df.empty:
         return {}
     return {
@@ -1306,7 +1341,7 @@ def _submit_exit_order(
     )
     result = OrderExecutor(env_dv=env_dv).execute_signal(signal)
     if result.empty:
-        return None, None, False, None
+        return None, None, False, "domestic sell returned empty order result"
 
     row = result.iloc[0]
     return (
@@ -1526,8 +1561,8 @@ def _submit_triggered_exit(
             return order
 
         _apply_us_paper_submit_error_policy(order, error)
-        detail = f": {error}" if error else ""
-        order["last_error"] = f"{exit_reason} sell submit failed{detail}"
+        error_detail = _submit_failure_error_detail(error)
+        order["last_error"] = f"{exit_reason} sell submit failed: {error_detail}"
         order["exit_submit_failed_at"] = _now()
         if _is_non_retryable_submit_error(error):
             order["exit_submit_blocked"] = True
@@ -1537,7 +1572,7 @@ def _submit_triggered_exit(
             "order_type": order_type,
             "order_price": price if order_type == "limit" else None,
             "current_price": current_price,
-            "error": error,
+            "error": error_detail,
         })
     return order
 
@@ -1559,9 +1594,9 @@ def _check_order_sync(
         order.get("exchange"),
     )
 
-    if not holdings:
+    if holdings is None:
         order["last_checked_at"] = _now()
-        order["last_error"] = "holdings unavailable or empty; active protection preserved"
+        order["last_error"] = "holdings query failed; active protection preserved"
         return order
 
     holding = holdings.get(str(order["stock_code"]))
@@ -1583,7 +1618,11 @@ def _check_order_sync(
         return order
 
     order.pop("position_missing_count", None)
-    if str(order.get("last_error") or "").startswith(("holdings unavailable", "position not found")):
+    if str(order.get("last_error") or "").startswith((
+        "holdings unavailable",
+        "holdings query failed",
+        "position not found",
+    )):
         order.pop("last_error", None)
 
     order["quantity"] = min(int(order["quantity"]), int(holding.get("quantity") or 0))
@@ -1663,6 +1702,61 @@ def _check_order_sync(
             current_price=current_price,
         )
 
+    return order
+
+
+def _needs_active_position_reconciliation(order: dict[str, Any]) -> bool:
+    if order.get("status") != "active":
+        return False
+    if order.get("position_missing_count"):
+        return True
+    return str(order.get("last_error") or "").startswith((
+        "holdings unavailable",
+        "holdings query failed",
+        "position not found",
+    ))
+
+
+def _reconcile_active_position_only_sync(
+    order: dict[str, Any],
+    env_dv: str,
+    snapshot: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    if order.get("status") != "active":
+        return order
+
+    market = str(order.get("market") or "domestic")
+    holdings = _snapshot_holdings(snapshot, env_dv, market)
+    if holdings is None:
+        order["last_checked_at"] = _now()
+        order["last_error"] = "holdings query failed; active protection preserved"
+        return order
+
+    holding = holdings.get(str(order["stock_code"]))
+    if not holding or int(holding.get("quantity") or 0) <= 0:
+        missing_count = int(order.get("position_missing_count") or 0) + 1
+        order["position_missing_count"] = missing_count
+        order["last_checked_at"] = _now()
+        order["last_error"] = (
+            "position not found in holdings "
+            f"({missing_count}/{POSITION_MISSING_CONFIRMATIONS})"
+        )
+        if missing_count < POSITION_MISSING_CONFIRMATIONS:
+            return order
+
+        order["status"] = "closed"
+        order["closed_at"] = _now()
+        order.setdefault("events", []).append({"type": "position_closed", "at": _now()})
+        return order
+
+    order.pop("position_missing_count", None)
+    if str(order.get("last_error") or "").startswith((
+        "holdings unavailable",
+        "holdings query failed",
+        "position not found",
+    )):
+        order.pop("last_error", None)
+    order["last_checked_at"] = _now()
     return order
 
 
@@ -2070,7 +2164,7 @@ async def run_monitor_cycle() -> None:
         if order.get("status") == "exit_submitted"
         or (
             order.get("status") == "active"
-            and _is_order_market_open(order)
+            and (_is_order_market_open(order) or _needs_active_position_reconciliation(order))
             and not (
                 price_source == "websocket"
                 and order.get("source") == "review"
@@ -2107,6 +2201,25 @@ async def run_monitor_cycle() -> None:
             continue
 
         if not _is_order_market_open(order):
+            if _needs_active_position_reconciliation(order):
+                try:
+                    before = json.dumps(order, sort_keys=True, default=str)
+                    updated = await asyncio.to_thread(
+                        _reconcile_active_position_only_sync,
+                        order,
+                        str(order.get("env_dv") or "vps"),
+                        snapshot,
+                    )
+                    updated_orders.append(updated)
+                    changed = changed or json.dumps(updated, sort_keys=True, default=str) != before
+                except Exception as exc:
+                    order["last_error"] = str(exc)
+                    order["last_checked_at"] = _now()
+                    updated_orders.append(order)
+                    changed = True
+                    processing_errors.append(f"{order.get('stock_code')}: {exc}")
+                    logger.exception("protective position reconciliation failed")
+                continue
             updated_orders.append(order)
             continue
 

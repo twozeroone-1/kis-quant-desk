@@ -264,6 +264,16 @@ def account_snapshot() -> dict[str, Any]:
     }
 
 
+def account_snapshot_available(snapshot: dict[str, Any]) -> bool:
+    account = snapshot.get("account") if isinstance(snapshot, dict) else {}
+    if not isinstance(account, dict):
+        return False
+    if account.get("stale") or account.get("error"):
+        return False
+    deposit = account.get("deposit")
+    return isinstance(deposit, dict) and float(deposit.get("total_eval") or 0) > 0
+
+
 def evaluate_market_risk(news_summary: dict[str, Any] | None) -> dict[str, Any]:
     summary = news_summary or {}
     regime = str(summary.get("regime") or "unknown")
@@ -1042,6 +1052,16 @@ def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(errors))
 
 
+def collect_payload_warnings(payload: dict[str, Any]) -> list[str]:
+    warnings = [
+        f"candidate_selection: {item}"
+        for item in payload.get("candidate_selection", {}).get("warnings", [])
+        if item
+    ]
+    warnings.extend(str(item) for item in payload.get("llm_warnings", []) if item)
+    return list(dict.fromkeys(warnings))
+
+
 def compact_account(snapshot: dict[str, Any]) -> dict[str, Any]:
     account = snapshot.get("account", {}) if isinstance(snapshot, dict) else {}
     deposit = account.get("deposit", {}) if isinstance(account, dict) else {}
@@ -1088,6 +1108,7 @@ def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "filled": sum(1 for order in orders if order_filled_or_completed(order)),
             "failed": sum(1 for order in orders if order.get("order_status") in failed_statuses),
             "skipped": sum(1 for order in orders if str(order.get("order_status") or "").startswith("skipped")),
+            "deferred": sum(1 for order in orders if order.get("order_status") == "deferred"),
         },
         "buy_notional": round(sum(
             float(order.get("amount") or order.get("notional") or 0)
@@ -1110,6 +1131,7 @@ def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "app_reservation_count": int(payload.get("account_after", {}).get("reservations", {}).get("total_count") or 0),
         "protective_count": len(payload.get("account_after", {}).get("protective", {}).get("orders") or []),
         "errors": collect_payload_errors(payload),
+        "warnings": collect_payload_warnings(payload),
         "json_report": f"{payload.get('run_id')}.json",
         "markdown_report": f"{payload.get('run_id')}.md",
     }
@@ -1131,7 +1153,13 @@ def normalize_summary_run(run: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "report_only": False,
         "signal_counts": {"BUY": 0, "SELL": 0, "HOLD": 0, "ERROR": 0},
-        "order_counts": {"submitted": 0, "filled": 0, "failed": 0, "skipped": 0},
+        "order_counts": {
+            "submitted": 0,
+            "filled": 0,
+            "failed": 0,
+            "skipped": 0,
+            "deferred": 0,
+        },
         "buy_notional": 0.0,
         "sell_notional": 0.0,
         "account_before": {},
@@ -1140,6 +1168,7 @@ def normalize_summary_run(run: dict[str, Any]) -> dict[str, Any]:
         "app_reservation_count": 0,
         "protective_count": 0,
         "errors": [],
+        "warnings": [],
         "json_report": f"{report_id}.json" if report_id else None,
         "markdown_report": f"{report_id}.md" if report_id else None,
     }
@@ -1169,6 +1198,7 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
             "submitted": sum(int(run.get("order_counts", {}).get("submitted") or 0) for run in runs),
             "filled": sum(int(run.get("order_counts", {}).get("filled") or 0) for run in runs),
             "failed": sum(int(run.get("order_counts", {}).get("failed") or 0) for run in runs),
+            "deferred": sum(int(run.get("order_counts", {}).get("deferred") or 0) for run in runs),
             "errors": sum(len(run.get("errors") or []) for run in runs),
         },
     }
@@ -1188,8 +1218,8 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
         f"- Remaining loss budget: {summary['remaining_loss_budget']:,.0f}원",
         "",
         "## Timeline",
-        "| KST Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed | Buy | Sell | Errors |",
-        "|---|---|---|---:|---|---|---:|---:|---:|",
+        "| KST Time | Run | Status | Duration | BUY/SELL/HOLD | Submitted/Filled/Failed/Deferred | Buy | Sell | Errors | Warnings |",
+        "|---|---|---|---:|---|---|---:|---:|---:|---:|",
     ]
     for run in runs:
         counts = run.get("signal_counts", {})
@@ -1198,10 +1228,12 @@ def write_session_summary(session_date: str, state: dict[str, Any]) -> dict[str,
             f"| {run.get('scheduled_at_kst') or '-'} | {run.get('run_id')} | {run.get('status')} | "
             f"{float(run.get('duration_seconds') or 0):.1f}s | "
             f"{counts.get('BUY', 0)}/{counts.get('SELL', 0)}/{counts.get('HOLD', 0)} | "
-            f"{order_counts.get('submitted', 0)}/{order_counts.get('filled', 0)}/{order_counts.get('failed', 0)} | "
+            f"{order_counts.get('submitted', 0)}/{order_counts.get('filled', 0)}/"
+            f"{order_counts.get('failed', 0)}/{order_counts.get('deferred', 0)} | "
             f"{float(run.get('buy_notional') or 0):,.0f}원 | "
             f"{float(run.get('sell_notional') or 0):,.0f}원 | "
-            f"{len(run.get('errors') or [])} |"
+            f"{len(run.get('errors') or [])} | "
+            f"{len(run.get('warnings') or [])} |"
         )
     (RUNTIME_DIR / f"{session_date}_summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return summary
@@ -1448,6 +1480,9 @@ def main() -> int:
     news_summary = summarize_news(headlines)
     market_risk = evaluate_market_risk(news_summary)
     account_before = account_snapshot()
+    if not account_snapshot_available(account_before):
+        order_block_reasons.append("account_holdings_unavailable")
+        can_submit_orders = False
     before_holding_codes = set(holding_by_code(account_before["account"]).keys())
     candidate_selection = select_kr_candidates(
         api_get=lambda path: api("GET", path),
@@ -1669,6 +1704,7 @@ def main() -> int:
     payload["finished_at"] = finished.isoformat(timespec="seconds")
     payload["duration_seconds"] = round(time.monotonic() - monotonic_started, 2)
     payload["errors"] = collect_payload_errors(payload)
+    payload["warnings"] = collect_payload_warnings(payload)
     summary_row = run_summary(payload)
     state.setdefault("runs", []).append({**summary_row, "report": str(report_base.with_suffix(".md"))})
     state.setdefault("orders", []).extend(
