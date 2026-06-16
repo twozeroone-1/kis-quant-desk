@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timezone
-from typing import Any, Callable
-
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 
 KR_DYNAMIC_MIN_COUNT = 5
 US_DYNAMIC_MIN_COUNT = 5
@@ -67,7 +67,7 @@ US_PRICE_EXCHANGE_BY_TRADING = {
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _first_value(row: dict[str, Any], keys: tuple[str, ...], default: Any = "") -> Any:
@@ -128,6 +128,125 @@ def _static_us_candidates(static_candidates: list[tuple[str, str]], limit: int) 
             "metrics": {"rank": index + 1},
         })
     return selected
+
+
+def _dedupe_in_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    selected = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        selected.append(item)
+    return selected
+
+
+def _custom_mode_from_env(mode: str | None, env_name: str, mode_env_name: str) -> str:
+    if mode is not None:
+        return mode.strip().lower()
+    if os.environ.get(env_name, "").strip():
+        return "custom"
+    return os.environ.get(mode_env_name, "dynamic").strip().lower()
+
+
+def _parse_kr_custom_symbols(raw: str) -> tuple[list[str], list[str]]:
+    warnings = []
+    symbols = []
+    for raw_token in raw.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if not re.fullmatch(r"\d{6}", token):
+            warnings.append(f"invalid KR custom symbol ignored: {token}")
+            continue
+        symbols.append(token)
+    return _dedupe_in_order(symbols), warnings
+
+
+def _parse_us_custom_symbols(raw: str) -> tuple[list[str], list[str]]:
+    warnings = []
+    symbols = []
+    for raw_token in raw.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        symbol = token.upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9.]{0,9}", symbol):
+            warnings.append(f"invalid US custom symbol ignored: {token}")
+            continue
+        symbols.append(symbol)
+    return _dedupe_in_order(symbols), warnings
+
+
+def _custom_kr_candidates(raw: str, limit: int) -> tuple[list[dict[str, Any]], list[str]]:
+    symbols, warnings = _parse_kr_custom_symbols(raw)
+    selected = []
+    for index, code in enumerate(symbols[:limit]):
+        selected.append({
+            "code": code,
+            "symbol": code,
+            "name": code,
+            "market": "KR",
+            "exchange": "KRX",
+            "category": "custom",
+            "score": round(max(1.0, 100.0 - index), 2),
+            "sources": ["custom"],
+            "reasons": ["custom env candidate"],
+            "metrics": {"rank": index + 1},
+        })
+    return selected, warnings
+
+
+def _resolved_us_custom_profile(ranking_fetcher: Any, symbol: str) -> tuple[str, str]:
+    resolver = getattr(ranking_fetcher, "resolve_exchange", None)
+    if not callable(resolver):
+        raise AttributeError("resolve_exchange unavailable")
+    result = resolver(symbol)
+    if result in (None, ""):
+        raise ValueError("empty resolve_exchange result")
+    if hasattr(result, "success") and not getattr(result, "success", False):
+        message = result.display_error() if hasattr(result, "display_error") else "resolve_exchange failed"
+        raise ValueError(str(message))
+    if isinstance(result, dict):
+        exchange = normalize_us_exchange(_first_value(result, ("exchange", "excd", "ovrs_excg_cd"), ""))
+        name = str(_first_value(result, ("name", "ename", "prdt_name", "stock_name"), symbol)).strip() or symbol
+        if not exchange:
+            raise ValueError("resolve_exchange returned invalid exchange")
+        return exchange, name
+    if isinstance(result, (tuple, list)) and result:
+        exchange = normalize_us_exchange(result[0])
+        name = str(result[1]).strip() if len(result) > 1 else symbol
+        if not exchange:
+            raise ValueError("resolve_exchange returned invalid exchange")
+        return exchange, name or symbol
+    exchange = normalize_us_exchange(result)
+    if not exchange:
+        raise ValueError("resolve_exchange returned invalid exchange")
+    return exchange, symbol
+
+
+def _custom_us_candidates(raw: str, limit: int, ranking_fetcher: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    symbols, warnings = _parse_us_custom_symbols(raw)
+    selected = []
+    for index, symbol in enumerate(symbols[:limit]):
+        try:
+            exchange, name = _resolved_us_custom_profile(ranking_fetcher, symbol)
+        except Exception as exc:
+            exchange, name = "NASD", symbol
+            warnings.append(f"{symbol}: resolve_exchange failed; using NASD fallback ({str(exc)[:200]})")
+        selected.append({
+            "code": symbol,
+            "symbol": symbol,
+            "name": name,
+            "market": "US",
+            "exchange": exchange,
+            "category": "custom",
+            "score": round(max(1.0, 100.0 - index), 2),
+            "sources": ["custom"],
+            "reasons": ["custom env candidate"],
+            "metrics": {"rank": index + 1},
+        })
+    return selected, warnings
 
 
 def normalize_kr_candidate_row(row: dict[str, Any], source: str = "") -> dict[str, Any] | None:
@@ -380,11 +499,23 @@ def select_kr_candidates(
     mode: str | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    mode = (mode or os.environ.get("KR_MARKET_CANDIDATE_MODE", "dynamic")).strip().lower()
+    mode = _custom_mode_from_env(mode, "KR_MARKET_CANDIDATE_SYMBOLS", "KR_MARKET_CANDIDATE_MODE")
     limit = int(limit or os.environ.get("KR_MARKET_CANDIDATE_LIMIT", "20"))
     static_selected = _static_kr_candidates(static_candidates, limit)
     if mode == "static":
         return _candidate_report("static", static_selected, False, [])
+    if mode == "custom":
+        selected, warnings = _custom_kr_candidates(os.environ.get("KR_MARKET_CANDIDATE_SYMBOLS", ""), limit)
+        if not selected:
+            return _candidate_report(
+                "custom",
+                [],
+                False,
+                ["custom candidate symbols did not include any valid KR 6-digit codes"],
+                warnings,
+            )
+        selected = _append_kr_holdings_to_static(selected, account)
+        return _candidate_report("custom", selected, False, [], warnings)
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -424,11 +555,11 @@ def select_kr_candidates(
             "dynamic",
             fallback_selected,
             True,
-            errors + [f"dynamic ranked candidate count below minimum: {len(ranked_symbols)}"],
+            [*errors, f"dynamic ranked candidate count below minimum: {len(ranked_symbols)}"],
             warnings,
         )
     selected = _append_required_candidates(selected, holding_candidates)
-    return _candidate_report("dynamic", selected, False, errors, warnings)
+    return _candidate_report("dynamic", selected, False, [], [*warnings, *errors])
 
 
 def select_us_candidates(
@@ -439,11 +570,27 @@ def select_us_candidates(
     mode: str | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    mode = (mode or os.environ.get("US_MARKET_CANDIDATE_MODE", "dynamic")).strip().lower()
+    mode = _custom_mode_from_env(mode, "US_MARKET_CANDIDATE_SYMBOLS", "US_MARKET_CANDIDATE_MODE")
     limit = int(limit or os.environ.get("US_MARKET_CANDIDATE_LIMIT", "18"))
     static_selected = _static_us_candidates(static_candidates, limit)
     if mode == "static":
         return _candidate_report("static", static_selected, False, [])
+    if mode == "custom":
+        selected, warnings = _custom_us_candidates(
+            os.environ.get("US_MARKET_CANDIDATE_SYMBOLS", ""),
+            limit,
+            ranking_fetcher,
+        )
+        if not selected:
+            return _candidate_report(
+                "custom",
+                [],
+                False,
+                ["custom candidate symbols did not include any valid US symbols"],
+                warnings,
+            )
+        selected = _append_us_holdings_to_static(selected, holdings)
+        return _candidate_report("custom", selected, False, [], warnings)
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -502,7 +649,7 @@ def select_us_candidates(
             "dynamic",
             fallback_selected,
             True,
-            errors + [f"dynamic ranked candidate count below minimum: {len(ranked_symbols)}"],
+            [*errors, f"dynamic ranked candidate count below minimum: {len(ranked_symbols)}"],
             warnings,
         )
     selected = _append_required_candidates(selected, core_candidates + holding_candidates)

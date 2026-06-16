@@ -46,6 +46,22 @@ class AutomationReportsApiTest(unittest.TestCase):
         self.assertEqual(sessions["total_count"], 1)
         self.assertEqual(run["data"]["status"], "completed")
 
+    def test_reads_custom_report_run_ids(self):
+        us_detail = {"run_id": "20260615_1845_ET_custom_report", "status": "report_only"}
+        kr_detail = {"run_id": "20260616_0745_KST_custom_report", "status": "report_only"}
+        (self.report_dir / "20260615_1845_ET_custom_report.json").write_text(
+            json.dumps(us_detail), encoding="utf-8"
+        )
+        (self.kr_report_dir / "20260616_0745_KST_custom_report.json").write_text(
+            json.dumps(kr_detail), encoding="utf-8"
+        )
+
+        us_run = asyncio.run(automation.get_us_run("20260615_1845_ET_custom_report"))
+        kr_run = asyncio.run(automation.get_kr_run("20260616_0745_KST_custom_report"))
+
+        self.assertEqual(us_run["data"]["status"], "report_only")
+        self.assertEqual(kr_run["data"]["status"], "report_only")
+
     def test_adds_daily_record_to_us_session(self):
         summary = {
             "session_date": "20260605",

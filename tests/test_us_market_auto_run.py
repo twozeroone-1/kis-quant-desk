@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
-import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -301,6 +300,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
                 {"symbol": "HOT", "sources": ["volume_surge_rank"], "category": "large_cap"},
                 {"symbol": "NVDA", "sources": ["trade_value_rank"], "category": "large_cap"},
                 {"symbol": "SPY", "sources": ["core_etf"], "category": "core_etf"},
+                {"symbol": "VRT", "sources": ["custom"], "category": "custom"},
             ]
         }
 
@@ -308,7 +308,7 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [item["symbol"] for item in filtered["selected"]],
-            ["NVDA", "SPY"],
+            ["NVDA", "SPY", "VRT"],
         )
         self.assertEqual(filtered["rejected"][0]["symbol"], "HOT")
 
@@ -554,16 +554,15 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
             summary = Path(tempdir) / "20260401_summary.json"
             detail.write_text("{}", encoding="utf-8")
             summary.write_text("{}", encoding="utf-8")
-            old = time.time() - 40 * 24 * 60 * 60
+            now = datetime(2026, 6, 5, tzinfo=ZoneInfo("Asia/Seoul"))
+            old = (now - timedelta(days=40)).timestamp()
             detail.touch()
             summary.touch()
             import os
             os.utime(detail, (old, old))
             os.utime(summary, (old, old))
 
-            removed = us_market_auto_run.cleanup_old_detail_reports(
-                datetime(2026, 6, 5, tzinfo=ZoneInfo("Asia/Seoul"))
-            )
+            removed = us_market_auto_run.cleanup_old_detail_reports(now)
 
             self.assertEqual(removed, ["20260401_0945_ET.json"])
             self.assertFalse(detail.exists())

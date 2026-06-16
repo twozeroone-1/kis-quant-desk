@@ -283,8 +283,8 @@ def infer_us_sector(symbol: Any, candidate: dict[str, Any] | None = None) -> str
 
 def candidate_quality(candidate: dict[str, Any]) -> tuple[bool, str]:
     sources = {str(item) for item in candidate.get("sources") or []}
-    if sources & {"static", "core_etf", "holding"}:
-        return True, "core/static/holding"
+    if sources & {"static", "core_etf", "holding", "custom"}:
+        return True, "core/static/holding/custom"
     liquidity_sources = {"trade_value_rank", "market_cap_rank"}
     if not sources & liquidity_sources:
         return False, "no trade-value or market-cap liquidity source"

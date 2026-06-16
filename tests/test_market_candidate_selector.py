@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import unittest
 from pathlib import Path
-
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = PROJECT_ROOT / ".codex" / "scripts" / "market_candidate_selector.py"
@@ -75,6 +76,16 @@ class FakeUSFetcherWithUnsupportedCap(FakeUSFetcher):
             success=False,
             message="OPSQ2001 ERROR INPUT FIELD NOT FOUND [CURR_GB]",
         )
+
+
+class FakeUSResolver:
+    def __init__(self, profiles):
+        self.profiles = profiles
+
+    def resolve_exchange(self, symbol):
+        if symbol not in self.profiles:
+            raise RuntimeError(f"unknown symbol: {symbol}")
+        return self.profiles[symbol]
 
 
 class MarketCandidateSelectorTest(unittest.TestCase):
@@ -207,6 +218,91 @@ class MarketCandidateSelectorTest(unittest.TestCase):
         self.assertIn("068270", [item["code"] for item in report["selected"]])
         self.assertTrue(report["errors"])
 
+    def test_kr_partial_source_errors_become_warnings_when_candidates_are_sufficient(self):
+        rows = [
+            {
+                "mksc_shrn_iscd": f"{index:06d}",
+                "hts_kor_isnm": f"종목{index}",
+                "rank": str(index),
+            }
+            for index in range(1, 8)
+        ]
+
+        def api_get(path):
+            if "volume-power" in path:
+                raise TimeoutError("ranking timeout")
+            return {"status": "success", "items": rows}
+
+        report = selector.select_kr_candidates(
+            api_get=api_get,
+            account={"holdings": []},
+            static_candidates=KR_STATIC,
+            limit=10,
+        )
+
+        self.assertFalse(report["fallback_used"])
+        self.assertEqual(report["errors"], [])
+        self.assertIn("volume_power_rank: ranking timeout", report["warnings"])
+
+    def test_kr_custom_env_uses_symbols_without_dynamic_api(self):
+        with patch.dict(os.environ, {"KR_MARKET_CANDIDATE_SYMBOLS": "010170,005930,000660"}):
+            report = selector.select_kr_candidates(
+                api_get=lambda path: self.fail(f"unexpected dynamic API call: {path}"),
+                account={"holdings": []},
+                static_candidates=KR_STATIC,
+                limit=20,
+            )
+
+        codes = [item["code"] for item in report["selected"]]
+        self.assertEqual(report["mode"], "custom")
+        self.assertFalse(report["fallback_used"])
+        self.assertEqual(codes, ["010170", "005930", "000660"])
+        self.assertEqual(
+            next(item for item in report["selected"] if item["code"] == "010170")["sources"],
+            ["custom"],
+        )
+
+    def test_kr_custom_env_dedupes_invalids_and_keeps_holdings(self):
+        with patch.dict(os.environ, {"KR_MARKET_CANDIDATE_SYMBOLS": "010170,bad,010170,000660"}):
+            report = selector.select_kr_candidates(
+                api_get=lambda path: self.fail(f"unexpected dynamic API call: {path}"),
+                account={"holdings": [{"stock_code": "068270", "stock_name": "셀트리온", "quantity": 1}]},
+                static_candidates=KR_STATIC,
+                limit=20,
+            )
+
+        self.assertEqual([item["code"] for item in report["selected"]], ["010170", "000660", "068270"])
+        self.assertIn("invalid KR custom symbol ignored: bad", report["warnings"])
+        holding = next(item for item in report["selected"] if item["code"] == "068270")
+        self.assertEqual(holding["sources"], ["holding"])
+
+    def test_kr_custom_env_empty_valid_list_does_not_fallback(self):
+        with patch.dict(os.environ, {"KR_MARKET_CANDIDATE_SYMBOLS": "bad,12345"}):
+            report = selector.select_kr_candidates(
+                api_get=lambda path: self.fail(f"unexpected dynamic API call: {path}"),
+                account={"holdings": [{"stock_code": "068270", "stock_name": "셀트리온", "quantity": 1}]},
+                static_candidates=KR_STATIC,
+                limit=20,
+            )
+
+        self.assertEqual(report["mode"], "custom")
+        self.assertFalse(report["fallback_used"])
+        self.assertEqual(report["selected"], [])
+        self.assertTrue(report["errors"])
+
+    def test_explicit_mode_overrides_custom_env(self):
+        with patch.dict(os.environ, {"KR_MARKET_CANDIDATE_SYMBOLS": "010170"}):
+            report = selector.select_kr_candidates(
+                api_get=lambda path: self.fail(f"unexpected dynamic API call: {path}"),
+                account={"holdings": []},
+                static_candidates=KR_STATIC,
+                mode="static",
+                limit=2,
+            )
+
+        self.assertEqual(report["mode"], "static")
+        self.assertEqual([item["code"] for item in report["selected"]], ["005930", "000660"])
+
     def test_us_exchange_normalization(self):
         self.assertEqual(selector.normalize_us_exchange("NAS"), "NASD")
         self.assertEqual(selector.normalize_us_exchange("NASD"), "NASD")
@@ -300,6 +396,28 @@ class MarketCandidateSelectorTest(unittest.TestCase):
         self.assertFalse(report["errors"])
         self.assertTrue(report["warnings"])
         self.assertTrue(all("market_cap_rank" in item for item in report["warnings"]))
+
+    def test_us_custom_env_resolves_exchange_and_keeps_holdings(self):
+        with patch.dict(os.environ, {"US_MARKET_CANDIDATE_SYMBOLS": "nvda,VRT,AVGO,VRT"}):
+            report = selector.select_us_candidates(
+                ranking_fetcher=FakeUSResolver({
+                    "NVDA": {"exchange": "NASD", "name": "NVIDIA"},
+                    "VRT": {"exchange": "NYSE", "name": "Vertiv"},
+                }),
+                holdings=[{"stock_code": "AAPL", "exchange": "NASD", "stock_name": "Apple", "quantity": 2}],
+                static_candidates=US_STATIC,
+                limit=30,
+            )
+
+        symbols = [item["symbol"] for item in report["selected"]]
+        self.assertEqual(report["mode"], "custom")
+        self.assertFalse(report["fallback_used"])
+        self.assertEqual(symbols, ["NVDA", "VRT", "AVGO", "AAPL"])
+        self.assertEqual(next(item for item in report["selected"] if item["symbol"] == "NVDA")["name"], "NVIDIA")
+        self.assertEqual(next(item for item in report["selected"] if item["symbol"] == "VRT")["exchange"], "NYSE")
+        self.assertEqual(next(item for item in report["selected"] if item["symbol"] == "AVGO")["exchange"], "NASD")
+        self.assertTrue(any("AVGO: resolve_exchange failed" in item for item in report["warnings"]))
+        self.assertNotIn("SPY", symbols)
 
 
 if __name__ == "__main__":
