@@ -1429,7 +1429,10 @@ def write_market_closed_report(path: Path, payload: dict[str, Any]) -> None:
 
 
 def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
-    errors = [str(item) for item in payload.get("errors", []) if item]
+    errors = [
+        str(item) for item in payload.get("errors", [])
+        if item and not is_report_only_existing_warning(payload, item)
+    ]
     errors.extend(
         f"candidate_selection: {item}"
         for item in payload.get("candidate_selection", {}).get("errors", [])
@@ -1451,6 +1454,8 @@ def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
             errors.append(f"{order.get('symbol')}: {reservation.get('message')}")
     for section in ("pending", "reservations", "app_reservations"):
         for item in payload.get("account_after", {}).get(section, {}).get("errors", []):
+            if is_report_only_account_after_warning(payload, section, item):
+                continue
             errors.append(f"{section}: {item}")
     protective_health = payload.get("account_after", {}).get("protective", {}).get("health", {})
     if protective_health.get("refresh_error"):
@@ -1463,6 +1468,35 @@ def collect_payload_errors(payload: dict[str, Any]) -> list[str]:
             f"overdue exits={protective_health.get('overdue_exit_count', 0)}"
         )
     return list(dict.fromkeys(errors))
+
+
+def is_report_only_account_after_warning(payload: dict[str, Any], section: str, item: Any) -> bool:
+    if not payload.get("report_only"):
+        return False
+    if section != "pending":
+        return False
+    message = item.get("message") if isinstance(item, dict) else str(item)
+    return "pending query failed" in str(message)
+
+
+def is_report_only_existing_warning(payload: dict[str, Any], item: Any) -> bool:
+    text = str(item or "")
+    return bool(payload.get("report_only") and text.startswith("pending:") and "pending query failed" in text)
+
+
+def collect_payload_warnings(payload: dict[str, Any]) -> list[str]:
+    warnings = [str(item) for item in payload.get("warnings", []) if item]
+    for item in payload.get("errors", []):
+        if item and is_report_only_existing_warning(payload, item):
+            warnings.append(str(item))
+    for item in payload.get("candidate_selection", {}).get("warnings", []):
+        if item:
+            warnings.append(f"candidate_selection: {item}")
+    for section in ("pending", "reservations", "app_reservations"):
+        for item in payload.get("account_after", {}).get(section, {}).get("errors", []):
+            if is_report_only_account_after_warning(payload, section, item):
+                warnings.append(f"{section}: {item}")
+    return list(dict.fromkeys(warnings))
 
 
 def compact_account(account: dict[str, Any]) -> dict[str, Any]:
@@ -1514,6 +1548,7 @@ def run_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "app_reservation_count": int(payload.get("account_after", {}).get("app_reservations", {}).get("total_count") or 0),
         "protective_count": len(payload.get("account_after", {}).get("protective", {}).get("orders") or []),
         "errors": collect_payload_errors(payload),
+        "warnings": collect_payload_warnings(payload),
         "json_report": f"{payload.get('run_id')}.json",
         "markdown_report": f"{payload.get('run_id')}.md",
     }
@@ -2114,6 +2149,7 @@ async def main() -> int:
     finished = datetime.now(ZoneInfo("Asia/Seoul"))
     payload["finished_at"] = finished.isoformat(timespec="seconds")
     payload["duration_seconds"] = round(time.monotonic() - monotonic_started, 2)
+    payload["warnings"] = collect_payload_warnings(payload)
     payload["errors"] = collect_payload_errors(payload)
     summary_row = run_summary(payload)
     state.get("active_runs", {}).pop(run_id, None)

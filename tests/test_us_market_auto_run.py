@@ -136,6 +136,45 @@ class UsMarketAutoRunTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("strategy_run: momentum: rate limited", us_market_auto_run.collect_payload_errors(payload))
 
+    def test_report_only_pending_query_failure_is_warning(self):
+        payload = {
+            "report_only": True,
+            "errors": ["pending: {'exchange': 'AMEX', 'message': 'pending query failed'}"],
+            "signals": [],
+            "submitted_sells": [],
+            "orders": [],
+            "account_after": {
+                "pending": {
+                    "errors": [{"exchange": "AMEX", "message": "pending query failed"}],
+                },
+            },
+        }
+
+        self.assertEqual(us_market_auto_run.collect_payload_errors(payload), [])
+        self.assertIn(
+            "pending: {'exchange': 'AMEX', 'message': 'pending query failed'}",
+            us_market_auto_run.collect_payload_warnings(payload),
+        )
+
+    def test_live_pending_query_failure_stays_error(self):
+        payload = {
+            "report_only": False,
+            "signals": [],
+            "submitted_sells": [],
+            "orders": [],
+            "account_after": {
+                "pending": {
+                    "errors": [{"exchange": "AMEX", "message": "pending query failed"}],
+                },
+            },
+        }
+
+        self.assertIn(
+            "pending: {'exchange': 'AMEX', 'message': 'pending query failed'}",
+            us_market_auto_run.collect_payload_errors(payload),
+        )
+        self.assertEqual(us_market_auto_run.collect_payload_warnings(payload), [])
+
     def test_live_llm_mode_is_shadow_alias_not_order_gate(self):
         planned = [{"symbol": "AMZN", "quantity": 1, "notional": 100.0}]
 

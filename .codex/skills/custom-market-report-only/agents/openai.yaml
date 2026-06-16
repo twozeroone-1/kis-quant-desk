@@ -1,0 +1,3 @@
+display_name: Custom Market Report Only
+short_description: Creates vps-only report-only automation reports from explicit KR or US candidate symbols.
+default_prompt: Create a report-only automation run from custom Korean or US candidate symbols on the 8081 vps backend, without submitting orders.
