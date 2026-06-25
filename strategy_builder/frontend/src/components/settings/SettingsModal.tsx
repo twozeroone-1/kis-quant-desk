@@ -17,6 +17,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const { status, isLoading, error, login, switchMode } = useAuth();
   const [masterStatus, setMasterStatus] = useState<MasterStatus | null>(null);
   const [isCollecting, setIsCollecting] = useState(false);
+  const [masterNotice, setMasterNotice] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [cooldownTimer, setCooldownTimer] = useState(0);
   const lockedMode = deploymentLockedMode();
 
@@ -43,25 +44,55 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
     }
   }, [cooldownTimer]);
 
-  const fetchMasterStatus = async () => {
+  const formatUnknownError = (error: unknown, fallback: string) => {
+    if (error instanceof Error && error.message) return error.message;
+    return fallback;
+  };
+
+  const fetchMasterStatus = async (silent = false) => {
     try {
       const result = await getMasterStatus();
       setMasterStatus(result);
     } catch (error) {
       console.error("Failed to fetch master status:", error);
+      if (!silent) {
+        setMasterNotice({
+          type: "error",
+          message: formatUnknownError(error, "마스터파일 상태 조회에 실패했습니다."),
+        });
+      }
     }
   };
 
   const handleCollectMaster = async () => {
     setIsCollecting(true);
+    setMasterNotice(null);
     try {
       const result = await collectMasterFiles();
-      await fetchMasterStatus();
+      await fetchMasterStatus(true);
       if (!result.success && result.errors?.length) {
         console.error("Collection errors:", result.errors);
+        setMasterNotice({
+          type: "error",
+          message: result.errors.join(" / "),
+        });
+      } else if (!result.success) {
+        setMasterNotice({
+          type: "error",
+          message: "마스터파일 수집에 실패했습니다.",
+        });
+      } else {
+        setMasterNotice({
+          type: "success",
+          message: `마스터파일 수집 완료: 총 ${result.total_count.toLocaleString()}개`,
+        });
       }
     } catch (error) {
       console.error("Failed to collect master files:", error);
+      setMasterNotice({
+        type: "error",
+        message: formatUnknownError(error, "마스터파일 수집 요청에 실패했습니다."),
+      });
     } finally {
       setIsCollecting(false);
     }
@@ -262,6 +293,15 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
               ) : (
                 <div className="text-sm text-slate-500 dark:text-slate-400">
                   로딩 중...
+                </div>
+              )}
+              {masterNotice && (
+                <div className={`px-2 py-1.5 rounded text-xs ${
+                  masterNotice.type === "success"
+                    ? "bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300"
+                    : "bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400"
+                }`}>
+                  {masterNotice.message}
                 </div>
               )}
               <button

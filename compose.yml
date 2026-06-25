@@ -25,6 +25,7 @@ services:
       - ${KIS_LOG_BIND_DIR:-/home/from0to01/.local/state/kis-stack/logs}:/var/log/kis
       - ${KIS_TOKEN_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/token-vps}:/home/kis/KIS/token-vps
       - ${KIS_RUNTIME_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/runtime-vps}:/app/.runtime-vps
+      - ${KIS_MASTER_VPS_BIND_DIR:-/home/from0to01/.local/state/kis-stack/master-vps}:/app/.master
       - ./.codex/runtime/us_market_auto:/app/us-market-reports:ro
       - ./.codex/runtime/kr_market_auto:/app/kr-market-reports:ro
     expose:

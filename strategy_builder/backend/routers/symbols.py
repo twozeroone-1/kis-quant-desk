@@ -4,12 +4,12 @@
 마스터파일 수집 기능 포함 (CSV 저장, 인메모리 캐시)
 """
 
+import asyncio
 import logging
 import zipfile
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
@@ -34,6 +34,7 @@ MASTER_URLS = {
 # 인메모리 캐시
 _symbol_cache: dict[str, list[dict]] = {}
 _last_loaded: dict[str, datetime] = {}
+_collect_lock = asyncio.Lock()
 
 
 # ============================================
@@ -63,8 +64,8 @@ class SymbolDetailResponse(BaseModel):
     """종목 상세 정보 응답"""
 
     status: str = "success"
-    data: Optional[SymbolSearchItem] = None
-    message: Optional[str] = None
+    data: SymbolSearchItem | None = None
+    message: str | None = None
 
 
 class MasterStatus(BaseModel):
@@ -72,8 +73,8 @@ class MasterStatus(BaseModel):
     kospi_count: int = 0
     kosdaq_count: int = 0
     total_count: int = 0
-    kospi_updated: Optional[str] = None
-    kosdaq_updated: Optional[str] = None
+    kospi_updated: str | None = None
+    kosdaq_updated: str | None = None
     needs_update: bool = True
 
 
@@ -83,7 +84,7 @@ class CollectResult(BaseModel):
     kospi_count: int = 0
     kosdaq_count: int = 0
     total_count: int = 0
-    errors: list[str] = []
+    errors: list[str] = Field(default_factory=list)
 
 
 # ============================================
@@ -101,7 +102,7 @@ def _get_csv_path(exchange: str) -> Path:
     return MASTER_DIR / f"{exchange}.csv"
 
 
-def _get_file_mtime(path: Path) -> Optional[datetime]:
+def _get_file_mtime(path: Path) -> datetime | None:
     """파일 수정 시간"""
     if path.exists():
         return datetime.fromtimestamp(path.stat().st_mtime)
@@ -116,7 +117,7 @@ def _load_from_csv(exchange: str) -> list[dict]:
 
     symbols = []
     try:
-        with open(csv_path, "r", encoding="utf-8-sig") as f:
+        with open(csv_path, encoding="utf-8-sig") as f:
             lines = f.readlines()
             for line in lines[1:]:  # 헤더 스킵
                 parts = line.strip().split(",")
@@ -186,7 +187,7 @@ FALLBACK_STOCKS: list[dict] = [
 # ============================================
 
 
-def search_symbols(query: str, limit: int = 20, exchange: Optional[str] = None) -> list[dict]:
+def search_symbols(query: str, limit: int = 20, exchange: str | None = None) -> list[dict]:
     """종목 검색 (코드 또는 이름)
 
     Args:
@@ -217,7 +218,7 @@ def search_symbols(query: str, limit: int = 20, exchange: Optional[str] = None) 
     return results
 
 
-def get_symbol_by_code(code: str) -> Optional[dict]:
+def get_symbol_by_code(code: str) -> dict | None:
     """종목코드로 종목 정보 조회
 
     Args:
@@ -279,31 +280,38 @@ async def collect_master_files() -> CollectResult:
     한국투자증권 서버에서 코스피/코스닥 마스터파일을 다운로드합니다.
     수집된 데이터는 .master/ 디렉토리에 CSV로 저장됩니다.
     """
-    errors = []
-    kospi_count = 0
-    kosdaq_count = 0
-    
-    # 코스피 수집
-    symbols, error = await _download_and_parse("kospi")
-    if error:
-        errors.append(f"kospi: {error}")
-    else:
-        kospi_count = len(symbols)
-    
-    # 코스닥 수집
-    symbols, error = await _download_and_parse("kosdaq")
-    if error:
-        errors.append(f"kosdaq: {error}")
-    else:
-        kosdaq_count = len(symbols)
-    
-    return CollectResult(
-        success=len(errors) == 0,
-        kospi_count=kospi_count,
-        kosdaq_count=kosdaq_count,
-        total_count=kospi_count + kosdaq_count,
-        errors=errors,
-    )
+    if _collect_lock.locked():
+        return CollectResult(
+            success=False,
+            errors=["마스터파일 수집이 이미 진행 중입니다. 잠시 후 상태를 다시 확인하세요."],
+        )
+
+    async with _collect_lock:
+        errors = []
+        kospi_count = 0
+        kosdaq_count = 0
+
+        # 코스피 수집
+        symbols, error = await _download_and_parse("kospi")
+        if error:
+            errors.append(f"kospi: {error}")
+        else:
+            kospi_count = len(symbols)
+
+        # 코스닥 수집
+        symbols, error = await _download_and_parse("kosdaq")
+        if error:
+            errors.append(f"kosdaq: {error}")
+        else:
+            kosdaq_count = len(symbols)
+
+        return CollectResult(
+            success=len(errors) == 0,
+            kospi_count=kospi_count,
+            kosdaq_count=kosdaq_count,
+            total_count=kospi_count + kosdaq_count,
+            errors=errors,
+        )
 
 
 # ============================================
@@ -315,7 +323,7 @@ async def collect_master_files() -> CollectResult:
 async def search_symbols_api(
     q: str = Query(..., min_length=1, max_length=50, description="검색어 (종목코드 또는 종목명)"),
     limit: int = Query(default=20, ge=1, le=50, description="최대 결과 수"),
-    exchange: Optional[str] = Query(default=None, description="거래소 필터 (kospi, kosdaq)"),
+    exchange: str | None = Query(default=None, description="거래소 필터 (kospi, kosdaq)"),
 ) -> SymbolSearchResponse:
     """종목 검색
 
@@ -420,7 +428,13 @@ def _parse_kospi_kosdaq_mst(content: bytes, exchange: str) -> list[dict]:
     return symbols
 
 
-async def _download_and_parse(exchange: str, timeout: float = 60.0) -> tuple[list[dict], Optional[str]]:
+def _format_exception(exc: Exception) -> str:
+    """Return a visible message even for exceptions with an empty string."""
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+async def _download_and_parse(exchange: str, timeout: float = 60.0) -> tuple[list[dict], str | None]:
     """마스터파일 다운로드 및 파싱"""
     global _symbol_cache, _last_loaded
     
@@ -464,8 +478,9 @@ async def _download_and_parse(exchange: str, timeout: float = 60.0) -> tuple[lis
         logger.error(f"HTTP 오류 ({exchange}): {error}")
         return [], error
     except Exception as e:
-        logger.error(f"수집 실패 ({exchange}): {e}")
-        return [], str(e)
+        error = _format_exception(e)
+        logger.error(f"수집 실패 ({exchange}): {error}")
+        return [], error
 
 
 def _check_needs_update() -> bool:
